@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cbor2::Cbor;
 
-use crate::{iana, CoseMap, Error};
+use crate::{iana, tag, CoseMap, Error};
 
 /// The maximum permitted clock skew, in seconds (10 minutes).
 const MAX_CLOCK_SKEW_SECS: u64 = 10 * 60;
@@ -15,6 +15,7 @@ const MAX_CLOCK_SKEW_SECS: u64 = 10 * 60;
 /// The struct encodes to a CBOR map with the registered integer claim keys,
 /// while still serializing to natural field names for JSON and other formats.
 #[derive(Clone, Debug, Default, PartialEq, Cbor)]
+#[cbor(tag = 61)]
 pub struct Claims {
     /// Issuer (`iss`, claim 1).
     #[cbor(key = 1)]
@@ -51,6 +52,51 @@ pub struct Claims {
     pub cwt_id: Option<Vec<u8>>,
 }
 
+/// Untagged CWT claims, accepted for compatibility with untagged claim sets.
+#[derive(Clone, Debug, Default, PartialEq, Cbor)]
+struct ClaimsBare {
+    #[cbor(key = 1)]
+    #[serde(rename = "iss", skip_serializing_if = "Option::is_none", default)]
+    issuer: Option<String>,
+    #[cbor(key = 2)]
+    #[serde(rename = "sub", skip_serializing_if = "Option::is_none", default)]
+    subject: Option<String>,
+    #[cbor(key = 3)]
+    #[serde(rename = "aud", skip_serializing_if = "Option::is_none", default)]
+    audience: Option<String>,
+    #[cbor(key = 4)]
+    #[serde(rename = "exp", skip_serializing_if = "Option::is_none", default)]
+    expiration: Option<u64>,
+    #[cbor(key = 5)]
+    #[serde(rename = "nbf", skip_serializing_if = "Option::is_none", default)]
+    not_before: Option<u64>,
+    #[cbor(key = 6)]
+    #[serde(rename = "iat", skip_serializing_if = "Option::is_none", default)]
+    issued_at: Option<u64>,
+    #[cbor(key = 7)]
+    #[serde(
+        rename = "cti",
+        with = "serde_bytes",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    cwt_id: Option<Vec<u8>>,
+}
+
+impl From<ClaimsBare> for Claims {
+    fn from(value: ClaimsBare) -> Self {
+        Claims {
+            issuer: value.issuer,
+            subject: value.subject,
+            audience: value.audience,
+            expiration: value.expiration,
+            not_before: value.not_before,
+            issued_at: value.issued_at,
+            cwt_id: value.cwt_id,
+        }
+    }
+}
+
 impl Claims {
     /// Creates empty claims.
     pub fn new() -> Self {
@@ -59,7 +105,12 @@ impl Claims {
 
     /// Decodes claims from CBOR bytes.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
-        Ok(cbor2::from_slice(data)?)
+        let data = tag::skip_tag(tag::CBOR_SELF_PREFIX, data);
+        if tag::starts_with_cbor_tag(data) {
+            Ok(cbor2::from_slice(data)?)
+        } else {
+            Ok(cbor2::from_slice::<ClaimsBare>(data)?.into())
+        }
     }
 
     /// Encodes claims to canonical CBOR bytes.

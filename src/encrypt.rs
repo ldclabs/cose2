@@ -9,12 +9,38 @@ use crate::{
 
 /// The on-the-wire COSE_Encrypt array: `[protected, unprotected, ciphertext, recipients]`.
 #[derive(Clone, Debug, PartialEq, Cbor)]
-struct EncryptWire(
-    #[serde(with = "serde_bytes")] Vec<u8>,
-    Header,
-    #[serde(with = "serde_bytes")] Option<Vec<u8>>,
-    Vec<Recipient>,
-);
+#[cbor(tag = 96, array)]
+struct EncryptWire {
+    #[serde(with = "serde_bytes")]
+    protected: Vec<u8>,
+    unprotected: Header,
+    #[serde(with = "serde_bytes")]
+    ciphertext: Option<Vec<u8>>,
+    recipients: Vec<Recipient>,
+}
+
+/// Untagged COSE_Encrypt, accepted for compatibility with untagged transports.
+#[derive(Clone, Debug, PartialEq, Cbor)]
+#[cbor(array)]
+struct EncryptBareWire {
+    #[serde(with = "serde_bytes")]
+    protected: Vec<u8>,
+    unprotected: Header,
+    #[serde(with = "serde_bytes")]
+    ciphertext: Option<Vec<u8>>,
+    recipients: Vec<Recipient>,
+}
+
+impl From<EncryptBareWire> for EncryptWire {
+    fn from(value: EncryptBareWire) -> Self {
+        EncryptWire {
+            protected: value.protected,
+            unprotected: value.unprotected,
+            ciphertext: value.ciphertext,
+            recipients: value.recipients,
+        }
+    }
+}
 
 /// A COSE_Encrypt message (encryption with one or more recipients).
 ///
@@ -47,7 +73,7 @@ impl EncryptMessage {
     }
 
     /// The `Enc_structure` (additional authenticated data, RFC 9052 §5.3).
-    fn to_be_encrypted(protected_raw: &[u8], external_aad: &[u8]) -> Vec<u8> {
+    fn to_be_encrypted(protected_raw: &[u8], external_aad: &[u8]) -> Result<Vec<u8>, Error> {
         util::encode_structure(vec![
             Value::from("Encrypt"),
             Value::Bytes(protected_raw.to_vec()),
@@ -76,13 +102,16 @@ impl EncryptMessage {
         encryptor: &dyn Encryptor,
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
+        if self.recipients.is_empty() {
+            return Err(Error::Custom("EncryptMessage has no recipients".into()));
+        }
         util::ensure_protected_alg(&mut self.protected, encryptor.alg())?;
         util::ensure_unprotected_kid(&mut self.unprotected, encryptor.kid());
 
         let iv = self.iv(encryptor)?;
-        self.protected_raw = encode_protected(&self.protected);
-        let aad = Self::to_be_encrypted(&self.protected_raw, external_aad.unwrap_or(&[]));
-        let plaintext = self.payload.clone().unwrap_or_default();
+        self.protected_raw = encode_protected(&self.protected)?;
+        let aad = Self::to_be_encrypted(&self.protected_raw, external_aad.unwrap_or(&[]))?;
+        let plaintext = util::require_plaintext(&self.payload, "EncryptMessage::encrypt")?.to_vec();
         self.ciphertext = encryptor.encrypt(&iv, &plaintext, &aad)?;
         self.encrypted = true;
         Ok(())
@@ -108,36 +137,39 @@ impl EncryptMessage {
         if self.recipients.is_empty() {
             return Err(Error::Custom("EncryptMessage has no recipients".into()));
         }
-        let wire = EncryptWire(
-            self.protected_raw.clone(),
-            self.unprotected.clone(),
-            Some(self.ciphertext.clone()),
-            self.recipients.clone(),
-        );
-        Ok(tag::with_tag(
-            tag::ENCRYPT_PREFIX,
-            &cbor2::to_canonical_vec(&wire)?,
-        ))
+        let wire = EncryptWire {
+            protected: self.protected_raw.clone(),
+            unprotected: self.unprotected.clone(),
+            ciphertext: Some(self.ciphertext.clone()),
+            recipients: self.recipients.clone(),
+        };
+        Ok(cbor2::to_canonical_vec(&wire)?)
     }
 
     /// Decodes a COSE_Encrypt message (tagged or untagged) without decrypting.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
-        let body = tag::untag(data, tag::ENCRYPT_PREFIX);
-        let wire: EncryptWire = cbor2::from_slice(body)?;
-        if wire.3.is_empty() {
+        let body = tag::strip_message_wrappers(data);
+        let wire: EncryptWire = if body.starts_with(tag::ENCRYPT_PREFIX) {
+            cbor2::from_slice(body)?
+        } else if tag::starts_with_cbor_tag(body) {
+            return Err(Error::Custom("unexpected CBOR tag for COSE_Encrypt".into()));
+        } else {
+            cbor2::from_slice::<EncryptBareWire>(body)?.into()
+        };
+        if wire.recipients.is_empty() {
             return Err(Error::Custom("EncryptMessage has no recipients".into()));
         }
-        let protected = decode_protected(&wire.0)?;
+        let protected = decode_protected(&wire.protected)?;
         let ciphertext = wire
-            .2
+            .ciphertext
             .ok_or_else(|| Error::Custom("COSE_Encrypt has no ciphertext".into()))?;
         Ok(EncryptMessage {
             protected,
-            unprotected: wire.1,
+            unprotected: wire.unprotected,
             payload: None,
-            recipients: wire.3,
+            recipients: wire.recipients,
             ciphertext,
-            protected_raw: wire.0,
+            protected_raw: wire.protected,
             encrypted: true,
         })
     }
@@ -156,7 +188,7 @@ impl EncryptMessage {
         }
         util::check_protected_alg(&self.protected, encryptor.alg())?;
         let iv = self.iv(encryptor)?;
-        let aad = Self::to_be_encrypted(&self.protected_raw, external_aad.unwrap_or(&[]));
+        let aad = Self::to_be_encrypted(&self.protected_raw, external_aad.unwrap_or(&[]))?;
         let plaintext = encryptor.decrypt(&iv, &self.ciphertext, &aad)?;
         self.payload = Some(plaintext);
         Ok(self.payload.as_deref().unwrap())
@@ -180,4 +212,20 @@ impl EncryptMessage {
 
     /// The on-the-wire CBOR tag for COSE_Encrypt.
     pub const TAG: u64 = iana::CBORTagCOSEEncrypt;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_cbor_shape<T: cbor2::Cbor>(tag: Option<u64>, array: bool) {
+        assert_eq!(T::TAG, tag);
+        assert_eq!(T::ARRAY, array);
+    }
+
+    #[test]
+    fn wire_metadata_declares_tagged_array_shape() {
+        assert_cbor_shape::<EncryptWire>(Some(iana::CBORTagCOSEEncrypt), true);
+        assert_cbor_shape::<EncryptBareWire>(None, true);
+    }
 }

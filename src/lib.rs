@@ -5,6 +5,11 @@
 //! claims, and delegates cryptography to caller-supplied implementations of
 //! the [`Signer`], [`Verifier`], [`Macer`] and [`Encryptor`] traits — so it
 //! ships no cryptographic dependencies of its own.
+//! Top-level COSE messages use named Rust structs with `#[cbor(array)]` to keep
+//! the COSE array wire shape, and encode with their registered CBOR tags
+//! through `#[derive(cbor2::Cbor)]`. CWT claims likewise encode with their
+//! registered CBOR tag. Decode helpers still accept untagged messages and claim
+//! maps for compatibility.
 //!
 //! # Example: COSE_Sign1 round trip
 //!
@@ -14,12 +19,12 @@
 //! // A trivial (insecure) signer/verifier for illustration.
 //! struct Demo;
 //! impl Signer for Demo {
-//!     fn alg(&self) -> i64 { iana::AlgorithmEdDSA }
-//!     fn kid(&self) -> &[u8] { b"key-1" }
+//!     fn alg(&self) -> Option<cose2::Label> { Some(iana::AlgorithmEdDSA.into()) }
+//!     fn kid(&self) -> Option<&[u8]> { Some(b"key-1") }
 //!     fn sign(&self, data: &[u8]) -> Result<Vec<u8>, Error> { Ok(data.to_vec()) }
 //! }
 //! impl Verifier for Demo {
-//!     fn alg(&self) -> i64 { iana::AlgorithmEdDSA }
+//!     fn alg(&self) -> Option<cose2::Label> { Some(iana::AlgorithmEdDSA.into()) }
 //!     fn verify(&self, data: &[u8], sig: &[u8]) -> Result<(), Error> {
 //!         if sig == data { Ok(()) } else { Err(Error::verify("bad signature")) }
 //!     }

@@ -8,7 +8,7 @@ use common::*;
 use cose2::{
     cwt::{Claims, Validator, ValidatorOptions},
     iana, tag, CoseMap, Encrypt0Message, EncryptMessage, Header, KdfContext, Key, Label,
-    Mac0Message, MacMessage, Recipient, Sign1Message, SignMessage, SuppPubInfo, Value,
+    Mac0Message, MacMessage, PartyInfo, Recipient, Sign1Message, SignMessage, SuppPubInfo, Value,
 };
 
 // ----------------------------------------------------------------------------
@@ -127,6 +127,28 @@ fn recipient_invalid_protected_bytes() {
 }
 
 #[test]
+fn recipient_rejects_null_or_extra_nested_recipients_slot() {
+    let null_nested = cbor2::to_vec(&(
+        serde_bytes::Bytes::new(&[]),
+        Header::new(),
+        Option::<&serde_bytes::Bytes>::None,
+        Option::<Vec<Recipient>>::None,
+    ))
+    .unwrap();
+    assert!(Recipient::from_slice(&null_nested).is_err());
+
+    let extra = cbor2::to_vec(&(
+        serde_bytes::Bytes::new(&[]),
+        Header::new(),
+        Option::<&serde_bytes::Bytes>::None,
+        Vec::<Recipient>::new(),
+        true,
+    ))
+    .unwrap();
+    assert!(Recipient::from_slice(&extra).is_err());
+}
+
+#[test]
 fn supp_pub_info_expecting_on_wrong_type() {
     assert!(cbor2::from_slice::<SuppPubInfo>(&[0x01]).is_err());
 }
@@ -139,8 +161,52 @@ fn supp_pub_info_invalid_protected_bytes() {
 }
 
 #[test]
+fn supp_pub_info_rejects_null_other_or_extra_elements() {
+    let null_other = cbor2::to_vec(&(
+        128u64,
+        serde_bytes::Bytes::new(&[]),
+        Option::<&serde_bytes::Bytes>::None,
+    ))
+    .unwrap();
+    assert!(cbor2::from_slice::<SuppPubInfo>(&null_other).is_err());
+
+    let extra = cbor2::to_vec(&(
+        128u64,
+        serde_bytes::Bytes::new(&[]),
+        serde_bytes::Bytes::new(b"other"),
+        true,
+    ))
+    .unwrap();
+    assert!(cbor2::from_slice::<SuppPubInfo>(&extra).is_err());
+}
+
+#[test]
 fn kdf_context_expecting_on_wrong_type() {
     assert!(KdfContext::from_slice(&[0x01]).is_err());
+}
+
+#[test]
+fn kdf_context_rejects_null_supp_priv_or_extra_elements() {
+    let null_priv = cbor2::to_vec(&(
+        1i64,
+        PartyInfo::default(),
+        PartyInfo::default(),
+        SuppPubInfo::default(),
+        Option::<&serde_bytes::Bytes>::None,
+    ))
+    .unwrap();
+    assert!(KdfContext::from_slice(&null_priv).is_err());
+
+    let extra = cbor2::to_vec(&(
+        1i64,
+        PartyInfo::default(),
+        PartyInfo::default(),
+        SuppPubInfo::default(),
+        serde_bytes::Bytes::new(b"private"),
+        true,
+    ))
+    .unwrap();
+    assert!(KdfContext::from_slice(&extra).is_err());
 }
 
 // ----------------------------------------------------------------------------

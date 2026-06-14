@@ -9,11 +9,35 @@ use crate::{
 
 /// The on-the-wire COSE_Encrypt0 array: `[protected, unprotected, ciphertext]`.
 #[derive(Clone, Debug, PartialEq, Cbor)]
-struct Encrypt0Wire(
-    #[serde(with = "serde_bytes")] Vec<u8>,
-    Header,
-    #[serde(with = "serde_bytes")] Option<Vec<u8>>,
-);
+#[cbor(tag = 16, array)]
+struct Encrypt0Wire {
+    #[serde(with = "serde_bytes")]
+    protected: Vec<u8>,
+    unprotected: Header,
+    #[serde(with = "serde_bytes")]
+    ciphertext: Option<Vec<u8>>,
+}
+
+/// Untagged COSE_Encrypt0, accepted for compatibility with untagged transports.
+#[derive(Clone, Debug, PartialEq, Cbor)]
+#[cbor(array)]
+struct Encrypt0BareWire {
+    #[serde(with = "serde_bytes")]
+    protected: Vec<u8>,
+    unprotected: Header,
+    #[serde(with = "serde_bytes")]
+    ciphertext: Option<Vec<u8>>,
+}
+
+impl From<Encrypt0BareWire> for Encrypt0Wire {
+    fn from(value: Encrypt0BareWire) -> Self {
+        Encrypt0Wire {
+            protected: value.protected,
+            unprotected: value.unprotected,
+            ciphertext: value.ciphertext,
+        }
+    }
+}
 
 /// A COSE_Encrypt0 message.
 ///
@@ -45,7 +69,7 @@ impl Encrypt0Message {
     }
 
     /// The `Enc_structure` (additional authenticated data, RFC 9052 §5.3).
-    fn to_be_encrypted(protected_raw: &[u8], external_aad: &[u8]) -> Vec<u8> {
+    fn to_be_encrypted(protected_raw: &[u8], external_aad: &[u8]) -> Result<Vec<u8>, Error> {
         util::encode_structure(vec![
             Value::from("Encrypt0"),
             Value::Bytes(protected_raw.to_vec()),
@@ -79,9 +103,10 @@ impl Encrypt0Message {
         util::ensure_unprotected_kid(&mut self.unprotected, encryptor.kid());
 
         let iv = self.iv(encryptor)?;
-        self.protected_raw = encode_protected(&self.protected);
-        let aad = Self::to_be_encrypted(&self.protected_raw, external_aad.unwrap_or(&[]));
-        let plaintext = self.payload.clone().unwrap_or_default();
+        self.protected_raw = encode_protected(&self.protected)?;
+        let aad = Self::to_be_encrypted(&self.protected_raw, external_aad.unwrap_or(&[]))?;
+        let plaintext =
+            util::require_plaintext(&self.payload, "Encrypt0Message::encrypt")?.to_vec();
         self.ciphertext = encryptor.encrypt(&iv, &plaintext, &aad)?;
         self.encrypted = true;
         Ok(())
@@ -104,31 +129,36 @@ impl Encrypt0Message {
                 "Encrypt0Message must be encrypted before encoding".into(),
             ));
         }
-        let wire = Encrypt0Wire(
-            self.protected_raw.clone(),
-            self.unprotected.clone(),
-            Some(self.ciphertext.clone()),
-        );
-        Ok(tag::with_tag(
-            tag::ENCRYPT0_PREFIX,
-            &cbor2::to_canonical_vec(&wire)?,
-        ))
+        let wire = Encrypt0Wire {
+            protected: self.protected_raw.clone(),
+            unprotected: self.unprotected.clone(),
+            ciphertext: Some(self.ciphertext.clone()),
+        };
+        Ok(cbor2::to_canonical_vec(&wire)?)
     }
 
     /// Decodes a COSE_Encrypt0 message (tagged or untagged) without decrypting.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
-        let body = tag::untag(data, tag::ENCRYPT0_PREFIX);
-        let wire: Encrypt0Wire = cbor2::from_slice(body)?;
-        let protected = decode_protected(&wire.0)?;
+        let body = tag::strip_message_wrappers(data);
+        let wire: Encrypt0Wire = if body.starts_with(tag::ENCRYPT0_PREFIX) {
+            cbor2::from_slice(body)?
+        } else if tag::starts_with_cbor_tag(body) {
+            return Err(Error::Custom(
+                "unexpected CBOR tag for COSE_Encrypt0".into(),
+            ));
+        } else {
+            cbor2::from_slice::<Encrypt0BareWire>(body)?.into()
+        };
+        let protected = decode_protected(&wire.protected)?;
         let ciphertext = wire
-            .2
+            .ciphertext
             .ok_or_else(|| Error::Custom("COSE_Encrypt0 has no ciphertext".into()))?;
         Ok(Encrypt0Message {
             protected,
-            unprotected: wire.1,
+            unprotected: wire.unprotected,
             payload: None,
             ciphertext,
-            protected_raw: wire.0,
+            protected_raw: wire.protected,
             encrypted: true,
         })
     }
@@ -147,7 +177,7 @@ impl Encrypt0Message {
         }
         util::check_protected_alg(&self.protected, encryptor.alg())?;
         let iv = self.iv(encryptor)?;
-        let aad = Self::to_be_encrypted(&self.protected_raw, external_aad.unwrap_or(&[]));
+        let aad = Self::to_be_encrypted(&self.protected_raw, external_aad.unwrap_or(&[]))?;
         let plaintext = encryptor.decrypt(&iv, &self.ciphertext, &aad)?;
         self.payload = Some(plaintext);
         Ok(self.payload.as_deref().unwrap())
@@ -171,4 +201,20 @@ impl Encrypt0Message {
 
     /// The on-the-wire CBOR tag for COSE_Encrypt0.
     pub const TAG: u64 = iana::CBORTagCOSEEncrypt0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_cbor_shape<T: cbor2::Cbor>(tag: Option<u64>, array: bool) {
+        assert_eq!(T::TAG, tag);
+        assert_eq!(T::ARRAY, array);
+    }
+
+    #[test]
+    fn wire_metadata_declares_tagged_array_shape() {
+        assert_cbor_shape::<Encrypt0Wire>(Some(iana::CBORTagCOSEEncrypt0), true);
+        assert_cbor_shape::<Encrypt0BareWire>(None, true);
+    }
 }

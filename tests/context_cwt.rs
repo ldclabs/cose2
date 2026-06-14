@@ -1,9 +1,10 @@
 mod common;
 
+use cbor2::Cbor;
 use common::*;
 use cose2::{
     cwt::{Claims, ClaimsMap, Validator, ValidatorOptions},
-    iana, KdfContext, PartyInfo, Sign1Message, SuppPubInfo,
+    iana, tag, KdfContext, PartyInfo, Sign1Message, SuppPubInfo,
 };
 
 // ----------------------------------------------------------------------------
@@ -101,10 +102,19 @@ fn claims_round_trip_integer_keys() {
         cwt_id: Some(vec![0xa, 0xb, 0xc]),
     };
     let bytes = claims.to_vec().unwrap();
-    // Map keyed by integers 1..=7.
-    assert_eq!(bytes[0], 0xa7);
+    assert_eq!(Claims::TAG, Some(iana::CBORTagCWT));
+    assert_eq!(&bytes[..2], tag::CWT_PREFIX);
+    // Tagged map keyed by integers 1..=7.
+    assert_eq!(bytes[2], 0xa7);
     let back = Claims::from_slice(&bytes).unwrap();
     assert_eq!(back, claims);
+
+    // The public helper accepts untagged claim maps for compatibility.
+    let untagged = tag::skip_tag(tag::CWT_PREFIX, &bytes);
+    assert_eq!(Claims::from_slice(untagged).unwrap(), claims);
+
+    let wrong_tagged = tag::with_tag(tag::SIGN1_PREFIX, untagged);
+    assert!(Claims::from_slice(&wrong_tagged).is_err());
 }
 
 #[test]
@@ -114,15 +124,16 @@ fn claims_omit_absent_fields_and_json() {
         ..Default::default()
     };
     let bytes = claims.to_vec().unwrap();
-    // single-entry map {1: "iss"}
-    assert_eq!(bytes[0], 0xa1);
+    // tagged single-entry map {1: "iss"}
+    assert_eq!(&bytes[..2], tag::CWT_PREFIX);
+    assert_eq!(bytes[2], 0xa1);
 
     // JSON keeps the original (renamed) field names — the cbor2 derive leaves
     // serde names intact for other formats.
     // (We don't depend on serde_json here; check the empty-claims default.)
     let empty = Claims::new();
     assert_eq!(empty, Claims::default());
-    assert!(empty.to_vec().unwrap() == vec![0xa0]);
+    assert_eq!(empty.to_vec().unwrap(), vec![0xd8, 0x3d, 0xa0]);
 }
 
 #[test]

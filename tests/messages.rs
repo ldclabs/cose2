@@ -36,6 +36,11 @@ fn sign1_round_trip_and_auto_headers() {
         verified.payload.as_deref(),
         Some(&b"This is the content"[..])
     );
+
+    let cwt_wrapped = tag::with_tag(tag::CWT_PREFIX, &encoded);
+    assert!(Sign1Message::verify_and_decode(&verifier, &cwt_wrapped, None).is_ok());
+    let self_and_cwt_wrapped = tag::with_tag(tag::CBOR_SELF_PREFIX, &cwt_wrapped);
+    assert!(Sign1Message::verify_and_decode(&verifier, &self_and_cwt_wrapped, None).is_ok());
 }
 
 #[test]
@@ -57,7 +62,9 @@ fn sign1_untagged_and_detached_payload() {
     let verifier = MockVerifier::new(0, b"");
 
     let mut msg = Sign1Message::new(None);
-    msg.sign(&signer, None).unwrap();
+    assert!(msg.sign(&signer, None).is_err());
+    msg.sign_detached(&signer, b"detached content", None)
+        .unwrap();
     // Protected stays empty (no alg), unprotected empty (no kid).
     assert!(msg.protected.is_empty());
     assert!(msg.unprotected.is_empty());
@@ -67,7 +74,21 @@ fn sign1_untagged_and_detached_payload() {
     let untagged = &tagged[tag::SIGN1_PREFIX.len()..];
     let decoded = Sign1Message::from_slice(untagged).unwrap();
     assert_eq!(decoded.payload, None);
-    assert!(decoded.verify(&verifier, None).is_ok());
+    assert!(decoded.verify(&verifier, None).is_err());
+    assert!(decoded
+        .verify_detached(&verifier, b"detached content", None)
+        .is_ok());
+    assert!(decoded.verify_detached(&verifier, b"wrong", None).is_err());
+}
+
+#[test]
+fn sign1_rejects_wrong_cose_tag() {
+    let signer = MockSigner::new(iana::AlgorithmEdDSA, b"key-1");
+    let mut msg = Sign1Message::new(Some(b"x".to_vec()));
+    let encoded = msg.sign_and_encode(&signer, None).unwrap();
+    let bare = tag::skip_tag(tag::SIGN1_PREFIX, &encoded);
+    let wrong_tagged = tag::with_tag(tag::MAC0_PREFIX, bare);
+    assert!(Sign1Message::from_slice(&wrong_tagged).is_err());
 }
 
 #[test]
@@ -135,6 +156,26 @@ fn mac0_round_trip() {
     assert_eq!(verified.payload.as_deref(), Some(&b"content"[..]));
     assert!(Mac0Message::verify_and_decode(&macer, &encoded, None).is_err());
     assert_eq!(Mac0Message::TAG, 17);
+}
+
+#[test]
+fn mac0_detached_payload_round_trip() {
+    let macer = MockMacer::new(iana::AlgorithmHMAC_256_256, b"mac-kid");
+    let mut msg = Mac0Message::new(None);
+    assert!(msg.compute(&macer, None).is_err());
+
+    let encoded = msg
+        .compute_detached_and_encode(&macer, b"detached content", Some(b"aad"))
+        .unwrap();
+    let decoded = Mac0Message::from_slice(&encoded).unwrap();
+    assert_eq!(decoded.payload, None);
+    assert!(decoded.verify(&macer, Some(b"aad")).is_err());
+    assert!(decoded
+        .verify_detached(&macer, b"detached content", Some(b"aad"))
+        .is_ok());
+    assert!(decoded
+        .verify_detached(&macer, b"wrong", Some(b"aad"))
+        .is_err());
 }
 
 #[test]
@@ -216,6 +257,13 @@ fn encrypt0_iv_handling_errors() {
         .insert(iana::HeaderParameterIV, vec![0u8; 8]);
     let err2 = msg2.encrypt(&enc, None).unwrap_err();
     assert!(format!("{err2}").contains("IV size mismatch"));
+
+    // Missing plaintext; use Some(Vec::new()) when an empty plaintext is intended.
+    let mut msg3 = Encrypt0Message::new(None);
+    msg3.unprotected
+        .insert(iana::HeaderParameterIV, vec![0u8; 12]);
+    let err3 = msg3.encrypt(&enc, None).unwrap_err();
+    assert!(format!("{err3}").contains("plaintext"));
 }
 
 #[test]
@@ -307,6 +355,26 @@ fn mac_round_trip_with_recipient() {
 }
 
 #[test]
+fn mac_detached_payload_round_trip() {
+    let macer = MockMacer::new(iana::AlgorithmHMAC_256_256, b"m");
+    let mut msg = MacMessage::new(None);
+    let mut r = Recipient::new();
+    r.ciphertext = Some(vec![]);
+    msg.recipients.push(r);
+
+    assert!(msg.compute(&macer, None).is_err());
+    let encoded = msg
+        .compute_detached_and_encode(&macer, b"detached content", None)
+        .unwrap();
+    let decoded = MacMessage::from_slice(&encoded).unwrap();
+    assert_eq!(decoded.payload, None);
+    assert!(decoded.verify(&macer, None).is_err());
+    assert!(decoded
+        .verify_detached(&macer, b"detached content", None)
+        .is_ok());
+}
+
+#[test]
 fn mac_requires_recipients() {
     let macer = MockMacer::new(iana::AlgorithmHMAC_256_256, b"m");
     let mut msg = MacMessage::new(Some(b"x".to_vec()));
@@ -367,6 +435,17 @@ fn encrypt_requires_recipients_and_state() {
     assert!(unprocessed.to_vec().is_err());
     let mut undecoded = EncryptMessage::new(Some(b"x".to_vec()));
     assert!(undecoded.decrypt(&enc, None).is_err());
+
+    let mut no_plaintext = EncryptMessage::new(None);
+    no_plaintext
+        .unprotected
+        .insert(iana::HeaderParameterIV, vec![0u8; 12]);
+    no_plaintext.recipients.push(Recipient {
+        ciphertext: Some(vec![]),
+        ..Default::default()
+    });
+    let err = no_plaintext.encrypt(&enc, None).unwrap_err();
+    assert!(format!("{err}").contains("plaintext"));
 }
 
 // ----------------------------------------------------------------------------
@@ -391,6 +470,28 @@ fn sign_round_trip_multiple_signers() {
     let verified = SignMessage::verify_and_decode(&verifiers, &encoded, None).unwrap();
     assert_eq!(verified.payload.as_deref(), Some(&b"content"[..]));
     assert_eq!(SignMessage::TAG, 98);
+}
+
+#[test]
+fn sign_detached_payload_round_trip() {
+    let signer = MockSigner::new(iana::AlgorithmES256, b"a");
+    let verifier = MockVerifier::new(iana::AlgorithmES256, b"a");
+    let mut msg = SignMessage::new(None);
+    let signers: [&dyn cose2::Signer; 1] = [&signer];
+
+    assert!(msg.sign(&signers, None).is_err());
+    let encoded = msg
+        .sign_detached_and_encode(&signers, b"detached content", None)
+        .unwrap();
+    let decoded = SignMessage::from_slice(&encoded).unwrap();
+    assert_eq!(decoded.payload, None);
+
+    let verifiers: [&dyn cose2::Verifier; 1] = [&verifier];
+    assert!(decoded.verify(&verifiers, None).is_err());
+    assert!(decoded
+        .verify_detached(&verifiers, b"detached content", None)
+        .is_ok());
+    assert!(SignMessage::verify_detached_and_decode(&verifiers, &encoded, b"wrong", None).is_err());
 }
 
 #[test]

@@ -4,23 +4,27 @@
 //! itself. Callers supply signing, verification, MAC and encryption by
 //! implementing these traits with the crypto library of their choice.
 
-use crate::Error;
+use crate::{Error, Label};
 
 /// Produces digital signatures for COSE_Sign and COSE_Sign1.
 ///
 /// Reference: <https://datatracker.ietf.org/doc/html/rfc9052#name-signature-algorithms>.
 pub trait Signer {
-    /// The COSE algorithm identifier this signer uses, or
-    /// [`AlgorithmReserved`](crate::iana::AlgorithmReserved) (0) when none
-    /// should be written to the protected header.
-    fn alg(&self) -> i64 {
-        crate::iana::AlgorithmReserved
+    /// The COSE algorithm identifier this signer uses.
+    ///
+    /// Returning `None` leaves the `alg` header untouched. Returning `Some`
+    /// writes the identifier when it is absent, or checks that an existing
+    /// protected `alg` value matches. COSE algorithm identifiers are
+    /// `int / tstr`, represented by [`Label`].
+    fn alg(&self) -> Option<Label> {
+        None
     }
 
-    /// The key identifier, or an empty slice when none should be written to
-    /// the unprotected header.
-    fn kid(&self) -> &[u8] {
-        &[]
+    /// The key identifier to write to the unprotected header.
+    ///
+    /// Returning `None` leaves the `kid` header untouched.
+    fn kid(&self) -> Option<&[u8]> {
+        None
     }
 
     /// Computes the signature over `data`.
@@ -29,14 +33,14 @@ pub trait Signer {
 
 /// Verifies digital signatures for COSE_Sign and COSE_Sign1.
 pub trait Verifier {
-    /// The COSE algorithm identifier this verifier expects.
-    fn alg(&self) -> i64 {
-        crate::iana::AlgorithmReserved
+    /// The COSE algorithm identifier this verifier expects, if any.
+    fn alg(&self) -> Option<Label> {
+        None
     }
 
-    /// The key identifier matched against a message's `kid` header.
-    fn kid(&self) -> &[u8] {
-        &[]
+    /// The key identifier matched against a message's `kid` header, if any.
+    fn kid(&self) -> Option<&[u8]> {
+        None
     }
 
     /// Returns `Ok(())` if `signature` is valid for `data`, otherwise an error.
@@ -48,14 +52,14 @@ pub trait Verifier {
 ///
 /// Reference: <https://datatracker.ietf.org/doc/html/rfc9052#name-message-authentication-code>.
 pub trait Macer {
-    /// The COSE algorithm identifier this MACer uses.
-    fn alg(&self) -> i64 {
-        crate::iana::AlgorithmReserved
+    /// The COSE algorithm identifier this MACer uses, if any.
+    fn alg(&self) -> Option<Label> {
+        None
     }
 
-    /// The key identifier.
-    fn kid(&self) -> &[u8] {
-        &[]
+    /// The key identifier to write to the unprotected header, if any.
+    fn kid(&self) -> Option<&[u8]> {
+        None
     }
 
     /// Computes the authentication tag over `data`.
@@ -69,14 +73,14 @@ pub trait Macer {
 ///
 /// Reference: <https://datatracker.ietf.org/doc/html/rfc9052#name-content-encryption-algorith>.
 pub trait Encryptor {
-    /// The COSE algorithm identifier this encryptor uses.
-    fn alg(&self) -> i64 {
-        crate::iana::AlgorithmReserved
+    /// The COSE algorithm identifier this encryptor uses, if any.
+    fn alg(&self) -> Option<Label> {
+        None
     }
 
-    /// The key identifier.
-    fn kid(&self) -> &[u8] {
-        &[]
+    /// The key identifier to write to the unprotected header, if any.
+    fn kid(&self) -> Option<&[u8]> {
+        None
     }
 
     /// The nonce (IV) size, in bytes, this encryptor expects.

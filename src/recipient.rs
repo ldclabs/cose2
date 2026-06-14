@@ -1,8 +1,8 @@
 //! COSE_recipient (RFC 9052 §5.1).
 
 use serde::{
-    de::{Error as _, SeqAccess, Visitor},
-    ser::SerializeSeq,
+    de::{Error as _, IgnoredAny, SeqAccess, Visitor},
+    ser::{Error as _, SerializeSeq},
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
@@ -50,7 +50,7 @@ impl Serialize for Recipient {
     where
         S: Serializer,
     {
-        let protected_raw = encode_protected(&self.protected);
+        let protected_raw = encode_protected(&self.protected).map_err(S::Error::custom)?;
         let len = if self.recipients.is_empty() { 3 } else { 4 };
         let mut seq = serializer.serialize_seq(Some(len))?;
         seq.serialize_element(serde_bytes::Bytes::new(&protected_raw))?;
@@ -93,7 +93,10 @@ impl<'de> Deserialize<'de> for Recipient {
                 let ciphertext: Option<serde_bytes::ByteBuf> = seq
                     .next_element()?
                     .ok_or_else(|| A::Error::custom("missing ciphertext"))?;
-                let recipients: Vec<Recipient> = seq.next_element()?.unwrap_or_default();
+                let recipients = seq.next_element::<Vec<Recipient>>()?.unwrap_or_default();
+                if seq.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(A::Error::invalid_length(5, &self));
+                }
 
                 let protected = decode_protected(&protected_raw).map_err(A::Error::custom)?;
                 Ok(Recipient {

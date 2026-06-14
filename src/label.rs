@@ -7,6 +7,8 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
+use crate::Value;
+
 /// A COSE label, used as the key of header, key and claim maps.
 ///
 /// RFC 9052 defines a label as `int / tstr`, so a `Label` is either a
@@ -67,6 +69,24 @@ impl From<String> for Label {
 impl From<&str> for Label {
     fn from(value: &str) -> Self {
         Label::Text(value.to_string())
+    }
+}
+
+impl From<Label> for Value {
+    fn from(value: Label) -> Self {
+        match value {
+            Label::Int(i) => Value::from(i),
+            Label::Text(s) => Value::from(s),
+        }
+    }
+}
+
+impl From<&Label> for Value {
+    fn from(value: &Label) -> Self {
+        match value {
+            Label::Int(i) => Value::from(*i),
+            Label::Text(s) => Value::from(s.clone()),
+        }
     }
 }
 

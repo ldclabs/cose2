@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use cose2::{Encryptor, Error, Macer, Signer, Verifier};
+use cose2::{iana, Encryptor, Error, Label, Macer, Signer, Verifier};
 
 /// A deterministic keyed "tag" over `secret || data`.
 pub fn toy_tag(secret: &[u8], data: &[u8]) -> Vec<u8> {
@@ -52,11 +52,11 @@ impl MockSigner {
 }
 
 impl Signer for MockSigner {
-    fn alg(&self) -> i64 {
-        self.alg
+    fn alg(&self) -> Option<Label> {
+        (self.alg != iana::AlgorithmReserved).then(|| self.alg.into())
     }
-    fn kid(&self) -> &[u8] {
-        &self.kid
+    fn kid(&self) -> Option<&[u8]> {
+        (!self.kid.is_empty()).then_some(self.kid.as_slice())
     }
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>, Error> {
         Ok(toy_tag(&self.secret, data))
@@ -82,11 +82,11 @@ impl MockVerifier {
 }
 
 impl Verifier for MockVerifier {
-    fn alg(&self) -> i64 {
-        self.alg
+    fn alg(&self) -> Option<Label> {
+        (self.alg != iana::AlgorithmReserved).then(|| self.alg.into())
     }
-    fn kid(&self) -> &[u8] {
-        &self.kid
+    fn kid(&self) -> Option<&[u8]> {
+        (!self.kid.is_empty()).then_some(self.kid.as_slice())
     }
     fn verify(&self, data: &[u8], signature: &[u8]) -> Result<(), Error> {
         if toy_tag(&self.secret, data) == signature {
@@ -115,11 +115,11 @@ impl MockMacer {
 }
 
 impl Macer for MockMacer {
-    fn alg(&self) -> i64 {
-        self.alg
+    fn alg(&self) -> Option<Label> {
+        (self.alg != iana::AlgorithmReserved).then(|| self.alg.into())
     }
-    fn kid(&self) -> &[u8] {
-        &self.kid
+    fn kid(&self) -> Option<&[u8]> {
+        (!self.kid.is_empty()).then_some(self.kid.as_slice())
     }
     fn mac_create(&self, data: &[u8]) -> Result<Vec<u8>, Error> {
         Ok(toy_tag(&self.secret, data))
@@ -162,11 +162,11 @@ impl MockEncryptor {
 }
 
 impl Encryptor for MockEncryptor {
-    fn alg(&self) -> i64 {
-        self.alg
+    fn alg(&self) -> Option<Label> {
+        (self.alg != iana::AlgorithmReserved).then(|| self.alg.into())
     }
-    fn kid(&self) -> &[u8] {
-        &self.kid
+    fn kid(&self) -> Option<&[u8]> {
+        (!self.kid.is_empty()).then_some(self.kid.as_slice())
     }
     fn nonce_size(&self) -> usize {
         self.nonce_size
@@ -204,8 +204,8 @@ pub struct FixedEncryptor {
 }
 
 impl Encryptor for FixedEncryptor {
-    fn alg(&self) -> i64 {
-        self.alg
+    fn alg(&self) -> Option<Label> {
+        (self.alg != iana::AlgorithmReserved).then(|| self.alg.into())
     }
     fn nonce_size(&self) -> usize {
         self.nonce_size

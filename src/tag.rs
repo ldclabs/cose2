@@ -60,10 +60,13 @@ pub fn remove_cbor_tag(data: &[u8]) -> &[u8] {
     data
 }
 
-/// Strips the self-described CBOR and CWT prefixes, then the given COSE
-/// message tag prefix if present, leaving the bare message body.
-pub(crate) fn untag<'a>(data: &'a [u8], message_prefix: &[u8]) -> &'a [u8] {
+/// Strips only the optional self-described CBOR and CWT wrapper prefixes.
+pub(crate) fn strip_message_wrappers(data: &[u8]) -> &[u8] {
     let data = skip_tag(CBOR_SELF_PREFIX, data);
-    let data = skip_tag(CWT_PREFIX, data);
-    skip_tag(message_prefix, data)
+    skip_tag(CWT_PREFIX, data)
+}
+
+/// Returns true when `data` begins with a CBOR semantic tag header.
+pub(crate) fn starts_with_cbor_tag(data: &[u8]) -> bool {
+    matches!(data.first(), Some(0xc0..=0xdb))
 }

@@ -1,4 +1,4 @@
-use cose2::{iana, tag, CoseMap, Error, Key, KeySet, Label, Value};
+use cose2::{iana, tag, CoseMap, Error, Header, Key, KeySet, Label, Value};
 
 // ----------------------------------------------------------------------------
 // Label
@@ -99,6 +99,8 @@ fn cosemap_typed_getters() {
     assert_eq!(m.get_text(3).unwrap(), Some("text"));
     assert_eq!(m.get_bool(4).unwrap(), Some(true));
     assert_eq!(m.get_array(5).unwrap().unwrap().len(), 2);
+    assert_eq!(m.get_label(1).unwrap(), Some(Label::Int(42)));
+    assert_eq!(m.get_label(3).unwrap(), Some(Label::Text("text".into())));
 
     // absent → Ok(None)
     assert_eq!(m.get_i64(99).unwrap(), None);
@@ -113,11 +115,13 @@ fn cosemap_type_mismatches_error() {
     let mut m = CoseMap::new();
     m.insert(1, "not an int");
     m.insert(2, 1i64);
+    m.insert(3, true);
     assert!(matches!(m.get_i64(1), Err(Error::UnexpectedType(_))));
     assert!(matches!(m.get_bytes(2), Err(Error::UnexpectedType(_))));
     assert!(matches!(m.get_text(2), Err(Error::UnexpectedType(_))));
     assert!(matches!(m.get_bool(2), Err(Error::UnexpectedType(_))));
     assert!(matches!(m.get_array(2), Err(Error::UnexpectedType(_))));
+    assert!(matches!(m.get_label(3), Err(Error::UnexpectedType(_))));
 
     // integer out of i64 range
     let mut big = CoseMap::new();
@@ -157,6 +161,41 @@ fn cosemap_rejects_duplicate_keys() {
 fn cosemap_default_impl() {
     let m: CoseMap = Default::default();
     assert!(m.is_empty());
+}
+
+// ----------------------------------------------------------------------------
+// Header
+// ----------------------------------------------------------------------------
+
+#[test]
+fn header_accessors_support_int_and_text_algorithm_ids() {
+    let mut header = Header::new();
+    header
+        .set_alg(iana::AlgorithmEdDSA)
+        .set_kid(b"kid".to_vec())
+        .set_iv(vec![1, 2, 3])
+        .set_partial_iv(vec![4, 5]);
+
+    assert_eq!(
+        header.alg().unwrap(),
+        Some(Label::Int(iana::AlgorithmEdDSA))
+    );
+    assert_eq!(header.kid().unwrap(), Some(&b"kid"[..]));
+    assert_eq!(header.iv().unwrap(), Some(&[1, 2, 3][..]));
+    assert_eq!(header.partial_iv().unwrap(), Some(&[4, 5][..]));
+
+    header.set_alg("private-alg");
+    assert_eq!(
+        header.alg().unwrap(),
+        Some(Label::Text("private-alg".into()))
+    );
+
+    let bytes = header.to_vec().unwrap();
+    let back = Header::from_slice(&bytes).unwrap();
+    assert_eq!(back, header);
+
+    let map = header.clone().into_map();
+    assert_eq!(Header::from(map), header);
 }
 
 // ----------------------------------------------------------------------------

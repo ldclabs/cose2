@@ -2,8 +2,8 @@
 
 use cbor2::Cbor;
 use serde::{
-    de::{Error as _, SeqAccess, Visitor},
-    ser::SerializeSeq,
+    de::{Error as _, IgnoredAny, SeqAccess, Visitor},
+    ser::{Error as _, SerializeSeq},
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
@@ -45,7 +45,7 @@ impl Serialize for SuppPubInfo {
     where
         S: Serializer,
     {
-        let protected_raw = encode_protected(&self.protected);
+        let protected_raw = encode_protected(&self.protected).map_err(S::Error::custom)?;
         let len = if self.other.is_some() { 3 } else { 2 };
         let mut seq = serializer.serialize_seq(Some(len))?;
         seq.serialize_element(&self.key_data_length)?;
@@ -81,7 +81,10 @@ impl<'de> Deserialize<'de> for SuppPubInfo {
                 let protected_raw: serde_bytes::ByteBuf = seq
                     .next_element()?
                     .ok_or_else(|| A::Error::custom("missing protected header"))?;
-                let other: Option<serde_bytes::ByteBuf> = seq.next_element()?;
+                let other = seq.next_element::<serde_bytes::ByteBuf>()?;
+                if seq.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(A::Error::invalid_length(4, &self));
+                }
                 let protected = decode_protected(&protected_raw).map_err(A::Error::custom)?;
                 Ok(SuppPubInfo {
                     key_data_length,
@@ -171,7 +174,10 @@ impl<'de> Deserialize<'de> for KdfContext {
                 let supp_pub_info: SuppPubInfo = seq
                     .next_element()?
                     .ok_or_else(|| A::Error::custom("missing SuppPubInfo"))?;
-                let supp_priv_info: Option<serde_bytes::ByteBuf> = seq.next_element()?;
+                let supp_priv_info = seq.next_element::<serde_bytes::ByteBuf>()?;
+                if seq.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(A::Error::invalid_length(6, &self));
+                }
                 Ok(KdfContext {
                     algorithm_id,
                     party_u_info,

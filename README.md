@@ -26,7 +26,9 @@ implement the relevant trait.
   [`cwt::Validator`] for expiry, not-before, issued-at, issuer and audience.
 - **KDF context** — `KdfContext`, `PartyInfo`, `SuppPubInfo` (RFC 9053 §5.2).
 - **Tagging** — tagged or untagged messages, with optional CWT and
-  self-described CBOR prefixes handled transparently.
+  self-described CBOR prefixes handled transparently. Newly encoded COSE
+  messages and CWT claims use their registered CBOR tags through
+  `#[derive(cbor2::Cbor)]`.
 
 ## Quick start
 
@@ -36,13 +38,13 @@ use cose2::{iana, Sign1Message, Signer, Verifier, Error};
 // Plug in your own crypto. (This toy "signer" is for illustration only.)
 struct MySigner;
 impl Signer for MySigner {
-    fn alg(&self) -> i64 { iana::AlgorithmEdDSA }
-    fn kid(&self) -> &[u8] { b"key-1" }
+    fn alg(&self) -> Option<cose2::Label> { Some(iana::AlgorithmEdDSA.into()) }
+    fn kid(&self) -> Option<&[u8]> { Some(b"key-1") }
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>, Error> { /* ... */ Ok(data.to_vec()) }
 }
 struct MyVerifier;
 impl Verifier for MyVerifier {
-    fn alg(&self) -> i64 { iana::AlgorithmEdDSA }
+    fn alg(&self) -> Option<cose2::Label> { Some(iana::AlgorithmEdDSA.into()) }
     fn verify(&self, data: &[u8], sig: &[u8]) -> Result<(), Error> {
         if sig == data { Ok(()) } else { Err(Error::verify("bad signature")) }
     }
@@ -60,9 +62,23 @@ assert_eq!(verified.payload.as_deref(), Some(&b"This is the content"[..]));
 
 - Header, key and claim maps share one ordered type, [`CoseMap`], keyed by
   [`Label`] (`int` / `tstr`). Values are [`cbor2::Value`].
+- [`Header`] is a `CoseMap` newtype with typed accessors for common COSE
+  parameters (`alg`, `kid`, `iv`, `Partial IV`) while still dereferencing to
+  the underlying map for custom labels.
+- `alg` values in crypto traits are `Option<Label>`, so both registered
+  integer algorithms and private text-string algorithms are representable.
 - The protected header is captured as raw bytes on decode and reused verbatim
   in the `Sig_structure`/`MAC_structure`/`Enc_structure`, so signatures made
   with non-canonical encodings still verify.
+- Top-level COSE message wire types use named Rust structs with
+  `#[cbor(tag = ..., array)]`, preserving the COSE array wire shape while
+  declaring their IANA CBOR tags. CWT claims declare their IANA CBOR tag with
+  `#[cbor(tag = 61)]`. Decoders still accept untagged COSE messages and
+  untagged claim maps for compatibility.
+- Detached payloads are explicit: use `sign_detached*`,
+  `compute_detached*`, `verify_detached*`, or `verify_detached_and_decode`.
+- Encryption requires an explicit plaintext payload; use `Some(Vec::new())`
+  for an empty plaintext.
 - Newly built protected headers and keys serialize with canonical
   (deterministic) CBOR (RFC 8949 §4.2.1).
 - IVs are taken from the unprotected header; this crate generates no
@@ -89,6 +105,7 @@ Dual-licensed under MIT or the [UNLICENSE](http://unlicense.org).
 [`Macer`]: https://docs.rs/cose2/latest/cose2/trait.Macer.html
 [`Encryptor`]: https://docs.rs/cose2/latest/cose2/trait.Encryptor.html
 [`iana`]: https://docs.rs/cose2/latest/cose2/iana/index.html
+[`Header`]: https://docs.rs/cose2/latest/cose2/struct.Header.html
 [`CoseMap`]: https://docs.rs/cose2/latest/cose2/struct.CoseMap.html
 [`Label`]: https://docs.rs/cose2/latest/cose2/enum.Label.html
 [`cwt::Claims`]: https://docs.rs/cose2/latest/cose2/cwt/struct.Claims.html

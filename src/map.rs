@@ -93,6 +93,21 @@ impl CoseMap {
         }
     }
 
+    /// Returns the value for a label as an `int / tstr` COSE identifier.
+    pub fn get_label(&self, key: impl Into<Label>) -> Result<Option<Label>, Error> {
+        match self.0.get(&key.into()) {
+            None => Ok(None),
+            Some(Value::Integer(i)) => i64::try_from(*i)
+                .map(Label::Int)
+                .map(Some)
+                .map_err(|_| Error::UnexpectedType("integer out of i64 range".into())),
+            Some(Value::Text(s)) => Ok(Some(Label::Text(s.clone()))),
+            Some(_) => Err(Error::UnexpectedType(
+                "expected an integer or text string".into(),
+            )),
+        }
+    }
+
     /// Returns the value for a label as a boolean.
     pub fn get_bool(&self, key: impl Into<Label>) -> Result<Option<bool>, Error> {
         match self.0.get(&key.into()) {
