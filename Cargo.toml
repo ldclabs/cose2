@@ -4,7 +4,7 @@ members = ["."]
 
 [package]
 name = "cose2"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["0xZensh <txr1883@gmail.com>"]
 description = "A Rust library for CBOR Object Signing and Encryption (COSE, RFC 9052) and CBOR Web Token (CWT, RFC 8392), built on cbor2."
 homepage = "https://github.com/ldclabs/cose2"
@@ -16,7 +16,6 @@ categories = ["encoding", "parsing"]
 license = "Unlicense OR MIT"
 edition = "2021"
 rust-version = "1.85"
-exclude = ["doc/", ".github/"]
 
 [dependencies]
 cbor2 = { version = "1", features = ["derive"] }
@@ -31,6 +30,18 @@ hex = "0.4"
 default = []
 crypto = ["crypto-ring"]
 crypto-ring = ["dep:ring"]
+
+[[example]]
+name = "sign1_ring"
+required-features = ["crypto-ring"]
+
+[[example]]
+name = "mac0_ring"
+required-features = ["crypto-ring"]
+
+[[example]]
+name = "encrypt0_ring"
+required-features = ["crypto-ring"]
 
 [package.metadata.docs.rs]
 all-features = true

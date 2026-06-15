@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    name: test (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # `stable` plus the crate's declared MSRV (Cargo.toml `rust-version`).
+        rust: [stable, "1.85"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-targets --all-features
+
+      - name: Doc
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --all-features --no-deps
+
+  # The default build must stay free of cryptographic dependencies.
+  no-default-features:
+    name: default build has no crypto deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (no default features)
+        run: cargo build --no-default-features
+      - name: Assert `ring` is not linked by default
+        # `cargo tree -i ring` exits non-zero when ring is absent from the
+        # default dependency graph, which is exactly what we want.
+        run: |
+          if cargo tree --no-default-features -e normal -i ring >/dev/null 2>&1; then
+            echo "::error::ring must not be a default dependency"
+            exit 1
+          fi

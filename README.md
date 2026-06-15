@@ -21,6 +21,9 @@ implements Ed25519, ES256, ES384, RS256/384/512, PS256/384/512, HMAC
 ChaCha20/Poly1305. Algorithms outside ring's support are rejected at provider
 construction.
 
+- Typescript version: [https://github.com/ldclabs/cose-ts](https://github.com/ldclabs/cose-ts)
+- Golang version: [https://github.com/ldclabs/cose](https://github.com/ldclabs/cose)
+
 ## Features
 
 - **Messages** — `COSE_Sign1`, `COSE_Sign`, `COSE_Mac0`, `COSE_Mac`,
@@ -66,6 +69,39 @@ let verified = Sign1Message::verify_and_decode(&MyVerifier, &encoded, None)?;
 assert_eq!(verified.payload.as_deref(), Some(&b"This is the content"[..]));
 # Ok::<(), cose2::Error>(())
 ```
+
+## Use the API by task
+
+| Task                       | Start with                                                                            | Notes                                                                     |
+| -------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Sign one embedded payload  | `Sign1Message::sign_and_encode` / `Sign1Message::verify_and_decode`                   | The common COSE_Sign1 flow.                                               |
+| Sign one detached payload  | `Sign1Message::sign_detached_and_encode` / `Sign1Message::verify_detached_and_decode` | The wire payload is `nil`; carry the payload out of band.                 |
+| Sign with multiple signers | `SignMessage`                                                                         | Each signer has its own `Signature`.                                      |
+| MAC one payload            | `Mac0Message::compute_and_encode` / `Mac0Message::verify_and_decode`                  | Symmetric authentication without recipients.                              |
+| MAC with recipients        | `MacMessage`                                                                          | Recipient-layer cryptography stays application-owned.                     |
+| Encrypt one payload        | `Encrypt0Message::encrypt_and_encode` / `Encrypt0Message::decrypt_and_decode`         | Requires a full `IV`, or `Partial IV` plus `Encryptor::base_iv`.          |
+| Encrypt with recipients    | `EncryptMessage`                                                                      | `cose2` validates recipient structure but does not wrap or agree the CEK. |
+| Work with CWT claims       | `cwt::Claims`, `cwt::ClaimsMap`, `cwt::Validator`                                     | Use `ClaimsMap` when custom claims must be preserved.                     |
+| Work with COSE keys        | `Key`, `KeySet`                                                                       | `KeySet::lookup(kid)` returns all matches because `kid` is not unique.    |
+
+## Runnable examples
+
+These examples are intended as copy/paste starting points for humans and AI
+agents:
+
+```sh
+cargo run --example custom_crypto_traits
+cargo run --example detached_payload
+cargo run --example cwt_sign1
+cargo run --example sign1_ring --features crypto-ring
+cargo run --example mac0_ring --features crypto-ring
+cargo run --example encrypt0_ring --features crypto-ring
+```
+
+For a compact decision checklist — including a [`crypto-ring` algorithm
+recipe table][agent-recipes] mapping each algorithm to its required COSE key
+parameters — see the [Agent guide for cose2][agent-guide]. Agents modifying this
+crate's source should start from [AGENTS.md](AGENTS.md).
 
 ## Design notes
 
@@ -140,3 +176,5 @@ Dual-licensed under MIT or the [UNLICENSE](http://unlicense.org).
 [`cwt::ClaimsMap`]: https://docs.rs/cose2/latest/cose2/cwt/type.ClaimsMap.html
 [`cwt::Validator`]: https://docs.rs/cose2/latest/cose2/cwt/struct.Validator.html
 [`crypto`]: https://docs.rs/cose2/latest/cose2/crypto/index.html
+[agent-guide]: docs/agent-guide.md
+[agent-recipes]: docs/agent-guide.md#crypto-ring-algorithm-recipes
