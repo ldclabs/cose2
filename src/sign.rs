@@ -3,7 +3,7 @@
 use cbor2::Cbor;
 
 use crate::{
-    header::{decode_protected, encode_protected},
+    header::{decode_protected, encode_protected, validate_header_buckets},
     iana, tag, util, Error, Header, Signer, Value, Verifier,
 };
 
@@ -65,9 +65,13 @@ pub struct Signature {
 }
 
 impl Signature {
-    /// Returns the `kid` from the signature's unprotected header, if any.
+    /// Returns the signature's `kid`, read from the protected header first and
+    /// then the unprotected header (RFC 9052 §3).
     fn kid(&self) -> Result<Option<&[u8]>, Error> {
-        self.unprotected.kid()
+        match self.protected.kid()? {
+            Some(kid) => Ok(Some(kid)),
+            None => self.unprotected.kid(),
+        }
     }
 
     /// Returns the raw signature bytes.
@@ -160,6 +164,7 @@ impl SignMessage {
             ));
         }
         let protected_raw = encode_protected(&self.protected)?;
+        validate_header_buckets(&self.protected, &self.unprotected)?;
         let mut signatures = Vec::with_capacity(signers.len());
 
         for signer in signers {
@@ -218,6 +223,10 @@ impl SignMessage {
         if self.signatures.is_empty() {
             return Err(Error::Custom("SignMessage has no signatures".into()));
         }
+        validate_header_buckets(&self.protected, &self.unprotected)?;
+        for sig in &self.signatures {
+            validate_header_buckets(&sig.protected, &sig.unprotected)?;
+        }
         let signatures = self
             .signatures
             .iter()
@@ -250,9 +259,11 @@ impl SignMessage {
             return Err(Error::Custom("SignMessage has no signatures".into()));
         }
         let protected = decode_protected(&wire.protected)?;
+        validate_header_buckets(&protected, &wire.unprotected)?;
         let mut signatures = Vec::with_capacity(wire.signatures.len());
         for sw in wire.signatures {
             let sig_protected = decode_protected(&sw.protected)?;
+            validate_header_buckets(&sig_protected, &sw.unprotected)?;
             signatures.push(Signature {
                 protected: sig_protected,
                 unprotected: sw.unprotected,
@@ -318,18 +329,34 @@ impl SignMessage {
 
         for sig in &self.signatures {
             let kid = sig.kid()?;
-            let verifier = verifiers
-                .iter()
-                .find(|v| util::kid_matches(kid, v.kid()))
-                .ok_or_else(|| Error::verify("no verifier for signature kid"))?;
-            util::check_protected_alg(&sig.protected, verifier.alg())?;
             let tbs = Self::to_be_signed(
                 &self.protected_raw,
                 &sig.protected_raw,
                 external_aad,
                 payload,
             )?;
-            verifier.verify(&tbs, &sig.signature)?;
+            let mut matched_kid = false;
+            let mut last_error = None;
+            for verifier in verifiers.iter().filter(|v| util::kid_matches(kid, v.kid())) {
+                matched_kid = true;
+                if let Err(err) = util::check_protected_alg(&sig.protected, verifier.alg()) {
+                    last_error = Some(err);
+                    continue;
+                }
+                match verifier.verify(&tbs, &sig.signature) {
+                    Ok(()) => {
+                        last_error = None;
+                        break;
+                    }
+                    Err(err) => last_error = Some(err),
+                }
+            }
+            if let Some(err) = last_error {
+                return Err(err);
+            }
+            if !matched_kid {
+                return Err(Error::verify("no verifier for signature kid"));
+            }
         }
         Ok(())
     }

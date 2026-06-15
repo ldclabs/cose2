@@ -2,9 +2,23 @@ mod common;
 
 use common::*;
 use cose2::{
-    iana, tag, Encrypt0Message, EncryptMessage, Header, Mac0Message, MacMessage, Recipient,
-    Sign1Message, SignMessage,
+    iana, tag, Encrypt0Message, EncryptMessage, Header, Label, Mac0Message, MacMessage, Recipient,
+    RecipientAlgorithmClass, Sign1Message, SignMessage,
 };
+
+fn direct_recipient() -> Recipient {
+    let mut r = Recipient::new();
+    r.unprotected.set_alg(iana::AlgorithmDirect);
+    r.ciphertext = Some(vec![]);
+    r
+}
+
+fn key_wrap_recipient() -> Recipient {
+    let mut r = Recipient::new();
+    r.unprotected.set_alg(iana::AlgorithmA128KW);
+    r.ciphertext = Some(vec![1, 2, 3]);
+    r
+}
 
 // ----------------------------------------------------------------------------
 // Sign1
@@ -89,6 +103,44 @@ fn sign1_rejects_wrong_cose_tag() {
     let bare = tag::skip_tag(tag::SIGN1_PREFIX, &encoded);
     let wrong_tagged = tag::with_tag(tag::MAC0_PREFIX, bare);
     assert!(Sign1Message::from_slice(&wrong_tagged).is_err());
+}
+
+#[test]
+fn sign1_rejects_malformed_header_buckets() {
+    fn encoded_sign1(protected: &Header, unprotected: Header) -> Vec<u8> {
+        let protected_raw = if protected.is_empty() {
+            Vec::new()
+        } else {
+            protected.to_vec().unwrap()
+        };
+        let body = cbor2::to_vec(&(
+            serde_bytes::Bytes::new(&protected_raw),
+            unprotected,
+            Some(serde_bytes::Bytes::new(b"payload")),
+            serde_bytes::Bytes::new(b"sig"),
+        ))
+        .unwrap();
+        tag::with_tag(tag::SIGN1_PREFIX, &body)
+    }
+
+    let mut protected = Header::new();
+    protected.set_alg(iana::AlgorithmEdDSA);
+    let mut unprotected = Header::new();
+    unprotected.set_alg(iana::AlgorithmEdDSA);
+    assert!(Sign1Message::from_slice(&encoded_sign1(&protected, unprotected)).is_err());
+
+    let protected = Header::new();
+    let mut unprotected = Header::new();
+    unprotected.set_crit([Label::Text("private".into())]);
+    assert!(Sign1Message::from_slice(&encoded_sign1(&protected, unprotected)).is_err());
+
+    let mut protected = Header::new();
+    protected.set_crit(Vec::<Label>::new());
+    assert!(Sign1Message::from_slice(&encoded_sign1(&protected, Header::new())).is_err());
+
+    let mut protected = Header::new();
+    protected.set_crit([Label::Text("absent".into())]);
+    assert!(Sign1Message::from_slice(&encoded_sign1(&protected, Header::new())).is_err());
 }
 
 #[test]
@@ -245,6 +297,8 @@ fn encrypt0_round_trip_reversible() {
 #[test]
 fn encrypt0_iv_handling_errors() {
     let enc = MockEncryptor::new(iana::AlgorithmA128GCM, b"", 12);
+    let enc_with_base_iv =
+        MockEncryptor::new(iana::AlgorithmA128GCM, b"", 12).with_base_iv(vec![0u8; 12]);
 
     // Missing IV.
     let mut msg = Encrypt0Message::new(Some(b"x".to_vec()));
@@ -258,12 +312,66 @@ fn encrypt0_iv_handling_errors() {
     let err2 = msg2.encrypt(&enc, None).unwrap_err();
     assert!(format!("{err2}").contains("IV size mismatch"));
 
+    // IV and Partial IV are mutually exclusive.
+    let mut both = Encrypt0Message::new(Some(b"x".to_vec()));
+    both.unprotected.set_iv(vec![0u8; 12]);
+    both.unprotected.set_partial_iv(vec![1, 2]);
+    let err_both = both.encrypt(&enc_with_base_iv, None).unwrap_err();
+    assert!(format!("{err_both}").contains("must not both be present"));
+
+    // Partial IV needs an encryptor-provided Base IV.
+    let mut partial_without_base = Encrypt0Message::new(Some(b"x".to_vec()));
+    partial_without_base.unprotected.set_partial_iv(vec![1, 2]);
+    let err_base = partial_without_base.encrypt(&enc, None).unwrap_err();
+    assert!(format!("{err_base}").contains("Base IV"));
+
+    // The Base IV length must match the content-encryption nonce size.
+    let wrong_base_iv =
+        MockEncryptor::new(iana::AlgorithmA128GCM, b"", 12).with_base_iv(vec![0u8; 8]);
+    let mut partial_wrong_base = Encrypt0Message::new(Some(b"x".to_vec()));
+    partial_wrong_base.unprotected.set_partial_iv(vec![1, 2]);
+    let err_wrong_base = partial_wrong_base
+        .encrypt(&wrong_base_iv, None)
+        .unwrap_err();
+    assert!(format!("{err_wrong_base}").contains("Base IV size mismatch"));
+
+    // The Partial IV is left-padded to the nonce size, so it cannot be longer.
+    let mut long_partial = Encrypt0Message::new(Some(b"x".to_vec()));
+    long_partial.unprotected.set_partial_iv(vec![1u8; 13]);
+    let err_long_partial = long_partial.encrypt(&enc_with_base_iv, None).unwrap_err();
+    assert!(format!("{err_long_partial}").contains("Partial IV size mismatch"));
+
     // Missing plaintext; use Some(Vec::new()) when an empty plaintext is intended.
     let mut msg3 = Encrypt0Message::new(None);
     msg3.unprotected
         .insert(iana::HeaderParameterIV, vec![0u8; 12]);
     let err3 = msg3.encrypt(&enc, None).unwrap_err();
     assert!(format!("{err3}").contains("plaintext"));
+}
+
+#[test]
+fn encrypt0_partial_iv_uses_base_iv() {
+    let base_iv = vec![0xaau8; 12];
+    let partial_iv = vec![0x01, 0x02, 0x03];
+    let enc = MockEncryptor::new(iana::AlgorithmA128GCM, b"e", 12).with_base_iv(base_iv.clone());
+
+    let mut derived_nonce = base_iv.clone();
+    let offset = derived_nonce.len() - partial_iv.len();
+    for (byte, partial) in derived_nonce[offset..].iter_mut().zip(&partial_iv) {
+        *byte ^= *partial;
+    }
+
+    let mut partial = Encrypt0Message::new(Some(b"secret payload".to_vec()));
+    partial.unprotected.set_partial_iv(partial_iv);
+    let encoded = partial.encrypt_and_encode(&enc, Some(b"aad")).unwrap();
+
+    let mut full = Encrypt0Message::new(Some(b"secret payload".to_vec()));
+    full.unprotected.set_iv(derived_nonce);
+    full.encrypt(&enc, Some(b"aad")).unwrap();
+    assert_eq!(partial.ciphertext(), full.ciphertext());
+
+    let decoded = Encrypt0Message::decrypt_and_decode(&enc, &encoded, Some(b"aad")).unwrap();
+    assert_eq!(decoded.payload.as_deref(), Some(&b"secret payload"[..]));
 }
 
 #[test]
@@ -284,16 +392,28 @@ fn encrypt0_state_and_alg_errors() {
 }
 
 #[test]
-fn encrypt0_missing_ciphertext_is_rejected() {
-    // [protected, unprotected, nil] — a COSE_Encrypt0 with detached ciphertext.
-    let body = cbor2::to_vec(&(
-        serde_bytes::Bytes::new(&[]),
-        Header::new(),
-        Option::<&serde_bytes::Bytes>::None,
-    ))
-    .unwrap();
-    let tagged = tag::with_tag(tag::ENCRYPT0_PREFIX, &body);
-    assert!(Encrypt0Message::from_slice(&tagged).is_err());
+fn encrypt0_detached_ciphertext_round_trip() {
+    let enc = MockEncryptor::new(iana::AlgorithmA128GCM, b"e", 12);
+    let mut msg = Encrypt0Message::new(Some(b"secret payload".to_vec()));
+    msg.unprotected
+        .insert(iana::HeaderParameterIV, vec![7u8; 12]);
+    let (encoded, ciphertext) = msg.encrypt_detached_and_encode(&enc, Some(b"aad")).unwrap();
+
+    let mut decoded = Encrypt0Message::from_slice(&encoded).unwrap();
+    assert!(decoded.is_ciphertext_detached());
+    assert!(decoded.ciphertext().is_empty());
+    assert!(decoded.decrypt(&enc, Some(b"aad")).is_err());
+    let pt = decoded
+        .decrypt_detached(&enc, &ciphertext, Some(b"aad"))
+        .unwrap()
+        .to_vec();
+    assert_eq!(pt, b"secret payload");
+    assert_eq!(decoded.ciphertext(), &ciphertext[..]);
+
+    assert!(
+        Encrypt0Message::decrypt_detached_and_decode(&enc, &encoded, b"wrong", Some(b"aad"))
+            .is_err()
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -302,19 +422,14 @@ fn encrypt0_missing_ciphertext_is_rejected() {
 
 #[test]
 fn recipient_round_trip_three_and_four_elements() {
-    let mut r = Recipient::new();
-    r.unprotected
-        .insert(iana::HeaderParameterAlg, iana::AlgorithmDirect);
-    r.ciphertext = Some(vec![]);
+    let r = direct_recipient();
     let bytes = r.to_vec().unwrap();
     let back = Recipient::from_slice(&bytes).unwrap();
     assert_eq!(back, r);
 
     // With a nested recipient → 4-element form.
     let mut outer = Recipient::new();
-    outer
-        .protected
-        .insert(iana::HeaderParameterAlg, iana::AlgorithmA128KW);
+    outer.unprotected.set_alg(iana::AlgorithmA128KW);
     outer.ciphertext = Some(vec![1, 2, 3]);
     outer.recipients.push(r);
     let bytes = outer.to_vec().unwrap();
@@ -326,9 +441,60 @@ fn recipient_round_trip_three_and_four_elements() {
 #[test]
 fn recipient_null_ciphertext() {
     let r = Recipient::new();
-    let bytes = r.to_vec().unwrap();
-    let back = Recipient::from_slice(&bytes).unwrap();
-    assert_eq!(back.ciphertext, None);
+    assert!(r.to_vec().is_err());
+
+    let mut r = Recipient::new();
+    r.unprotected.set_alg(iana::AlgorithmA128KW);
+    assert!(r.to_vec().is_err());
+}
+
+#[test]
+fn recipient_validates_registered_algorithm_classes() {
+    let r = direct_recipient();
+    assert_eq!(
+        r.algorithm_class().unwrap(),
+        Some(RecipientAlgorithmClass::Direct)
+    );
+
+    let mut direct = direct_recipient();
+    direct.ciphertext = Some(vec![1]);
+    assert!(direct.validate().is_err());
+
+    let key_wrap = key_wrap_recipient();
+    assert_eq!(
+        key_wrap.algorithm_class().unwrap(),
+        Some(RecipientAlgorithmClass::KeyWrap)
+    );
+    assert!(key_wrap.validate().is_ok());
+
+    let mut key_wrap = key_wrap_recipient();
+    key_wrap.protected.set_kid(b"protected".to_vec());
+    assert!(key_wrap.validate().is_err());
+
+    let mut transport = Recipient::new();
+    transport
+        .unprotected
+        .set_alg(iana::AlgorithmRSAES_OAEP_SHA_256);
+    transport.protected.set_kid(b"protected".to_vec());
+    transport.ciphertext = Some(vec![1, 2, 3]);
+    assert!(transport.validate().is_err());
+
+    let mut direct_ka = Recipient::new();
+    direct_ka.protected.set_alg(iana::AlgorithmECDH_ES_HKDF_256);
+    direct_ka.ciphertext = Some(vec![]);
+    assert_eq!(
+        direct_ka.algorithm_class().unwrap(),
+        Some(RecipientAlgorithmClass::DirectKeyAgreement)
+    );
+    assert!(direct_ka.validate().is_ok());
+
+    let mut direct_ka_missing_ciphertext = direct_ka.clone();
+    direct_ka_missing_ciphertext.ciphertext = None;
+    assert!(direct_ka_missing_ciphertext.validate().is_err());
+
+    let mut ka_kw = Recipient::new();
+    ka_kw.protected.set_alg(iana::AlgorithmECDH_ES_A128KW);
+    assert!(ka_kw.validate().is_err());
 }
 
 // ----------------------------------------------------------------------------
@@ -339,11 +505,7 @@ fn recipient_null_ciphertext() {
 fn mac_round_trip_with_recipient() {
     let macer = MockMacer::new(iana::AlgorithmHMAC_256_256, b"m");
     let mut msg = MacMessage::new(Some(b"content".to_vec()));
-    let mut r = Recipient::new();
-    r.unprotected
-        .insert(iana::HeaderParameterAlg, iana::AlgorithmDirect);
-    r.ciphertext = Some(vec![]);
-    msg.recipients.push(r);
+    msg.recipients.push(direct_recipient());
 
     let encoded = msg.compute_and_encode(&macer, None).unwrap();
     assert_eq!(&encoded[..2], &[0xd8, 0x61]);
@@ -358,9 +520,7 @@ fn mac_round_trip_with_recipient() {
 fn mac_detached_payload_round_trip() {
     let macer = MockMacer::new(iana::AlgorithmHMAC_256_256, b"m");
     let mut msg = MacMessage::new(None);
-    let mut r = Recipient::new();
-    r.ciphertext = Some(vec![]);
-    msg.recipients.push(r);
+    msg.recipients.push(direct_recipient());
 
     assert!(msg.compute(&macer, None).is_err());
     let encoded = msg
@@ -383,9 +543,7 @@ fn mac_requires_recipients() {
 
     // A decoded COSE_Mac without recipients is rejected.
     let mut with = MacMessage::new(Some(b"x".to_vec()));
-    let mut r = Recipient::new();
-    r.ciphertext = Some(vec![]);
-    with.recipients.push(r);
+    with.recipients.push(direct_recipient());
     let encoded = with.compute_and_encode(&macer, None).unwrap();
     // Tamper: rebuild as a 5-array with empty recipients list is hard; instead
     // check the state/verify guards.
@@ -405,11 +563,7 @@ fn encrypt_round_trip_with_recipient() {
     let mut msg = EncryptMessage::new(Some(b"plaintext".to_vec()));
     msg.unprotected
         .insert(iana::HeaderParameterIV, vec![3u8; 12]);
-    let mut r = Recipient::new();
-    r.unprotected
-        .insert(iana::HeaderParameterAlg, iana::AlgorithmDirect);
-    r.ciphertext = Some(vec![]);
-    msg.recipients.push(r);
+    msg.recipients.push(direct_recipient());
 
     let encoded = msg.encrypt_and_encode(&enc, None).unwrap();
     assert_eq!(&encoded[..2], &[0xd8, 0x60]);
@@ -420,6 +574,49 @@ fn encrypt_round_trip_with_recipient() {
     // decrypt again directly to exercise the method path.
     assert_eq!(decoded.decrypt(&enc, None).unwrap(), b"plaintext");
     assert_eq!(EncryptMessage::TAG, 96);
+}
+
+#[test]
+fn encrypt_detached_ciphertext_round_trip() {
+    let enc = MockEncryptor::new(iana::AlgorithmA128GCM, b"", 12);
+    let mut msg = EncryptMessage::new(Some(b"plaintext".to_vec()));
+    msg.unprotected
+        .insert(iana::HeaderParameterIV, vec![3u8; 12]);
+    msg.recipients.push(direct_recipient());
+
+    let (encoded, ciphertext) = msg.encrypt_detached_and_encode(&enc, None).unwrap();
+    let mut decoded = EncryptMessage::from_slice(&encoded).unwrap();
+    assert!(decoded.is_ciphertext_detached());
+    assert!(decoded.decrypt(&enc, None).is_err());
+    assert_eq!(
+        decoded.decrypt_detached(&enc, &ciphertext, None).unwrap(),
+        b"plaintext"
+    );
+    assert!(EncryptMessage::decrypt_detached_and_decode(&enc, &encoded, b"wrong", None).is_err());
+}
+
+#[test]
+fn encrypt_partial_iv_round_trip_with_recipient() {
+    let enc = MockEncryptor::new(iana::AlgorithmA128GCM, b"", 12).with_base_iv(vec![0x55u8; 12]);
+    let mut msg = EncryptMessage::new(Some(b"plaintext".to_vec()));
+    msg.unprotected.set_partial_iv(vec![0x10, 0x20]);
+    msg.recipients.push(direct_recipient());
+
+    let encoded = msg.encrypt_and_encode(&enc, None).unwrap();
+    let decoded = EncryptMessage::decrypt_and_decode(&enc, &encoded, None).unwrap();
+    assert_eq!(decoded.payload.as_deref(), Some(&b"plaintext"[..]));
+}
+
+#[test]
+fn encrypt_rejects_direct_recipient_mixed_with_other_recipients() {
+    let enc = MockEncryptor::new(iana::AlgorithmA128GCM, b"", 12);
+    let mut msg = EncryptMessage::new(Some(b"plaintext".to_vec()));
+    msg.unprotected.set_iv(vec![0u8; 12]);
+    msg.recipients.push(direct_recipient());
+    msg.recipients.push(key_wrap_recipient());
+
+    let err = msg.encrypt(&enc, None).unwrap_err();
+    assert!(format!("{err}").contains("only recipient"));
 }
 
 #[test]
@@ -440,10 +637,7 @@ fn encrypt_requires_recipients_and_state() {
     no_plaintext
         .unprotected
         .insert(iana::HeaderParameterIV, vec![0u8; 12]);
-    no_plaintext.recipients.push(Recipient {
-        ciphertext: Some(vec![]),
-        ..Default::default()
-    });
+    no_plaintext.recipients.push(direct_recipient());
     let err = no_plaintext.encrypt(&enc, None).unwrap_err();
     assert!(format!("{err}").contains("plaintext"));
 }
@@ -508,6 +702,21 @@ fn sign_no_verifier_for_kid() {
 }
 
 #[test]
+fn sign_tries_all_verifiers_for_matching_kid() {
+    let signer = MockSigner::new(iana::AlgorithmES256, b"a");
+    let mut bad = MockVerifier::new(iana::AlgorithmES256, b"a");
+    bad.secret = b"wrong-secret".to_vec();
+    let good = MockVerifier::new(iana::AlgorithmES256, b"a");
+
+    let mut msg = SignMessage::new(Some(b"x".to_vec()));
+    let signers: [&dyn cose2::Signer; 1] = [&signer];
+    let encoded = msg.sign_and_encode(&signers, None).unwrap();
+
+    let verifiers: [&dyn cose2::Verifier; 2] = [&bad, &good];
+    assert!(SignMessage::verify_and_decode(&verifiers, &encoded, None).is_ok());
+}
+
+#[test]
 fn sign_empty_signers_and_verifiers_rejected() {
     let mut msg = SignMessage::new(Some(b"x".to_vec()));
     assert!(msg.sign(&[], None).is_err());
@@ -548,4 +757,79 @@ fn sign_signer_error_propagates() {
     let mut msg = SignMessage::new(Some(b"x".to_vec()));
     let signers: [&dyn cose2::Signer; 1] = [&FailingSigner];
     assert!(msg.sign(&signers, None).is_err());
+}
+
+// ----------------------------------------------------------------------------
+// Cross-bucket attribute lookup (RFC 9052 §3: protected bucket takes precedence)
+// ----------------------------------------------------------------------------
+
+#[test]
+fn encrypt0_reads_iv_from_protected_bucket() {
+    // Placing the IV in the protected bucket is unusual but permitted by the
+    // CDDL; the message layer must still find it (protected first, then
+    // unprotected) for both encryption and decryption.
+    let enc = MockEncryptor::new(iana::AlgorithmA128GCM, b"", 12);
+    let mut msg = Encrypt0Message::new(Some(b"secret".to_vec()));
+    msg.protected.set_iv(vec![9u8; 12]);
+    let encoded = msg.encrypt_and_encode(&enc, None).unwrap();
+
+    let mut decoded = Encrypt0Message::from_slice(&encoded).unwrap();
+    assert!(decoded.unprotected.iv().unwrap().is_none());
+    assert_eq!(decoded.protected.iv().unwrap(), Some(&[9u8; 12][..]));
+    let pt = decoded.decrypt(&enc, None).unwrap().to_vec();
+    assert_eq!(pt, b"secret");
+}
+
+#[test]
+fn sign_matches_kid_in_signature_protected_bucket() {
+    use cbor2::Value;
+
+    // A COSE_Signature may carry its kid in either bucket. Hand-assemble a
+    // COSE_Sign whose signature kid lives in the protected header and confirm
+    // verifier selection still matches it (protected first, then unprotected).
+    let mut sig_protected = Header::new();
+    sig_protected.set_alg(iana::AlgorithmEdDSA);
+    sig_protected.set_kid(b"key-7".to_vec());
+    let sig_protected_raw = sig_protected.to_vec().unwrap();
+    let body_protected_raw: Vec<u8> = Vec::new();
+    let payload = b"payload".to_vec();
+
+    // Sig_structure = ["Signature", body_protected, sign_protected, aad, payload]
+    let tbs = cbor2::to_canonical_vec(&Value::Array(vec![
+        Value::from("Signature"),
+        Value::Bytes(body_protected_raw.clone()),
+        Value::Bytes(sig_protected_raw.clone()),
+        Value::Bytes(Vec::new()),
+        Value::Bytes(payload.clone()),
+    ]))
+    .unwrap();
+    let signature = toy_tag(b"signer-secret", &tbs);
+
+    let body = cbor2::to_vec(&(
+        serde_bytes::Bytes::new(&body_protected_raw),
+        Header::new(),
+        Some(serde_bytes::Bytes::new(&payload)),
+        vec![(
+            serde_bytes::Bytes::new(&sig_protected_raw),
+            Header::new(),
+            serde_bytes::Bytes::new(&signature),
+        )],
+    ))
+    .unwrap();
+    let tagged = tag::with_tag(tag::SIGN_PREFIX, &body);
+
+    let decoded = SignMessage::from_slice(&tagged).unwrap();
+    assert_eq!(
+        decoded.signatures[0].protected.kid().unwrap(),
+        Some(&b"key-7"[..])
+    );
+
+    let verifier = MockVerifier::new(iana::AlgorithmEdDSA, b"key-7");
+    let verifiers: [&dyn cose2::Verifier; 1] = [&verifier];
+    assert!(decoded.verify(&verifiers, None).is_ok());
+
+    // A verifier whose kid does not match the protected kid is not selected.
+    let other = MockVerifier::new(iana::AlgorithmEdDSA, b"key-9");
+    let others: [&dyn cose2::Verifier; 1] = [&other];
+    assert!(decoded.verify(&others, None).is_err());
 }

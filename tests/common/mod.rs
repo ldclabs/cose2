@@ -140,6 +140,7 @@ pub struct MockEncryptor {
     pub kid: Vec<u8>,
     pub nonce_size: usize,
     pub secret: Vec<u8>,
+    pub base_iv: Option<Vec<u8>>,
 }
 
 impl MockEncryptor {
@@ -149,7 +150,13 @@ impl MockEncryptor {
             kid: kid.to_vec(),
             nonce_size,
             secret: b"enc-secret".to_vec(),
+            base_iv: None,
         }
+    }
+
+    pub fn with_base_iv(mut self, base_iv: Vec<u8>) -> Self {
+        self.base_iv = Some(base_iv);
+        self
     }
 
     fn tag_input(nonce: &[u8], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
@@ -170,6 +177,9 @@ impl Encryptor for MockEncryptor {
     }
     fn nonce_size(&self) -> usize {
         self.nonce_size
+    }
+    fn base_iv(&self) -> Option<&[u8]> {
+        self.base_iv.as_deref()
     }
     fn encrypt(&self, nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, Error> {
         let ks = keystream(&self.secret, nonce, plaintext.len());

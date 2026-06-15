@@ -20,11 +20,17 @@ exclude = ["doc/", ".github/"]
 
 [dependencies]
 cbor2 = { version = "1", features = ["derive"] }
+ring = { version = "0.17", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 
 [dev-dependencies]
 hex = "0.4"
+
+[features]
+default = []
+crypto = ["crypto-ring"]
+crypto-ring = ["dep:ring"]
 
 [package.metadata.docs.rs]
 all-features = true

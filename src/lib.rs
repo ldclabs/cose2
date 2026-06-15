@@ -4,12 +4,35 @@
 //! This crate models COSE structures (messages, headers, keys) and CWT
 //! claims, and delegates cryptography to caller-supplied implementations of
 //! the [`Signer`], [`Verifier`], [`Macer`] and [`Encryptor`] traits — so it
-//! ships no cryptographic dependencies of its own.
+//! ships no cryptographic dependencies in its default feature set.
 //! Top-level COSE messages use named Rust structs with `#[cbor(array)]` to keep
 //! the COSE array wire shape, and encode with their registered CBOR tags
 //! through `#[derive(cbor2::Cbor)]`. CWT claims likewise encode with their
 //! registered CBOR tag. Decode helpers still accept untagged messages and claim
 //! maps for compatibility.
+//! Headers reject malformed `crit` parameters and protected/unprotected bucket
+//! label collisions. Critical header parameters (`crit`) that an application
+//! must understand are validated structurally on decode; applications that
+//! process untrusted input should additionally call
+//! [`Header::ensure_crit_understood`] on each protected header to enforce the
+//! RFC 9052 §3.1 rule that an unrecognised critical parameter is a fatal error.
+//! Header accessors and the message layer read attributes from the protected
+//! bucket first and then the unprotected bucket (RFC 9052 §3).
+//! Keys enforce required `kty` values and non-empty `COSE_KeySet`s. Recipient
+//! structures validate the RFC 9052 shape for known recipient algorithm
+//! classes. Content-key distribution itself (key wrap, key transport, ECDH key
+//! agreement, and the `Enc_Recipient` / `Mac_Recipient` / `Rec_Recipient`
+//! recipient-layer cryptography of RFC 9053) is left to application code: this
+//! crate models and validates the recipient structures but does not encrypt or
+//! decrypt the content-encryption key.
+//! Content encryption follows the AEAD construction of RFC 9052 §5.3; the
+//! [`Encryptor`] trait always authenticates the `Enc_structure`, so the AE-only
+//! construction of §5.4 (zero-length protected header, no external AAD) is not
+//! directly modelled.
+//! Encryption accepts either a full `IV`, or a `Partial IV` combined with
+//! [`Encryptor::base_iv`], and never generates nonces internally.
+//! Optional crypto backends are available behind feature flags; enable
+//! `crypto-ring` or the aggregate `crypto` feature for a `ring`-based backend.
 //!
 //! # Example: COSE_Sign1 round trip
 //!
@@ -60,10 +83,12 @@ mod recipient;
 mod sign;
 mod sign1;
 
+#[cfg(feature = "crypto-ring")]
+pub mod crypto;
 pub mod cwt;
 
 pub use error::Error;
-pub use header::Header;
+pub use header::{is_understood_header, Header};
 pub use key::{Key, KeySet};
 pub use label::Label;
 pub use map::CoseMap;
@@ -74,7 +99,7 @@ pub use encrypt::EncryptMessage;
 pub use encrypt0::Encrypt0Message;
 pub use mac::MacMessage;
 pub use mac0::Mac0Message;
-pub use recipient::Recipient;
+pub use recipient::{Recipient, RecipientAlgorithmClass};
 pub use sign::{SignMessage, Signature};
 pub use sign1::Sign1Message;
 

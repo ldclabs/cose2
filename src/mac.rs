@@ -3,8 +3,10 @@
 use cbor2::Cbor;
 
 use crate::{
-    header::{decode_protected, encode_protected},
-    iana, tag, util, Error, Header, Macer, Recipient, Value,
+    header::{decode_protected, encode_protected, validate_header_buckets},
+    iana,
+    recipient::validate_recipient_list,
+    tag, util, Error, Header, Macer, Recipient, Value,
 };
 
 /// The on-the-wire COSE_Mac array: `[protected, unprotected, payload, tag, recipients]`.
@@ -119,8 +121,10 @@ impl MacMessage {
         if self.recipients.is_empty() {
             return Err(Error::Custom("MacMessage has no recipients".into()));
         }
+        validate_recipient_list(&self.recipients)?;
         util::ensure_protected_alg(&mut self.protected, macer.alg())?;
         util::ensure_unprotected_kid(&mut self.unprotected, macer.kid());
+        validate_header_buckets(&self.protected, &self.unprotected)?;
 
         self.protected_raw = encode_protected(&self.protected)?;
         let tbm = Self::to_be_maced(&self.protected_raw, external_aad, payload)?;
@@ -160,6 +164,8 @@ impl MacMessage {
         if self.recipients.is_empty() {
             return Err(Error::Custom("MacMessage has no recipients".into()));
         }
+        validate_recipient_list(&self.recipients)?;
+        validate_header_buckets(&self.protected, &self.unprotected)?;
         let wire = MacWire {
             protected: self.protected_raw.clone(),
             unprotected: self.unprotected.clone(),
@@ -183,7 +189,9 @@ impl MacMessage {
         if wire.recipients.is_empty() {
             return Err(Error::Custom("MacMessage has no recipients".into()));
         }
+        validate_recipient_list(&wire.recipients)?;
         let protected = decode_protected(&wire.protected)?;
+        validate_header_buckets(&protected, &wire.unprotected)?;
         Ok(MacMessage {
             protected,
             unprotected: wire.unprotected,

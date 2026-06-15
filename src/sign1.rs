@@ -3,7 +3,7 @@
 use cbor2::Cbor;
 
 use crate::{
-    header::{decode_protected, encode_protected},
+    header::{decode_protected, encode_protected, validate_header_buckets},
     iana, tag, util, Error, Header, Signer, Value, Verifier,
 };
 
@@ -112,6 +112,7 @@ impl Sign1Message {
     ) -> Result<(), Error> {
         util::ensure_protected_alg(&mut self.protected, signer.alg())?;
         util::ensure_unprotected_kid(&mut self.unprotected, signer.kid());
+        validate_header_buckets(&self.protected, &self.unprotected)?;
 
         self.protected_raw = encode_protected(&self.protected)?;
         let tbs = Self::to_be_signed(&self.protected_raw, external_aad, payload)?;
@@ -148,6 +149,7 @@ impl Sign1Message {
                 "Sign1Message must be signed before encoding".into(),
             ));
         }
+        validate_header_buckets(&self.protected, &self.unprotected)?;
         let wire = Sign1Wire {
             protected: self.protected_raw.clone(),
             unprotected: self.unprotected.clone(),
@@ -168,6 +170,7 @@ impl Sign1Message {
             cbor2::from_slice::<Sign1BareWire>(body)?.into()
         };
         let protected = decode_protected(&wire.protected)?;
+        validate_header_buckets(&protected, &wire.unprotected)?;
         Ok(Sign1Message {
             protected,
             unprotected: wire.unprotected,

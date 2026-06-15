@@ -3,7 +3,7 @@
 use cbor2::Cbor;
 
 use crate::{
-    header::{decode_protected, encode_protected},
+    header::{decode_protected, encode_protected, validate_header_buckets},
     iana, tag, util, Error, Header, Macer, Value,
 };
 
@@ -113,6 +113,7 @@ impl Mac0Message {
     ) -> Result<(), Error> {
         util::ensure_protected_alg(&mut self.protected, macer.alg())?;
         util::ensure_unprotected_kid(&mut self.unprotected, macer.kid());
+        validate_header_buckets(&self.protected, &self.unprotected)?;
 
         self.protected_raw = encode_protected(&self.protected)?;
         let tbm = Self::to_be_maced(&self.protected_raw, external_aad, payload)?;
@@ -149,6 +150,7 @@ impl Mac0Message {
                 "Mac0Message must be computed before encoding".into(),
             ));
         }
+        validate_header_buckets(&self.protected, &self.unprotected)?;
         let wire = Mac0Wire {
             protected: self.protected_raw.clone(),
             unprotected: self.unprotected.clone(),
@@ -169,6 +171,7 @@ impl Mac0Message {
             cbor2::from_slice::<Mac0BareWire>(body)?.into()
         };
         let protected = decode_protected(&wire.protected)?;
+        validate_header_buckets(&protected, &wire.unprotected)?;
         Ok(Mac0Message {
             protected,
             unprotected: wire.unprotected,

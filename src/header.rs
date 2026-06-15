@@ -77,6 +77,23 @@ impl Header {
         self
     }
 
+    /// Returns the content type (`content type`, label 3), if present.
+    ///
+    /// The value is `tstr / uint` (RFC 9052 §3.1); this crate represents that
+    /// shape with [`Label`].
+    pub fn content_type(&self) -> Result<Option<Label>, Error> {
+        self.0.get_label(iana::HeaderParameterContentType)
+    }
+
+    /// Sets the content type (`content type`, label 3).
+    pub fn set_content_type(&mut self, content_type: impl Into<Label>) -> &mut Self {
+        self.0.insert(
+            iana::HeaderParameterContentType,
+            Value::from(content_type.into()),
+        );
+        self
+    }
+
     /// Returns the full initialization vector (`iv`, label 5), if present.
     pub fn iv(&self) -> Result<Option<&[u8]>, Error> {
         self.0.get_bytes(iana::HeaderParameterIV)
@@ -99,6 +116,70 @@ impl Header {
             .insert(iana::HeaderParameterPartialIV, partial_iv.into());
         self
     }
+
+    /// Returns the critical protected header labels (`crit`, label 2), if present.
+    pub fn crit(&self) -> Result<Option<Vec<Label>>, Error> {
+        labels_from_value(self.0.get(iana::HeaderParameterCrit))
+    }
+
+    /// Sets the critical protected header labels (`crit`, label 2).
+    pub fn set_crit<I, L>(&mut self, labels: I) -> &mut Self
+    where
+        I: IntoIterator<Item = L>,
+        L: Into<Label>,
+    {
+        let labels = labels
+            .into_iter()
+            .map(|label| Value::from(label.into()))
+            .collect::<Vec<_>>();
+        self.0.insert(iana::HeaderParameterCrit, labels);
+        self
+    }
+
+    /// Enforces RFC 9052 §3.1 critical-header processing: every label listed in
+    /// `crit` must be understood, otherwise processing the message is a fatal
+    /// error.
+    ///
+    /// A label is considered understood when it is one of the common header
+    /// parameters this crate models natively (see [`is_understood_header`]) or
+    /// when the caller lists it in `understood`. Applications that process
+    /// untrusted messages SHOULD call this on the protected header of each
+    /// layer (and each `COSE_Signature`) after decoding, passing the
+    /// application-specific labels they are able to process.
+    ///
+    /// Returns `Ok(())` when there is no `crit` parameter or when every listed
+    /// label is understood.
+    pub fn ensure_crit_understood(&self, understood: &[Label]) -> Result<(), Error> {
+        let Some(crit) = self.crit()? else {
+            return Ok(());
+        };
+        for label in crit {
+            if is_understood_header(&label) || understood.contains(&label) {
+                continue;
+            }
+            return Err(Error::Custom(format!(
+                "unsupported critical header parameter {label}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Returns `true` when `label` is a common header parameter this crate models
+/// natively and therefore always understands (RFC 9052 §3.1: "Header
+/// parameters defined in [RFC 9052] do not need to be included [in `crit`]").
+pub fn is_understood_header(label: &Label) -> bool {
+    matches!(
+        label,
+        Label::Int(
+            iana::HeaderParameterAlg
+                | iana::HeaderParameterCrit
+                | iana::HeaderParameterContentType
+                | iana::HeaderParameterKid
+                | iana::HeaderParameterIV
+                | iana::HeaderParameterPartialIV
+        )
+    )
 }
 
 impl From<CoseMap> for Header {
@@ -171,5 +252,71 @@ pub(crate) fn decode_protected(data: &[u8]) -> Result<Header, Error> {
         Ok(Header::new())
     } else {
         Header::from_slice(data)
+    }
+}
+
+/// Validates the RFC 9052 rules that require both header buckets.
+pub(crate) fn validate_header_buckets(
+    protected: &Header,
+    unprotected: &Header,
+) -> Result<(), Error> {
+    for (label, _) in protected.iter() {
+        if unprotected.contains_key(label.clone()) {
+            return Err(Error::Custom(format!(
+                "header label {label} appears in both protected and unprotected buckets"
+            )));
+        }
+    }
+
+    if unprotected.contains_key(iana::HeaderParameterCrit) {
+        return Err(Error::Custom(
+            "crit header parameter must be protected".into(),
+        ));
+    }
+
+    if let Some(crit) = protected.crit()? {
+        if crit.is_empty() {
+            return Err(Error::Custom(
+                "crit header parameter must not be empty".into(),
+            ));
+        }
+        for label in crit {
+            if !protected.contains_key(label.clone()) {
+                return Err(Error::Custom(format!(
+                    "crit references absent protected header label {label}"
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn labels_from_value(value: Option<&Value>) -> Result<Option<Vec<Label>>, Error> {
+    let Some(Value::Array(values)) = value else {
+        return match value {
+            None => Ok(None),
+            Some(_) => Err(Error::UnexpectedType(
+                "crit must be an array of labels".into(),
+            )),
+        };
+    };
+
+    let mut labels = Vec::with_capacity(values.len());
+    for value in values {
+        labels.push(label_from_value(value)?);
+    }
+    Ok(Some(labels))
+}
+
+fn label_from_value(value: &Value) -> Result<Label, Error> {
+    match value {
+        Value::Integer(i) => i64::try_from(*i)
+            .map(Label::Int)
+            .map_err(|_| Error::UnexpectedType("integer label out of range".into())),
+        Value::Text(s) => Ok(Label::Text(s.clone())),
+        _ => Err(Error::UnexpectedType(
+            "expected an integer or text string label".into(),
+        )),
     }
 }

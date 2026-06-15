@@ -11,6 +11,13 @@ use cose2::{
     Mac0Message, MacMessage, PartyInfo, Recipient, Sign1Message, SignMessage, SuppPubInfo, Value,
 };
 
+fn direct_recipient() -> Recipient {
+    let mut r = Recipient::new();
+    r.unprotected.set_alg(iana::AlgorithmDirect);
+    r.ciphertext = Some(vec![]);
+    r
+}
+
 // ----------------------------------------------------------------------------
 // Trait default methods (alg/kid) via minimal implementations
 // ----------------------------------------------------------------------------
@@ -220,14 +227,12 @@ fn encrypt_iv_size_mismatch() {
     let mut msg = EncryptMessage::new(Some(b"x".to_vec()));
     msg.unprotected
         .insert(iana::HeaderParameterIV, vec![0u8; 4]); // wrong size
-    let mut r = Recipient::new();
-    r.ciphertext = Some(vec![]);
-    msg.recipients.push(r);
+    msg.recipients.push(direct_recipient());
     assert!(msg.encrypt(&enc, None).is_err());
 }
 
 #[test]
-fn encrypt_decode_without_recipients_or_ciphertext() {
+fn encrypt_decode_without_recipients_and_with_detached_ciphertext() {
     // [protected, unprotected, ciphertext, []] — empty recipients.
     let no_recip = cbor2::to_vec(&(
         serde_bytes::Bytes::new(&[]),
@@ -240,10 +245,7 @@ fn encrypt_decode_without_recipients_or_ciphertext() {
     assert!(EncryptMessage::from_slice(&tagged).is_err());
 
     // [protected, unprotected, nil, [recipient]] — detached ciphertext.
-    let recip = Recipient {
-        ciphertext: Some(vec![]),
-        ..Default::default()
-    };
+    let recip = direct_recipient();
     let no_ct = cbor2::to_canonical_vec(&(
         serde_bytes::Bytes::new(&[]),
         Header::new(),
@@ -252,7 +254,8 @@ fn encrypt_decode_without_recipients_or_ciphertext() {
     ))
     .unwrap();
     let tagged = tag::with_tag(tag::ENCRYPT_PREFIX, &no_ct);
-    assert!(EncryptMessage::from_slice(&tagged).is_err());
+    let msg = EncryptMessage::from_slice(&tagged).unwrap();
+    assert!(msg.is_ciphertext_detached());
 }
 
 #[test]
@@ -261,9 +264,7 @@ fn encrypt_ciphertext_accessor() {
     let mut msg = EncryptMessage::new(Some(b"data".to_vec()));
     msg.unprotected
         .insert(iana::HeaderParameterIV, vec![5u8; 12]);
-    let mut r = Recipient::new();
-    r.ciphertext = Some(vec![]);
-    msg.recipients.push(r);
+    msg.recipients.push(direct_recipient());
     msg.encrypt(&enc, None).unwrap();
     assert!(!msg.ciphertext().is_empty());
 }
@@ -291,9 +292,7 @@ fn mac_decode_without_recipients() {
 fn mac_tag_accessor() {
     let macer = MockMacer::new(iana::AlgorithmHMAC_256_256, b"m");
     let mut msg = MacMessage::new(Some(b"x".to_vec()));
-    let mut r = Recipient::new();
-    r.ciphertext = Some(vec![]);
-    msg.recipients.push(r);
+    msg.recipients.push(direct_recipient());
     msg.compute(&macer, None).unwrap();
     assert!(!msg.tag().is_empty());
 }
@@ -397,9 +396,7 @@ fn kdf_context_missing_elements() {
 fn encrypt_missing_iv() {
     let enc = MockEncryptor::new(iana::AlgorithmA128GCM, b"", 12);
     let mut msg = EncryptMessage::new(Some(b"x".to_vec()));
-    let mut r = Recipient::new();
-    r.ciphertext = Some(vec![]);
-    msg.recipients.push(r);
+    msg.recipients.push(direct_recipient());
     assert!(msg.encrypt(&enc, None).is_err());
 }
 

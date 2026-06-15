@@ -198,6 +198,73 @@ fn header_accessors_support_int_and_text_algorithm_ids() {
     assert_eq!(Header::from(map), header);
 }
 
+#[test]
+fn header_crit_accessors_support_label_arrays() {
+    let mut header = Header::new();
+    header.insert("private", true);
+    header.set_crit(["private"]);
+    assert_eq!(
+        header.crit().unwrap(),
+        Some(vec![Label::Text("private".into())])
+    );
+
+    header.set_crit([iana::HeaderParameterAlg]);
+    assert_eq!(
+        header.crit().unwrap(),
+        Some(vec![Label::Int(iana::HeaderParameterAlg)])
+    );
+}
+
+#[test]
+fn header_content_type_accepts_text_and_uint() {
+    let mut header = Header::new();
+    assert_eq!(header.content_type().unwrap(), None);
+
+    header.set_content_type("application/cbor");
+    assert_eq!(
+        header.content_type().unwrap(),
+        Some(Label::Text("application/cbor".into()))
+    );
+
+    header.set_content_type(60i64); // application/cbor CoAP Content-Format
+    assert_eq!(header.content_type().unwrap(), Some(Label::Int(60)));
+
+    // Round-trips through CBOR with the registered label 3.
+    let bytes = header.to_vec().unwrap();
+    let back = Header::from_slice(&bytes).unwrap();
+    assert_eq!(back.content_type().unwrap(), Some(Label::Int(60)));
+    assert_eq!(
+        back.get(iana::HeaderParameterContentType),
+        Some(&Value::from(60i64))
+    );
+}
+
+#[test]
+fn header_ensure_crit_understood_enforces_rfc9052_3_1() {
+    // No crit parameter: always understood.
+    assert!(Header::new().ensure_crit_understood(&[]).is_ok());
+
+    // Common header parameters this crate models are always understood.
+    let mut native = Header::new();
+    native.set_alg(iana::AlgorithmEdDSA);
+    native.set_crit([iana::HeaderParameterAlg]);
+    assert!(native.ensure_crit_understood(&[]).is_ok());
+    assert!(cose2::is_understood_header(&Label::Int(
+        iana::HeaderParameterAlg
+    )));
+    assert!(!cose2::is_understood_header(&Label::Text("private".into())));
+
+    // An unrecognised critical label is a fatal error unless the caller lists it.
+    let mut app = Header::new();
+    app.insert("private", true);
+    app.set_crit([Label::Text("private".into())]);
+    let err = app.ensure_crit_understood(&[]).unwrap_err();
+    assert!(format!("{err}").contains("unsupported critical header parameter"));
+    assert!(app
+        .ensure_crit_understood(&[Label::Text("private".into())])
+        .is_ok());
+}
+
 // ----------------------------------------------------------------------------
 // Key & KeySet
 // ----------------------------------------------------------------------------
@@ -208,13 +275,19 @@ fn key_accessors_round_trip() {
     key.set_kty(iana::KeyTypeEC2)
         .set_kid(b"my-kid".to_vec())
         .set_alg(iana::AlgorithmES256)
-        .set_ops(&[iana::KeyOperationSign, iana::KeyOperationVerify]);
+        .set_ops([iana::KeyOperationSign, iana::KeyOperationVerify]);
     key.insert(iana::KeyParameterBaseIV, vec![9u8, 8, 7]);
 
-    assert_eq!(key.kty().unwrap(), Some(iana::KeyTypeEC2));
+    assert_eq!(key.kty().unwrap(), Some(Label::Int(iana::KeyTypeEC2)));
     assert_eq!(key.kid().unwrap(), Some(&b"my-kid"[..]));
-    assert_eq!(key.alg().unwrap(), Some(iana::AlgorithmES256));
-    assert_eq!(key.ops().unwrap(), Some(vec![1, 2]));
+    assert_eq!(key.alg().unwrap(), Some(Label::Int(iana::AlgorithmES256)));
+    assert_eq!(
+        key.ops().unwrap(),
+        Some(vec![
+            Label::Int(iana::KeyOperationSign),
+            Label::Int(iana::KeyOperationVerify)
+        ])
+    );
     assert_eq!(key.base_iv().unwrap(), Some(&[9u8, 8, 7][..]));
     // Deref to CoseMap works.
     assert!(key.contains_key(iana::KeyParameterKty));
@@ -228,12 +301,23 @@ fn key_accessors_round_trip() {
 fn key_ops_errors_on_non_integer_array() {
     let mut key = Key::new();
     key.insert(iana::KeyParameterKeyOps, vec![Value::from("sign")]);
-    assert!(key.ops().is_err());
+    assert_eq!(key.ops().unwrap(), Some(vec![Label::Text("sign".into())]));
 
     // ops absent → None
-    let empty = Key::new();
+    let mut empty = Key::new();
+    empty.set_kty("private-kty");
     assert_eq!(empty.ops().unwrap(), None);
-    assert_eq!(empty.kty().unwrap(), None);
+    assert_eq!(
+        empty.kty().unwrap(),
+        Some(Label::Text("private-kty".into()))
+    );
+}
+
+#[test]
+fn key_rejects_missing_kty() {
+    let empty = Key::new();
+    assert!(empty.to_vec().is_err());
+    assert!(Key::from_slice(&CoseMap::new().to_vec().unwrap()).is_err());
 }
 
 #[test]
@@ -255,8 +339,8 @@ fn keyset_lookup_and_round_trip() {
     set.0.push(k2.clone());
     assert_eq!(set.len(), 2);
 
-    assert_eq!(set.lookup(b"two"), Some(&k2));
-    assert!(set.lookup(b"missing").is_none());
+    assert_eq!(set.lookup(b"two").collect::<Vec<_>>(), vec![&k2]);
+    assert_eq!(set.lookup(b"missing").count(), 0);
 
     let bytes = set.to_vec().unwrap();
     let back = KeySet::from_slice(&bytes).unwrap();
@@ -264,10 +348,32 @@ fn keyset_lookup_and_round_trip() {
 
     let empty = KeySet::default();
     assert!(empty.is_empty());
+    assert!(empty.to_vec().is_err());
+    assert!(KeySet::from_slice(&cbor2::to_vec(&Vec::<Value>::new()).unwrap()).is_err());
     // a key without kid is skipped by lookup
     let mut s2 = KeySet::new();
-    s2.push(Key::new());
-    assert!(s2.lookup(b"x").is_none());
+    let mut no_kid = Key::new();
+    no_kid.set_kty(iana::KeyTypeOKP);
+    s2.push(no_kid);
+    assert_eq!(s2.lookup(b"x").count(), 0);
+}
+
+#[test]
+fn keyset_lookup_returns_all_matching_kids_and_ignores_bad_keys_on_decode() {
+    let mut k1 = Key::new();
+    k1.set_kty(iana::KeyTypeOKP).set_kid(b"same".to_vec());
+    let mut k2 = Key::new();
+    k2.set_kty("private-kty").set_kid(b"same".to_vec());
+    let bad = CoseMap::new();
+
+    let raw = cbor2::to_vec(&vec![
+        cbor2::from_slice::<Value>(&k1.to_vec().unwrap()).unwrap(),
+        cbor2::from_slice::<Value>(&bad.to_vec().unwrap()).unwrap(),
+        cbor2::from_slice::<Value>(&k2.to_vec().unwrap()).unwrap(),
+    ])
+    .unwrap();
+    let set = KeySet::from_slice(&raw).unwrap();
+    assert_eq!(set.lookup(b"same").count(), 2);
 }
 
 // ----------------------------------------------------------------------------

@@ -86,6 +86,16 @@ pub trait Encryptor {
     /// The nonce (IV) size, in bytes, this encryptor expects.
     fn nonce_size(&self) -> usize;
 
+    /// The Base IV / Context IV used to derive the nonce when a COSE message
+    /// carries `Partial IV` instead of a full `IV`.
+    ///
+    /// Returning `None` rejects messages that use `Partial IV`. When present,
+    /// the slice length must match [`nonce_size`](Self::nonce_size); the
+    /// message nonce is the Base IV XORed with the left-padded Partial IV.
+    fn base_iv(&self) -> Option<&[u8]> {
+        None
+    }
+
     /// Encrypts `plaintext` with `nonce` and additional authenticated data.
     fn encrypt(&self, nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, Error>;
 

@@ -1,6 +1,6 @@
 //! Internal helpers shared by the message modules.
 
-use crate::{Error, Header, Label, Value};
+use crate::{Encryptor, Error, Header, Label, Value};
 
 /// Maps payload bytes to the CBOR value used in the `*_structure` to be
 /// signed or MACed.
@@ -92,4 +92,80 @@ pub(crate) fn ensure_unprotected_kid(unprotected: &mut Header, kid: Option<&[u8]
             unprotected.set_kid(kid.to_vec());
         }
     }
+}
+
+/// Looks a byte-string header parameter up in the protected bucket first, then
+/// the unprotected bucket (RFC 9052 §3: protected attributes take precedence).
+pub(crate) fn header_bytes<'a>(
+    protected: &'a Header,
+    unprotected: &'a Header,
+    label: i64,
+) -> Result<Option<&'a [u8]>, Error> {
+    match protected.get_bytes(label)? {
+        Some(value) => Ok(Some(value)),
+        None => unprotected.get_bytes(label),
+    }
+}
+
+/// Returns the actual AEAD nonce from either a full `IV` or a `Partial IV`,
+/// reading the headers from the protected bucket first, then the unprotected
+/// bucket (RFC 9052 §3).
+pub(crate) fn nonce_from_headers(
+    protected: &Header,
+    unprotected: &Header,
+    encryptor: &dyn Encryptor,
+) -> Result<Vec<u8>, Error> {
+    let iv = header_bytes(protected, unprotected, crate::iana::HeaderParameterIV)?;
+    let partial_iv = header_bytes(
+        protected,
+        unprotected,
+        crate::iana::HeaderParameterPartialIV,
+    )?;
+    if iv.is_some() && partial_iv.is_some() {
+        return Err(Error::Custom(
+            "IV and Partial IV must not both be present".into(),
+        ));
+    }
+
+    let nonce_size = encryptor.nonce_size();
+    if let Some(iv) = iv {
+        if iv.len() != nonce_size {
+            return Err(Error::Custom(format!(
+                "IV size mismatch, expected {}, got {}",
+                nonce_size,
+                iv.len()
+            )));
+        }
+        return Ok(iv.to_vec());
+    }
+
+    let Some(partial_iv) = partial_iv else {
+        return Err(Error::Custom(
+            "missing IV or Partial IV in unprotected header".into(),
+        ));
+    };
+    let base_iv = encryptor
+        .base_iv()
+        .ok_or_else(|| Error::Custom("Partial IV requires a Base IV from the encryptor".into()))?;
+    if base_iv.len() != nonce_size {
+        return Err(Error::Custom(format!(
+            "Base IV size mismatch, expected {}, got {}",
+            nonce_size,
+            base_iv.len()
+        )));
+    }
+    if partial_iv.len() > nonce_size {
+        return Err(Error::Custom(format!(
+            "Partial IV size mismatch, expected at most {}, got {}",
+            nonce_size,
+            partial_iv.len()
+        )));
+    }
+
+    let mut nonce = vec![0; nonce_size];
+    nonce[nonce_size - partial_iv.len()..].copy_from_slice(partial_iv);
+    for (byte, base) in nonce.iter_mut().zip(base_iv) {
+        *byte ^= *base;
+    }
+    Ok(nonce)
 }

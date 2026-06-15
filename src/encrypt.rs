@@ -3,8 +3,10 @@
 use cbor2::Cbor;
 
 use crate::{
-    header::{decode_protected, encode_protected},
-    iana, tag, util, Encryptor, Error, Header, Recipient, Value,
+    header::{decode_protected, encode_protected, validate_header_buckets},
+    iana,
+    recipient::validate_recipient_list,
+    tag, util, Encryptor, Error, Header, Recipient, Value,
 };
 
 /// The on-the-wire COSE_Encrypt array: `[protected, unprotected, ciphertext, recipients]`.
@@ -44,8 +46,8 @@ impl From<EncryptBareWire> for EncryptWire {
 
 /// A COSE_Encrypt message (encryption with one or more recipients).
 ///
-/// As with [`Encrypt0Message`](crate::Encrypt0Message), the full IV must be
-/// present in the unprotected header before encrypting.
+/// As with [`Encrypt0Message`](crate::Encrypt0Message), a full `IV` or a
+/// `Partial IV` plus [`Encryptor::base_iv`] must be present before encrypting.
 ///
 /// Reference: <https://datatracker.ietf.org/doc/html/rfc9052#name-enveloped-cose-structure>.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -59,6 +61,7 @@ pub struct EncryptMessage {
     /// The recipients that can recover the content-encryption key.
     pub recipients: Vec<Recipient>,
     ciphertext: Vec<u8>,
+    ciphertext_detached: bool,
     protected_raw: Vec<u8>,
     encrypted: bool,
 }
@@ -81,21 +84,6 @@ impl EncryptMessage {
         ])
     }
 
-    fn iv(&self, encryptor: &dyn Encryptor) -> Result<Vec<u8>, Error> {
-        let iv = self
-            .unprotected
-            .get_bytes(iana::HeaderParameterIV)?
-            .ok_or_else(|| Error::Custom("missing IV in unprotected header".into()))?;
-        if iv.len() != encryptor.nonce_size() {
-            return Err(Error::Custom(format!(
-                "IV size mismatch, expected {}, got {}",
-                encryptor.nonce_size(),
-                iv.len()
-            )));
-        }
-        Ok(iv.to_vec())
-    }
-
     /// Encrypts the payload with `encryptor`.
     pub fn encrypt(
         &mut self,
@@ -105,16 +93,33 @@ impl EncryptMessage {
         if self.recipients.is_empty() {
             return Err(Error::Custom("EncryptMessage has no recipients".into()));
         }
+        validate_recipient_list(&self.recipients)?;
         util::ensure_protected_alg(&mut self.protected, encryptor.alg())?;
         util::ensure_unprotected_kid(&mut self.unprotected, encryptor.kid());
+        validate_header_buckets(&self.protected, &self.unprotected)?;
 
-        let iv = self.iv(encryptor)?;
+        let iv = util::nonce_from_headers(&self.protected, &self.unprotected, encryptor)?;
         self.protected_raw = encode_protected(&self.protected)?;
         let aad = Self::to_be_encrypted(&self.protected_raw, external_aad.unwrap_or(&[]))?;
         let plaintext = util::require_plaintext(&self.payload, "EncryptMessage::encrypt")?.to_vec();
         self.ciphertext = encryptor.encrypt(&iv, &plaintext, &aad)?;
+        self.ciphertext_detached = false;
         self.encrypted = true;
         Ok(())
+    }
+
+    /// Encrypts the payload and marks the ciphertext as detached.
+    ///
+    /// The returned ciphertext must be transported separately; the encoded
+    /// COSE_Encrypt message will carry `nil` in the ciphertext field.
+    pub fn encrypt_detached(
+        &mut self,
+        encryptor: &dyn Encryptor,
+        external_aad: Option<&[u8]>,
+    ) -> Result<&[u8], Error> {
+        self.encrypt(encryptor, external_aad)?;
+        self.ciphertext_detached = true;
+        Ok(&self.ciphertext)
     }
 
     /// Encrypts and encodes the message to tagged COSE_Encrypt bytes.
@@ -127,6 +132,17 @@ impl EncryptMessage {
         self.to_vec()
     }
 
+    /// Encrypts with detached ciphertext and returns `(message, ciphertext)`.
+    pub fn encrypt_detached_and_encode(
+        &mut self,
+        encryptor: &dyn Encryptor,
+        external_aad: Option<&[u8]>,
+    ) -> Result<(Vec<u8>, Vec<u8>), Error> {
+        self.encrypt_detached(encryptor, external_aad)?;
+        let ciphertext = self.ciphertext.clone();
+        Ok((self.to_vec()?, ciphertext))
+    }
+
     /// Encodes an encrypted message to tagged COSE_Encrypt bytes.
     pub fn to_vec(&self) -> Result<Vec<u8>, Error> {
         if !self.encrypted {
@@ -137,10 +153,17 @@ impl EncryptMessage {
         if self.recipients.is_empty() {
             return Err(Error::Custom("EncryptMessage has no recipients".into()));
         }
+        validate_recipient_list(&self.recipients)?;
+        validate_header_buckets(&self.protected, &self.unprotected)?;
+        let ciphertext = if self.ciphertext_detached {
+            None
+        } else {
+            Some(self.ciphertext.clone())
+        };
         let wire = EncryptWire {
             protected: self.protected_raw.clone(),
             unprotected: self.unprotected.clone(),
-            ciphertext: Some(self.ciphertext.clone()),
+            ciphertext,
             recipients: self.recipients.clone(),
         };
         Ok(cbor2::to_canonical_vec(&wire)?)
@@ -159,16 +182,20 @@ impl EncryptMessage {
         if wire.recipients.is_empty() {
             return Err(Error::Custom("EncryptMessage has no recipients".into()));
         }
+        validate_recipient_list(&wire.recipients)?;
         let protected = decode_protected(&wire.protected)?;
-        let ciphertext = wire
-            .ciphertext
-            .ok_or_else(|| Error::Custom("COSE_Encrypt has no ciphertext".into()))?;
+        validate_header_buckets(&protected, &wire.unprotected)?;
+        let (ciphertext, ciphertext_detached) = match wire.ciphertext {
+            Some(ciphertext) => (ciphertext, false),
+            None => (Vec::new(), true),
+        };
         Ok(EncryptMessage {
             protected,
             unprotected: wire.unprotected,
             payload: None,
             recipients: wire.recipients,
             ciphertext,
+            ciphertext_detached,
             protected_raw: wire.protected,
             encrypted: true,
         })
@@ -186,10 +213,45 @@ impl EncryptMessage {
                 "EncryptMessage must be decoded before decrypting".into(),
             ));
         }
+        if self.ciphertext_detached {
+            return Err(Error::Custom(
+                "EncryptMessage has detached ciphertext; use decrypt_detached".into(),
+            ));
+        }
+        self.decrypt_ciphertext(encryptor, self.ciphertext.clone(), external_aad)
+    }
+
+    /// Decrypts a detached ciphertext for a decoded COSE_Encrypt message.
+    pub fn decrypt_detached(
+        &mut self,
+        encryptor: &dyn Encryptor,
+        detached_ciphertext: &[u8],
+        external_aad: Option<&[u8]>,
+    ) -> Result<&[u8], Error> {
+        if !self.encrypted {
+            return Err(Error::Custom(
+                "EncryptMessage must be decoded before decrypting".into(),
+            ));
+        }
+        if !self.ciphertext_detached {
+            return Err(Error::Custom(
+                "EncryptMessage carries embedded ciphertext; use decrypt".into(),
+            ));
+        }
+        self.decrypt_ciphertext(encryptor, detached_ciphertext.to_vec(), external_aad)
+    }
+
+    fn decrypt_ciphertext(
+        &mut self,
+        encryptor: &dyn Encryptor,
+        ciphertext: Vec<u8>,
+        external_aad: Option<&[u8]>,
+    ) -> Result<&[u8], Error> {
         util::check_protected_alg(&self.protected, encryptor.alg())?;
-        let iv = self.iv(encryptor)?;
+        let iv = util::nonce_from_headers(&self.protected, &self.unprotected, encryptor)?;
         let aad = Self::to_be_encrypted(&self.protected_raw, external_aad.unwrap_or(&[]))?;
-        let plaintext = encryptor.decrypt(&iv, &self.ciphertext, &aad)?;
+        let plaintext = encryptor.decrypt(&iv, &ciphertext, &aad)?;
+        self.ciphertext = ciphertext;
         self.payload = Some(plaintext);
         Ok(self.payload.as_deref().unwrap())
     }
@@ -205,9 +267,26 @@ impl EncryptMessage {
         Ok(msg)
     }
 
+    /// Decodes and decrypts a detached-ciphertext COSE_Encrypt message.
+    pub fn decrypt_detached_and_decode(
+        encryptor: &dyn Encryptor,
+        data: &[u8],
+        detached_ciphertext: &[u8],
+        external_aad: Option<&[u8]>,
+    ) -> Result<Self, Error> {
+        let mut msg = Self::from_slice(data)?;
+        msg.decrypt_detached(encryptor, detached_ciphertext, external_aad)?;
+        Ok(msg)
+    }
+
     /// Returns the raw ciphertext (empty until encrypted/decoded).
     pub fn ciphertext(&self) -> &[u8] {
         &self.ciphertext
+    }
+
+    /// Returns true when the message carries `nil` in the ciphertext field.
+    pub fn is_ciphertext_detached(&self) -> bool {
+        self.ciphertext_detached
     }
 
     /// The on-the-wire CBOR tag for COSE_Encrypt.
