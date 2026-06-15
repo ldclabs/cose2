@@ -11,9 +11,9 @@ const MAX_CLOCK_SKEW_SECS: u64 = 10 * 60;
 
 /// The common, typed subset of CWT claims (RFC 8392 §3).
 ///
-/// Unknown claims are ignored on decode; use [`ClaimsMap`] to retain them.
-/// The struct encodes to a CBOR map with the registered integer claim keys,
-/// while still serializing to natural field names for JSON and other formats.
+/// Claims outside the typed subset are retained in [`Claims::extra`]. The
+/// struct encodes to a CBOR map with the registered integer claim keys, while
+/// still serializing to natural field names for JSON and other formats.
 #[derive(Clone, Debug, Default, PartialEq, Cbor)]
 #[cbor(tag = 61)]
 pub struct Claims {
@@ -50,6 +50,13 @@ pub struct Claims {
         default
     )]
     pub cwt_id: Option<Vec<u8>>,
+    /// Additional CWT claims outside the typed subset above.
+    ///
+    /// Use this for application/private claims and registered claims that do
+    /// not yet have typed fields here. The keys are flattened into the CWT
+    /// claim map on encode and retained on decode.
+    #[serde(flatten, skip_serializing_if = "CoseMap::is_empty", default)]
+    pub extra: CoseMap,
 }
 
 impl Claims {

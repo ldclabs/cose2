@@ -20,7 +20,7 @@ This guide is for AI coding agents and code-generation tools that need to use
 | Async or remote signing | `prepare_signature` / `prepare_signatures`, then `set_signature` / `set_signatures` | Sign the returned `Sig_structure` bytes with KMS/HSM/async code. |
 | Async or remote MAC | `prepare_tag` / `prepare_detached_tag`, then `set_tag` | MAC the returned `MAC_structure` bytes with HSM/KMS/async code. |
 | Async or remote encryption | `prepare_encryption`, then `set_ciphertext` | Encrypt with the returned nonce and `Enc_structure` AAD. |
-| Encode or validate CWT claims | `cwt::Claims`, `cwt::ClaimsMap`, `cwt::Validator` | `Claims` preserves the registered typed subset. Use `ClaimsMap` for custom claims. |
+| Encode or validate CWT claims | `cwt::Claims`, `cwt::ClaimsMap`, `cwt::Validator` | `Claims` preserves the registered typed subset plus `extra` custom claims. Use `ClaimsMap` when you want a map-only workflow. |
 | Store COSE keys | `Key` and `KeySet` | `KeySet::lookup(kid)` returns an iterator because `kid` is not unique. |
 
 ## Feature selection

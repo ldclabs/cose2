@@ -81,10 +81,10 @@ assert_eq!(verified.payload.as_deref(), Some(&b"This is the content"[..]));
 | MAC with recipients        | `MacMessage`                                                                          | Recipient-layer cryptography stays application-owned.                     |
 | Encrypt one payload        | `Encrypt0Message::encrypt_and_encode` / `Encrypt0Message::decrypt_and_decode`         | Requires a full `IV`, or `Partial IV` plus `Encryptor::base_iv`.          |
 | Encrypt with recipients    | `EncryptMessage`                                                                      | `cose2` validates recipient structure but does not wrap or agree the CEK. |
-| Async/remote signing       | `prepare_signature` / `prepare_signatures`, then `set_signature` / `set_signatures`   | Sign the returned `Sig_structure` bytes outside the synchronous trait.     |
-| Async/remote MAC           | `prepare_tag` / `prepare_detached_tag`, then `set_tag`                                | MAC the returned `MAC_structure` bytes outside the synchronous trait.      |
+| Async/remote signing       | `prepare_signature` / `prepare_signatures`, then `set_signature` / `set_signatures`   | Sign the returned `Sig_structure` bytes outside the synchronous trait.    |
+| Async/remote MAC           | `prepare_tag` / `prepare_detached_tag`, then `set_tag`                                | MAC the returned `MAC_structure` bytes outside the synchronous trait.     |
 | Async/remote encryption    | `prepare_encryption` then `set_ciphertext`                                            | Encrypt with the returned nonce and `Enc_structure` AAD.                  |
-| Work with CWT claims       | `cwt::Claims`, `cwt::ClaimsMap`, `cwt::Validator`                                     | Use `ClaimsMap` when custom claims must be preserved.                     |
+| Work with CWT claims       | `cwt::Claims`, `cwt::ClaimsMap`, `cwt::Validator`                                     | `Claims::extra` preserves custom claims; use `ClaimsMap` for map-only use. |
 | Work with COSE keys        | `Key`, `KeySet`                                                                       | `KeySet::lookup(kid)` returns all matches because `kid` is not unique.    |
 
 ## Runnable examples
@@ -158,7 +158,7 @@ serialization that cannot fail.
 
 ## License
 
-Dual-licensed under MIT or the [UNLICENSE](http://unlicense.org).
+Licensed under the MIT License.
 
 [cose]: https://datatracker.ietf.org/doc/html/rfc9052
 [cwt]: https://datatracker.ietf.org/doc/html/rfc8392

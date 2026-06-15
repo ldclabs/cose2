@@ -52,6 +52,7 @@ fn main() -> Result<(), Error> {
         not_before: Some(1_700_000_000),
         issued_at: Some(1_700_000_000),
         cwt_id: Some(b"token-1".to_vec()),
+        ..Default::default()
     };
 
     let mut msg = Sign1Message::new(Some(claims.to_vec()?));

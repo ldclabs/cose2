@@ -100,6 +100,7 @@ fn claims_round_trip_integer_keys() {
         not_before: Some(1_700_000_000),
         issued_at: Some(1_700_000_000),
         cwt_id: Some(vec![0xa, 0xb, 0xc]),
+        ..Default::default()
     };
     let bytes = claims.to_vec().unwrap();
     assert_eq!(Claims::TAG, Some(iana::CBORTagCWT));
@@ -138,14 +139,31 @@ fn claims_omit_absent_fields_and_json() {
 }
 
 #[test]
-fn claims_decode_ignores_unknown_claims() {
-    // {1: "iss", 99: "unknown"}
+fn claims_preserve_extra_claims() {
+    // {1: "iss", 99: "unknown", "private": true}
     let mut map = ClaimsMap::new();
     map.insert(iana::CWTClaimIss, "iss");
     map.insert(99, "unknown");
+    map.insert("private", true);
     let bytes = map.to_vec().unwrap();
+
     let claims = Claims::from_slice(&bytes).unwrap();
     assert_eq!(claims.issuer.as_deref(), Some("iss"));
+    assert_eq!(claims.extra.get_text(99).unwrap(), Some("unknown"));
+    assert_eq!(claims.extra.get_bool("private").unwrap(), Some(true));
+
+    let direct = cbor2::from_slice::<Claims>(&bytes).unwrap();
+    assert_eq!(direct, claims);
+
+    let encoded = claims.to_vec().unwrap();
+    assert_eq!(&encoded[..2], tag::CWT_PREFIX);
+    assert_eq!(encoded[2], 0xa3);
+    let round_trip = Claims::from_slice(&encoded).unwrap();
+    assert_eq!(round_trip, claims);
+
+    let canonical = cbor2::to_canonical_vec(&claims).unwrap();
+    assert_eq!(canonical, encoded);
+    assert_eq!(cbor2::from_slice::<Claims>(&canonical).unwrap(), claims);
 }
 
 #[test]
