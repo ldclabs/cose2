@@ -109,8 +109,9 @@ fn claims_round_trip_integer_keys() {
     let back = Claims::from_slice(&bytes).unwrap();
     assert_eq!(back, claims);
 
-    // The public helper accepts untagged claim maps for compatibility.
+    // The cbor2 tag derive accepts untagged claim maps for compatibility.
     let untagged = tag::skip_tag(tag::CWT_PREFIX, &bytes);
+    assert_eq!(cbor2::from_slice::<Claims>(untagged).unwrap(), claims);
     assert_eq!(Claims::from_slice(untagged).unwrap(), claims);
 
     let wrong_tagged = tag::with_tag(tag::SIGN1_PREFIX, untagged);

@@ -1,4 +1,4 @@
-//! Second coverage batch: untagged decode (BareWire paths), detached one-step
+//! Second coverage batch: untagged decode, detached one-step
 //! APIs, recipient validation branches, and small accessor/From paths.
 
 mod common;
@@ -17,7 +17,7 @@ fn key_wrap_recipient() -> Recipient {
 }
 
 // ----------------------------------------------------------------------------
-// Untagged decode exercises the `From<*BareWire>` conversions.
+// Untagged decode exercises the tag-transparent cbor2 derive paths.
 // ----------------------------------------------------------------------------
 
 #[test]

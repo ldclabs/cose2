@@ -18,27 +18,6 @@ struct Encrypt0Wire {
     ciphertext: Option<Vec<u8>>,
 }
 
-/// Untagged COSE_Encrypt0, accepted for compatibility with untagged transports.
-#[derive(Clone, Debug, PartialEq, Cbor)]
-#[cbor(array)]
-struct Encrypt0BareWire {
-    #[serde(with = "serde_bytes")]
-    protected: Vec<u8>,
-    unprotected: Header,
-    #[serde(with = "serde_bytes")]
-    ciphertext: Option<Vec<u8>>,
-}
-
-impl From<Encrypt0BareWire> for Encrypt0Wire {
-    fn from(value: Encrypt0BareWire) -> Self {
-        Encrypt0Wire {
-            protected: value.protected,
-            unprotected: value.unprotected,
-            ciphertext: value.ciphertext,
-        }
-    }
-}
-
 /// A COSE_Encrypt0 message.
 ///
 /// A full `IV` or a `Partial IV` plus [`Encryptor::base_iv`] must be present
@@ -245,15 +224,12 @@ impl Encrypt0Message {
     /// Decodes a COSE_Encrypt0 message (tagged or untagged) without decrypting.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
         let body = tag::strip_message_wrappers(data);
-        let wire: Encrypt0Wire = if body.starts_with(tag::ENCRYPT0_PREFIX) {
-            cbor2::from_slice(body)?
-        } else if tag::starts_with_cbor_tag(body) {
+        if !body.starts_with(tag::ENCRYPT0_PREFIX) && tag::starts_with_cbor_tag(body) {
             return Err(Error::Custom(
                 "unexpected CBOR tag for COSE_Encrypt0".into(),
             ));
-        } else {
-            cbor2::from_slice::<Encrypt0BareWire>(body)?.into()
-        };
+        }
+        let wire: Encrypt0Wire = cbor2::from_slice(body)?;
         let protected = decode_protected(&wire.protected)?;
         validate_header_buckets(&protected, &wire.unprotected)?;
         let (ciphertext, ciphertext_detached) = match wire.ciphertext {
@@ -383,6 +359,5 @@ mod tests {
     #[test]
     fn wire_metadata_declares_tagged_array_shape() {
         assert_cbor_shape::<Encrypt0Wire>(Some(iana::CBORTagCOSEEncrypt0), true);
-        assert_cbor_shape::<Encrypt0BareWire>(None, true);
     }
 }

@@ -21,29 +21,6 @@ struct EncryptWire {
     recipients: Vec<Recipient>,
 }
 
-/// Untagged COSE_Encrypt, accepted for compatibility with untagged transports.
-#[derive(Clone, Debug, PartialEq, Cbor)]
-#[cbor(array)]
-struct EncryptBareWire {
-    #[serde(with = "serde_bytes")]
-    protected: Vec<u8>,
-    unprotected: Header,
-    #[serde(with = "serde_bytes")]
-    ciphertext: Option<Vec<u8>>,
-    recipients: Vec<Recipient>,
-}
-
-impl From<EncryptBareWire> for EncryptWire {
-    fn from(value: EncryptBareWire) -> Self {
-        EncryptWire {
-            protected: value.protected,
-            unprotected: value.unprotected,
-            ciphertext: value.ciphertext,
-            recipients: value.recipients,
-        }
-    }
-}
-
 /// A COSE_Encrypt message (encryption with one or more recipients).
 ///
 /// As with [`Encrypt0Message`](crate::Encrypt0Message), a full `IV` or a
@@ -263,13 +240,10 @@ impl EncryptMessage {
     /// Decodes a COSE_Encrypt message (tagged or untagged) without decrypting.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
         let body = tag::strip_message_wrappers(data);
-        let wire: EncryptWire = if body.starts_with(tag::ENCRYPT_PREFIX) {
-            cbor2::from_slice(body)?
-        } else if tag::starts_with_cbor_tag(body) {
+        if !body.starts_with(tag::ENCRYPT_PREFIX) && tag::starts_with_cbor_tag(body) {
             return Err(Error::Custom("unexpected CBOR tag for COSE_Encrypt".into()));
-        } else {
-            cbor2::from_slice::<EncryptBareWire>(body)?.into()
-        };
+        }
+        let wire: EncryptWire = cbor2::from_slice(body)?;
         if wire.recipients.is_empty() {
             return Err(Error::Custom("EncryptMessage has no recipients".into()));
         }
@@ -404,6 +378,5 @@ mod tests {
     #[test]
     fn wire_metadata_declares_tagged_array_shape() {
         assert_cbor_shape::<EncryptWire>(Some(iana::CBORTagCOSEEncrypt), true);
-        assert_cbor_shape::<EncryptBareWire>(None, true);
     }
 }

@@ -23,32 +23,6 @@ struct MacWire {
     recipients: Vec<Recipient>,
 }
 
-/// Untagged COSE_Mac, accepted for compatibility with untagged transports.
-#[derive(Clone, Debug, PartialEq, Cbor)]
-#[cbor(array)]
-struct MacBareWire {
-    #[serde(with = "serde_bytes")]
-    protected: Vec<u8>,
-    unprotected: Header,
-    #[serde(with = "serde_bytes")]
-    payload: Option<Vec<u8>>,
-    #[serde(with = "serde_bytes")]
-    tag: Vec<u8>,
-    recipients: Vec<Recipient>,
-}
-
-impl From<MacBareWire> for MacWire {
-    fn from(value: MacBareWire) -> Self {
-        MacWire {
-            protected: value.protected,
-            unprotected: value.unprotected,
-            payload: value.payload,
-            tag: value.tag,
-            recipients: value.recipients,
-        }
-    }
-}
-
 /// A COSE_Mac message (MAC with one or more recipients).
 ///
 /// Reference: <https://datatracker.ietf.org/doc/html/rfc9052#name-maced-message-with-recipien>.
@@ -245,13 +219,10 @@ impl MacMessage {
     /// Decodes a COSE_Mac message (tagged or untagged) without verifying it.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
         let body = tag::strip_message_wrappers(data);
-        let wire: MacWire = if body.starts_with(tag::MAC_PREFIX) {
-            cbor2::from_slice(body)?
-        } else if tag::starts_with_cbor_tag(body) {
+        if !body.starts_with(tag::MAC_PREFIX) && tag::starts_with_cbor_tag(body) {
             return Err(Error::Custom("unexpected CBOR tag for COSE_Mac".into()));
-        } else {
-            cbor2::from_slice::<MacBareWire>(body)?.into()
-        };
+        }
+        let wire: MacWire = cbor2::from_slice(body)?;
         if wire.recipients.is_empty() {
             return Err(Error::Custom("MacMessage has no recipients".into()));
         }
@@ -360,6 +331,5 @@ mod tests {
     #[test]
     fn wire_metadata_declares_tagged_array_shape() {
         assert_cbor_shape::<MacWire>(Some(iana::CBORTagCOSEMac), true);
-        assert_cbor_shape::<MacBareWire>(None, true);
     }
 }

@@ -20,30 +20,6 @@ struct Sign1Wire {
     signature: Vec<u8>,
 }
 
-/// Untagged COSE_Sign1, accepted for compatibility with untagged transports.
-#[derive(Clone, Debug, PartialEq, Cbor)]
-#[cbor(array)]
-struct Sign1BareWire {
-    #[serde(with = "serde_bytes")]
-    protected: Vec<u8>,
-    unprotected: Header,
-    #[serde(with = "serde_bytes")]
-    payload: Option<Vec<u8>>,
-    #[serde(with = "serde_bytes")]
-    signature: Vec<u8>,
-}
-
-impl From<Sign1BareWire> for Sign1Wire {
-    fn from(value: Sign1BareWire) -> Self {
-        Sign1Wire {
-            protected: value.protected,
-            unprotected: value.unprotected,
-            payload: value.payload,
-            signature: value.signature,
-        }
-    }
-}
-
 /// A COSE_Sign1 message.
 ///
 /// Reference: <https://datatracker.ietf.org/doc/html/rfc9052#name-signing-with-one-signer>.
@@ -241,13 +217,10 @@ impl Sign1Message {
     /// Decodes a COSE_Sign1 message (tagged or untagged) without verifying it.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
         let body = tag::strip_message_wrappers(data);
-        let wire: Sign1Wire = if body.starts_with(tag::SIGN1_PREFIX) {
-            cbor2::from_slice(body)?
-        } else if tag::starts_with_cbor_tag(body) {
+        if !body.starts_with(tag::SIGN1_PREFIX) && tag::starts_with_cbor_tag(body) {
             return Err(Error::Custom("unexpected CBOR tag for COSE_Sign1".into()));
-        } else {
-            cbor2::from_slice::<Sign1BareWire>(body)?.into()
-        };
+        }
+        let wire: Sign1Wire = cbor2::from_slice(body)?;
         let protected = decode_protected(&wire.protected)?;
         validate_header_buckets(&protected, &wire.unprotected)?;
         Ok(Sign1Message {
@@ -358,6 +331,5 @@ mod tests {
     #[test]
     fn wire_metadata_declares_tagged_array_shape() {
         assert_cbor_shape::<Sign1Wire>(Some(iana::CBORTagCOSESign1), true);
-        assert_cbor_shape::<Sign1BareWire>(None, true);
     }
 }

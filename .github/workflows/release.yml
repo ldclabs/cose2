@@ -24,9 +24,6 @@ jobs:
   publish:
     name: publish to crates.io
     runs-on: ubuntu-latest
-    # Scopes the trusted publisher to a protected environment so the OIDC token
-    # can only be minted from this workflow. Configure the same name on crates.io.
-    environment: release
     permissions:
       # Required to mint the OIDC token consumed by crates-io-auth-action.
       id-token: write

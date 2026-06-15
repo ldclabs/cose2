@@ -20,30 +20,6 @@ struct Mac0Wire {
     tag: Vec<u8>,
 }
 
-/// Untagged COSE_Mac0, accepted for compatibility with untagged transports.
-#[derive(Clone, Debug, PartialEq, Cbor)]
-#[cbor(array)]
-struct Mac0BareWire {
-    #[serde(with = "serde_bytes")]
-    protected: Vec<u8>,
-    unprotected: Header,
-    #[serde(with = "serde_bytes")]
-    payload: Option<Vec<u8>>,
-    #[serde(with = "serde_bytes")]
-    tag: Vec<u8>,
-}
-
-impl From<Mac0BareWire> for Mac0Wire {
-    fn from(value: Mac0BareWire) -> Self {
-        Mac0Wire {
-            protected: value.protected,
-            unprotected: value.unprotected,
-            payload: value.payload,
-            tag: value.tag,
-        }
-    }
-}
-
 /// A COSE_Mac0 message.
 ///
 /// Reference: <https://datatracker.ietf.org/doc/html/rfc9052#name-maced-messages-with-implici>.
@@ -225,13 +201,10 @@ impl Mac0Message {
     /// Decodes a COSE_Mac0 message (tagged or untagged) without verifying it.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
         let body = tag::strip_message_wrappers(data);
-        let wire: Mac0Wire = if body.starts_with(tag::MAC0_PREFIX) {
-            cbor2::from_slice(body)?
-        } else if tag::starts_with_cbor_tag(body) {
+        if !body.starts_with(tag::MAC0_PREFIX) && tag::starts_with_cbor_tag(body) {
             return Err(Error::Custom("unexpected CBOR tag for COSE_Mac0".into()));
-        } else {
-            cbor2::from_slice::<Mac0BareWire>(body)?.into()
-        };
+        }
+        let wire: Mac0Wire = cbor2::from_slice(body)?;
         let protected = decode_protected(&wire.protected)?;
         validate_header_buckets(&protected, &wire.unprotected)?;
         Ok(Mac0Message {
@@ -335,6 +308,5 @@ mod tests {
     #[test]
     fn wire_metadata_declares_tagged_array_shape() {
         assert_cbor_shape::<Mac0Wire>(Some(iana::CBORTagCOSEMac0), true);
-        assert_cbor_shape::<Mac0BareWire>(None, true);
     }
 }

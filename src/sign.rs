@@ -30,29 +30,6 @@ struct SignWire {
     signatures: Vec<SignatureWire>,
 }
 
-/// Untagged COSE_Sign, accepted for compatibility with untagged transports.
-#[derive(Clone, Debug, PartialEq, Cbor)]
-#[cbor(array)]
-struct SignBareWire {
-    #[serde(with = "serde_bytes")]
-    protected: Vec<u8>,
-    unprotected: Header,
-    #[serde(with = "serde_bytes")]
-    payload: Option<Vec<u8>>,
-    signatures: Vec<SignatureWire>,
-}
-
-impl From<SignBareWire> for SignWire {
-    fn from(value: SignBareWire) -> Self {
-        SignWire {
-            protected: value.protected,
-            unprotected: value.unprotected,
-            payload: value.payload,
-            signatures: value.signatures,
-        }
-    }
-}
-
 /// A COSE_Signature inside a [`SignMessage`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Signature {
@@ -372,13 +349,10 @@ impl SignMessage {
     /// Decodes a COSE_Sign message (tagged or untagged) without verifying it.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
         let body = tag::strip_message_wrappers(data);
-        let wire: SignWire = if body.starts_with(tag::SIGN_PREFIX) {
-            cbor2::from_slice(body)?
-        } else if tag::starts_with_cbor_tag(body) {
+        if !body.starts_with(tag::SIGN_PREFIX) && tag::starts_with_cbor_tag(body) {
             return Err(Error::Custom("unexpected CBOR tag for COSE_Sign".into()));
-        } else {
-            cbor2::from_slice::<SignBareWire>(body)?.into()
-        };
+        }
+        let wire: SignWire = cbor2::from_slice(body)?;
         if wire.signatures.is_empty() {
             return Err(Error::Custom("SignMessage has no signatures".into()));
         }
@@ -530,6 +504,5 @@ mod tests {
     fn wire_metadata_declares_tagged_array_shape() {
         assert_cbor_shape::<SignatureWire>(None, true);
         assert_cbor_shape::<SignWire>(Some(iana::CBORTagCOSESign), true);
-        assert_cbor_shape::<SignBareWire>(None, true);
     }
 }
