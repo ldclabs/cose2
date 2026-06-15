@@ -92,7 +92,7 @@ pub use header::{is_understood_header, Header};
 pub use key::{Key, KeySet};
 pub use label::Label;
 pub use map::CoseMap;
-pub use traits::{Encryptor, Macer, Signer, Verifier};
+pub use traits::{EncryptionContext, Encryptor, Macer, Signer, Verifier};
 
 pub use context::{KdfContext, PartyInfo, SuppPubInfo};
 pub use encrypt::EncryptMessage;

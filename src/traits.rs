@@ -6,6 +6,19 @@
 
 use crate::{Error, Label};
 
+/// AEAD inputs prepared by a COSE_Encrypt or COSE_Encrypt0 message.
+///
+/// `aad` is the encoded `Enc_structure` from RFC 9052 §5.3. Pass both values
+/// to external encryption or decryption code together with the plaintext or
+/// ciphertext bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncryptionContext {
+    /// The nonce (IV) to pass to the AEAD operation.
+    pub nonce: Vec<u8>,
+    /// The additional authenticated data to pass to the AEAD operation.
+    pub aad: Vec<u8>,
+}
+
 /// Produces digital signatures for COSE_Sign and COSE_Sign1.
 ///
 /// Reference: <https://datatracker.ietf.org/doc/html/rfc9052#name-signature-algorithms>.

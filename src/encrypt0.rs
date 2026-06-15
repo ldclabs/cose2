@@ -4,7 +4,7 @@ use cbor2::Cbor;
 
 use crate::{
     header::{decode_protected, encode_protected, validate_header_buckets},
-    iana, tag, util, Encryptor, Error, Header, Value,
+    iana, tag, util, EncryptionContext, Encryptor, Error, Header, Label, Value,
 };
 
 /// The on-the-wire COSE_Encrypt0 array: `[protected, unprotected, ciphertext]`.
@@ -69,13 +69,102 @@ impl Encrypt0Message {
         }
     }
 
-    /// The `Enc_structure` (additional authenticated data, RFC 9052 §5.3).
-    fn to_be_encrypted(protected_raw: &[u8], external_aad: &[u8]) -> Result<Vec<u8>, Error> {
+    /// Encodes the `Enc_structure` (additional authenticated data, RFC 9052 §5.3).
+    ///
+    /// This is the low-level helper for external or async AEAD code. New
+    /// messages should usually call [`prepare_encryption`](Self::prepare_encryption)
+    /// so the protected header bytes stored in the message match the AAD.
+    pub fn to_be_encrypted(protected_raw: &[u8], external_aad: &[u8]) -> Result<Vec<u8>, Error> {
         util::encode_structure(vec![
             Value::from("Encrypt0"),
             Value::Bytes(protected_raw.to_vec()),
             Value::Bytes(external_aad.to_vec()),
         ])
+    }
+
+    /// Prepares this message for external encryption.
+    ///
+    /// The returned context contains the nonce and encoded `Enc_structure` AAD
+    /// to pass to async or remote AEAD code together with
+    /// [`payload`](Self::payload). After encryption returns ciphertext bytes,
+    /// call [`set_ciphertext`](Self::set_ciphertext) and then
+    /// [`to_vec`](Self::to_vec). Passing `None` for `external_aad` is the same
+    /// as an empty byte string.
+    pub fn prepare_encryption(
+        &mut self,
+        alg: Option<Label>,
+        kid: Option<&[u8]>,
+        nonce_size: usize,
+        base_iv: Option<&[u8]>,
+        external_aad: Option<&[u8]>,
+    ) -> Result<EncryptionContext, Error> {
+        util::ensure_protected_alg(&mut self.protected, alg)?;
+        util::ensure_unprotected_kid(&mut self.unprotected, kid);
+        validate_header_buckets(&self.protected, &self.unprotected)?;
+        util::require_plaintext(&self.payload, "Encrypt0Message::prepare_encryption")?;
+
+        let nonce = util::nonce_from_header_values(
+            &self.protected,
+            &self.unprotected,
+            nonce_size,
+            base_iv,
+        )?;
+        let protected_raw = encode_protected(&self.protected)?;
+        let aad = Self::to_be_encrypted(&protected_raw, external_aad.unwrap_or(&[]))?;
+        self.protected_raw = protected_raw;
+        self.ciphertext.clear();
+        self.ciphertext_detached = false;
+        self.encrypted = false;
+        Ok(EncryptionContext { nonce, aad })
+    }
+
+    /// Prepares this decoded message for external decryption.
+    ///
+    /// The returned context contains the nonce and encoded `Enc_structure` AAD
+    /// to pass to async or remote AEAD code together with
+    /// [`ciphertext`](Self::ciphertext), or with the detached ciphertext when
+    /// [`is_ciphertext_detached`](Self::is_ciphertext_detached) is true.
+    pub fn prepare_decryption(
+        &self,
+        alg: Option<Label>,
+        nonce_size: usize,
+        base_iv: Option<&[u8]>,
+        external_aad: Option<&[u8]>,
+    ) -> Result<EncryptionContext, Error> {
+        if !self.encrypted {
+            return Err(Error::Custom(
+                "Encrypt0Message must be decoded before decrypting".into(),
+            ));
+        }
+        util::check_protected_alg(&self.protected, alg)?;
+        let nonce = util::nonce_from_header_values(
+            &self.protected,
+            &self.unprotected,
+            nonce_size,
+            base_iv,
+        )?;
+        let aad = Self::to_be_encrypted(&self.protected_raw, external_aad.unwrap_or(&[]))?;
+        Ok(EncryptionContext { nonce, aad })
+    }
+
+    /// Stores externally produced ciphertext bytes on this message.
+    ///
+    /// When `detached` is true, the encoded COSE_Encrypt0 message carries `nil`
+    /// in the ciphertext field and the returned/stored ciphertext must be
+    /// transported out of band.
+    pub fn set_ciphertext(
+        &mut self,
+        ciphertext: impl Into<Vec<u8>>,
+        detached: bool,
+    ) -> Result<(), Error> {
+        validate_header_buckets(&self.protected, &self.unprotected)?;
+        if self.protected_raw.is_empty() && !self.protected.is_empty() {
+            self.protected_raw = encode_protected(&self.protected)?;
+        }
+        self.ciphertext = ciphertext.into();
+        self.ciphertext_detached = detached;
+        self.encrypted = true;
+        Ok(())
     }
 
     /// Encrypts the payload with `encryptor`.
@@ -84,19 +173,17 @@ impl Encrypt0Message {
         encryptor: &dyn Encryptor,
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        util::ensure_protected_alg(&mut self.protected, encryptor.alg())?;
-        util::ensure_unprotected_kid(&mut self.unprotected, encryptor.kid());
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-
-        let iv = util::nonce_from_headers(&self.protected, &self.unprotected, encryptor)?;
-        self.protected_raw = encode_protected(&self.protected)?;
-        let aad = Self::to_be_encrypted(&self.protected_raw, external_aad.unwrap_or(&[]))?;
+        let context = self.prepare_encryption(
+            encryptor.alg(),
+            encryptor.kid(),
+            encryptor.nonce_size(),
+            encryptor.base_iv(),
+            external_aad,
+        )?;
         let plaintext =
             util::require_plaintext(&self.payload, "Encrypt0Message::encrypt")?.to_vec();
-        self.ciphertext = encryptor.encrypt(&iv, &plaintext, &aad)?;
-        self.ciphertext_detached = false;
-        self.encrypted = true;
-        Ok(())
+        let ciphertext = encryptor.encrypt(&context.nonce, &plaintext, &context.aad)?;
+        self.set_ciphertext(ciphertext, false)
     }
 
     /// Encrypts the payload and marks the ciphertext as detached.
@@ -230,10 +317,13 @@ impl Encrypt0Message {
         ciphertext: Vec<u8>,
         external_aad: Option<&[u8]>,
     ) -> Result<&[u8], Error> {
-        util::check_protected_alg(&self.protected, encryptor.alg())?;
-        let iv = util::nonce_from_headers(&self.protected, &self.unprotected, encryptor)?;
-        let aad = Self::to_be_encrypted(&self.protected_raw, external_aad.unwrap_or(&[]))?;
-        let plaintext = encryptor.decrypt(&iv, &ciphertext, &aad)?;
+        let context = self.prepare_decryption(
+            encryptor.alg(),
+            encryptor.nonce_size(),
+            encryptor.base_iv(),
+            external_aad,
+        )?;
+        let plaintext = encryptor.decrypt(&context.nonce, &ciphertext, &context.aad)?;
         self.ciphertext = ciphertext;
         self.payload = Some(plaintext);
         Ok(self.payload.as_deref().unwrap())
@@ -265,6 +355,11 @@ impl Encrypt0Message {
     /// Returns the raw ciphertext (empty until encrypted/decoded).
     pub fn ciphertext(&self) -> &[u8] {
         &self.ciphertext
+    }
+
+    /// Returns the protected-header bytes used in the encryption AAD.
+    pub fn protected_raw(&self) -> &[u8] {
+        &self.protected_raw
     }
 
     /// Returns true when the message carries `nil` in the ciphertext field.

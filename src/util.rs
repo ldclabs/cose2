@@ -1,6 +1,6 @@
 //! Internal helpers shared by the message modules.
 
-use crate::{Encryptor, Error, Header, Label, Value};
+use crate::{Error, Header, Label, Value};
 
 /// Maps payload bytes to the CBOR value used in the `*_structure` to be
 /// signed or MACed.
@@ -108,12 +108,12 @@ pub(crate) fn header_bytes<'a>(
 }
 
 /// Returns the actual AEAD nonce from either a full `IV` or a `Partial IV`,
-/// reading the headers from the protected bucket first, then the unprotected
-/// bucket (RFC 9052 §3).
-pub(crate) fn nonce_from_headers(
+/// using explicit external-crypto parameters instead of an `Encryptor`.
+pub(crate) fn nonce_from_header_values(
     protected: &Header,
     unprotected: &Header,
-    encryptor: &dyn Encryptor,
+    nonce_size: usize,
+    base_iv: Option<&[u8]>,
 ) -> Result<Vec<u8>, Error> {
     let iv = header_bytes(protected, unprotected, crate::iana::HeaderParameterIV)?;
     let partial_iv = header_bytes(
@@ -127,7 +127,6 @@ pub(crate) fn nonce_from_headers(
         ));
     }
 
-    let nonce_size = encryptor.nonce_size();
     if let Some(iv) = iv {
         if iv.len() != nonce_size {
             return Err(Error::Custom(format!(
@@ -144,9 +143,7 @@ pub(crate) fn nonce_from_headers(
             "missing IV or Partial IV in unprotected header".into(),
         ));
     };
-    let base_iv = encryptor
-        .base_iv()
-        .ok_or_else(|| Error::Custom("Partial IV requires a Base IV from the encryptor".into()))?;
+    let base_iv = base_iv.ok_or_else(|| Error::Custom("Partial IV requires a Base IV".into()))?;
     if base_iv.len() != nonce_size {
         return Err(Error::Custom(format!(
             "Base IV size mismatch, expected {}, got {}",

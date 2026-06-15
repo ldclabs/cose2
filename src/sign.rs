@@ -4,7 +4,7 @@ use cbor2::Cbor;
 
 use crate::{
     header::{decode_protected, encode_protected, validate_header_buckets},
-    iana, tag, util, Error, Header, Signer, Value, Verifier,
+    iana, tag, util, Error, Header, Label, Signer, Value, Verifier,
 };
 
 /// The on-the-wire COSE_Signature array: `[protected, unprotected, signature]`.
@@ -65,6 +65,23 @@ pub struct Signature {
 }
 
 impl Signature {
+    /// Creates an unsigned COSE_Signature with empty header buckets.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates an unsigned COSE_Signature with optional `alg` and `kid`.
+    pub fn with_alg_kid(alg: Option<Label>, kid: Option<&[u8]>) -> Self {
+        let mut signature = Self::new();
+        if let Some(alg) = alg {
+            signature.protected.set_alg(alg);
+        }
+        if let Some(kid) = kid {
+            signature.unprotected.set_kid(kid.to_vec());
+        }
+        signature
+    }
+
     /// Returns the signature's `kid`, read from the protected header first and
     /// then the unprotected header (RFC 9052 §3).
     fn kid(&self) -> Result<Option<&[u8]>, Error> {
@@ -82,6 +99,20 @@ impl Signature {
     /// Returns the protected-header bytes used in this signature structure.
     pub fn protected_raw(&self) -> &[u8] {
         &self.protected_raw
+    }
+
+    /// Stores externally produced signature bytes on this signature.
+    ///
+    /// If no protected bytes were prepared yet, this method serializes the
+    /// current protected header canonically, which is valid for newly built
+    /// signatures.
+    pub fn set_signature(&mut self, signature: impl Into<Vec<u8>>) -> Result<(), Error> {
+        validate_header_buckets(&self.protected, &self.unprotected)?;
+        if self.protected_raw.is_empty() && !self.protected.is_empty() {
+            self.protected_raw = encode_protected(&self.protected)?;
+        }
+        self.signature = signature.into();
+        Ok(())
     }
 }
 
@@ -111,8 +142,14 @@ impl SignMessage {
         }
     }
 
-    /// The `Sig_structure` to be signed by one signer (RFC 9052 §4.4).
-    fn to_be_signed(
+    /// Encodes the `Sig_structure` to be signed by one signer (RFC 9052 §4.4).
+    ///
+    /// This is the low-level helper for external or async signing code. New
+    /// messages should usually call [`prepare_signatures`](Self::prepare_signatures)
+    /// or [`prepare_detached_signatures`](Self::prepare_detached_signatures) so
+    /// the body and per-signature protected bytes stored in the message match
+    /// the bytes being signed.
+    pub fn to_be_signed(
         body_protected: &[u8],
         sign_protected: &[u8],
         external_aad: &[u8],
@@ -125,6 +162,108 @@ impl SignMessage {
             Value::Bytes(external_aad.to_vec()),
             util::payload_value(payload),
         ])
+    }
+
+    /// Prepares this embedded-payload message for external signatures.
+    ///
+    /// `signatures` provides the per-signature protected and unprotected header
+    /// buckets. The returned vector has the same order and contains the
+    /// `Sig_structure` bytes each external signer must sign. After async or
+    /// remote signers return signature bytes, call
+    /// [`set_signatures`](Self::set_signatures) and then [`to_vec`](Self::to_vec).
+    pub fn prepare_signatures(
+        &mut self,
+        signatures: Vec<Signature>,
+        external_aad: Option<&[u8]>,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        let payload =
+            util::require_embedded_payload(&self.payload, "SignMessage::prepare_signatures")?
+                .to_vec();
+        self.prepare_signature_payload(signatures, &payload, external_aad.unwrap_or(&[]))
+    }
+
+    /// Prepares this detached-payload message for external signatures.
+    ///
+    /// The message's on-the-wire payload is set to `nil`; `detached_payload` is
+    /// used only in each `Sig_structure`.
+    pub fn prepare_detached_signatures(
+        &mut self,
+        signatures: Vec<Signature>,
+        detached_payload: &[u8],
+        external_aad: Option<&[u8]>,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        let to_be_signed = self.prepare_signature_payload(
+            signatures,
+            detached_payload,
+            external_aad.unwrap_or(&[]),
+        )?;
+        self.payload = None;
+        Ok(to_be_signed)
+    }
+
+    fn prepare_signature_payload(
+        &mut self,
+        mut signatures: Vec<Signature>,
+        payload: &[u8],
+        external_aad: &[u8],
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        if signatures.is_empty() {
+            return Err(Error::Custom(
+                "SignMessage requires at least one signature".into(),
+            ));
+        }
+        validate_header_buckets(&self.protected, &self.unprotected)?;
+        let protected_raw = encode_protected(&self.protected)?;
+        let mut to_be_signed = Vec::with_capacity(signatures.len());
+
+        for signature in &mut signatures {
+            validate_header_buckets(&signature.protected, &signature.unprotected)?;
+            let sign_protected_raw = encode_protected(&signature.protected)?;
+            let tbs =
+                Self::to_be_signed(&protected_raw, &sign_protected_raw, external_aad, payload)?;
+            signature.protected_raw = sign_protected_raw;
+            signature.signature.clear();
+            to_be_signed.push(tbs);
+        }
+
+        self.protected_raw = protected_raw;
+        self.signatures = signatures;
+        self.signed = false;
+        Ok(to_be_signed)
+    }
+
+    /// Stores externally produced signature bytes on this message.
+    ///
+    /// The number and order must match the signatures passed to
+    /// [`prepare_signatures`](Self::prepare_signatures) or
+    /// [`prepare_detached_signatures`](Self::prepare_detached_signatures).
+    pub fn set_signatures<I, S>(&mut self, signatures: I) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<Vec<u8>>,
+    {
+        let signatures = signatures.into_iter().map(Into::into).collect::<Vec<_>>();
+        if signatures.is_empty() {
+            return Err(Error::Custom(
+                "SignMessage requires at least one signature".into(),
+            ));
+        }
+        if signatures.len() != self.signatures.len() {
+            return Err(Error::Custom(format!(
+                "signature count mismatch, message has {}, got {}",
+                self.signatures.len(),
+                signatures.len()
+            )));
+        }
+        validate_header_buckets(&self.protected, &self.unprotected)?;
+        if self.protected_raw.is_empty() && !self.protected.is_empty() {
+            self.protected_raw = encode_protected(&self.protected)?;
+        }
+        for (slot, signature) in self.signatures.iter_mut().zip(signatures) {
+            slot.set_signature(signature)?;
+        }
+        self.signed = true;
+        Ok(())
     }
 
     /// Signs the message with each signer, producing one [`Signature`] per signer.
@@ -163,33 +302,18 @@ impl SignMessage {
                 "SignMessage requires at least one signer".into(),
             ));
         }
-        let protected_raw = encode_protected(&self.protected)?;
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        let mut signatures = Vec::with_capacity(signers.len());
-
-        for signer in signers {
-            let mut protected = Header::new();
-            if let Some(alg) = signer.alg() {
-                protected.set_alg(alg);
-            }
-            let mut unprotected = Header::new();
-            util::ensure_unprotected_kid(&mut unprotected, signer.kid());
-
-            let sign_protected_raw = encode_protected(&protected)?;
-            let tbs =
-                Self::to_be_signed(&protected_raw, &sign_protected_raw, external_aad, payload)?;
-            let signature = signer.sign(&tbs)?;
-            signatures.push(Signature {
-                protected,
-                unprotected,
-                signature,
-                protected_raw: sign_protected_raw,
-            });
-        }
-        self.protected_raw = protected_raw;
-        self.signatures = signatures;
-        self.signed = true;
-        Ok(())
+        let signature_headers = signers
+            .iter()
+            .map(|signer| Signature::with_alg_kid(signer.alg(), signer.kid()))
+            .collect::<Vec<_>>();
+        let to_be_signed =
+            self.prepare_signature_payload(signature_headers, payload, external_aad)?;
+        let signatures = signers
+            .iter()
+            .zip(&to_be_signed)
+            .map(|(signer, tbs)| signer.sign(tbs))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.set_signatures(signatures)
     }
 
     /// Signs and encodes the message to tagged COSE_Sign bytes.

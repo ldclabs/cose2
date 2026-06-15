@@ -17,6 +17,9 @@ This guide is for AI coding agents and code-generation tools that need to use
 | MAC with recipients | `MacMessage` | Recipient-layer key distribution remains application-owned. |
 | Encrypt one payload | `Encrypt0Message::encrypt_and_encode` and `Encrypt0Message::decrypt_and_decode` | Requires `IV`, or `Partial IV` plus `Encryptor::base_iv`. |
 | Encrypt with recipients | `EncryptMessage` | `cose2` models recipients but does not perform CEK wrapping/agreement. |
+| Async or remote signing | `prepare_signature` / `prepare_signatures`, then `set_signature` / `set_signatures` | Sign the returned `Sig_structure` bytes with KMS/HSM/async code. |
+| Async or remote MAC | `prepare_tag` / `prepare_detached_tag`, then `set_tag` | MAC the returned `MAC_structure` bytes with HSM/KMS/async code. |
+| Async or remote encryption | `prepare_encryption`, then `set_ciphertext` | Encrypt with the returned nonce and `Enc_structure` AAD. |
 | Encode or validate CWT claims | `cwt::Claims`, `cwt::ClaimsMap`, `cwt::Validator` | `Claims` preserves the registered typed subset. Use `ClaimsMap` for custom claims. |
 | Store COSE keys | `Key` and `KeySet` | `KeySet::lookup(kid)` returns an iterator because `kid` is not unique. |
 
@@ -99,6 +102,89 @@ cargo run --example encrypt0_ring --features crypto-ring
 
 Use `examples/custom_crypto_traits.rs` when integrating another crypto library.
 Use the `*_ring.rs` examples when the built-in `ring` backend is acceptable.
+
+## Async or remote cryptography
+
+The [`Signer`](https://docs.rs/cose2/latest/cose2/trait.Signer.html),
+[`Macer`](https://docs.rs/cose2/latest/cose2/trait.Macer.html), and
+[`Encryptor`](https://docs.rs/cose2/latest/cose2/trait.Encryptor.html) traits
+are synchronous. They work well for in-process providers, including providers
+that internally block. If the operation crosses an async runtime, HSM, KMS, IPC,
+device queue, or separate service, use the two-step message APIs instead:
+
+- Sign: `prepare_signature` / `prepare_detached_signature` on `Sign1Message`,
+  or `prepare_signatures` / `prepare_detached_signatures` on `SignMessage`.
+  Sign the returned `Sig_structure` bytes, then call `set_signature` or
+  `set_signatures`.
+- MAC: `prepare_tag` / `prepare_detached_tag` on `Mac0Message` or `MacMessage`.
+  MAC the returned `MAC_structure` bytes, then call `set_tag`.
+- Encrypt: `prepare_encryption` on `Encrypt0Message` or `EncryptMessage`.
+  Encrypt `payload` with the returned nonce and AAD, then call
+  `set_ciphertext`. For async decryption, use `prepare_decryption` with
+  `ciphertext` or the detached ciphertext.
+
+Sign1 example:
+
+```rust
+use cose2::{iana, Sign1Message};
+
+# async fn kms_sign(_data: Vec<u8>) -> Result<Vec<u8>, cose2::Error> {
+#     Ok(vec![1, 2, 3])
+# }
+# async fn example() -> Result<Vec<u8>, cose2::Error> {
+let mut msg = Sign1Message::new(Some(b"payload".to_vec()));
+
+let to_sign = msg.prepare_signature(
+    Some(iana::AlgorithmEdDSA.into()),
+    Some(b"key-1"),
+    None,
+)?;
+let signature = kms_sign(to_sign).await?;
+
+msg.set_signature(signature)?;
+let encoded = msg.to_vec()?;
+# Ok(encoded)
+# }
+```
+
+Encrypt0 example:
+
+```rust
+use cose2::{iana, Encrypt0Message};
+
+# async fn kms_encrypt(
+#     _nonce: Vec<u8>,
+#     _plaintext: Vec<u8>,
+#     _aad: Vec<u8>,
+# ) -> Result<Vec<u8>, cose2::Error> {
+#     Ok(vec![1, 2, 3])
+# }
+# async fn example() -> Result<Vec<u8>, cose2::Error> {
+let mut msg = Encrypt0Message::new(Some(b"payload".to_vec()));
+msg.unprotected.set_iv(vec![0u8; 12]);
+
+let context = msg.prepare_encryption(
+    Some(iana::AlgorithmA128GCM.into()),
+    Some(b"key-1"),
+    12,
+    None,
+    None,
+)?;
+let ciphertext = kms_encrypt(
+    context.nonce,
+    msg.payload.as_deref().unwrap().to_vec(),
+    context.aad,
+).await?;
+
+msg.set_ciphertext(ciphertext, false)?;
+let encoded = msg.to_vec()?;
+# Ok(encoded)
+# }
+```
+
+For detached payloads or detached ciphertext, use the matching `prepare_detached_*`
+or `set_ciphertext(..., true)` flow and pass the same detached bytes to the
+verify/decrypt APIs.
 
 ## Protocol rules agents should not guess
 

@@ -3,7 +3,7 @@ mod common;
 use common::*;
 use cose2::{
     iana, tag, Encrypt0Message, EncryptMessage, Header, Label, Mac0Message, MacMessage, Recipient,
-    RecipientAlgorithmClass, Sign1Message, SignMessage,
+    RecipientAlgorithmClass, Sign1Message, SignMessage, Signature,
 };
 
 fn direct_recipient() -> Recipient {
@@ -68,6 +68,69 @@ fn sign1_external_aad_must_match() {
     assert!(Sign1Message::verify_and_decode(&verifier, &encoded, Some(b"aad")).is_ok());
     assert!(Sign1Message::verify_and_decode(&verifier, &encoded, Some(b"nope")).is_err());
     assert!(Sign1Message::verify_and_decode(&verifier, &encoded, None).is_err());
+}
+
+#[test]
+fn sign1_external_signature_flow_for_embedded_payload() {
+    let verifier = MockVerifier::new(iana::AlgorithmEdDSA, b"async-key");
+    let mut msg = Sign1Message::new(Some(b"async payload".to_vec()));
+
+    let tbs = msg
+        .prepare_signature(
+            Some(iana::AlgorithmEdDSA.into()),
+            Some(&b"async-key"[..]),
+            Some(b"aad"),
+        )
+        .unwrap();
+    assert!(msg.to_vec().is_err());
+    assert_eq!(
+        tbs,
+        Sign1Message::to_be_signed(msg.protected_raw(), b"aad", b"async payload").unwrap()
+    );
+
+    msg.set_signature(toy_tag(b"signer-secret", &tbs)).unwrap();
+    let encoded = msg.to_vec().unwrap();
+    let decoded = Sign1Message::verify_and_decode(&verifier, &encoded, Some(b"aad")).unwrap();
+
+    assert_eq!(decoded.payload.as_deref(), Some(&b"async payload"[..]));
+    assert_eq!(
+        decoded.protected.get_i64(iana::HeaderParameterAlg).unwrap(),
+        Some(iana::AlgorithmEdDSA)
+    );
+    assert_eq!(
+        decoded
+            .unprotected
+            .get_bytes(iana::HeaderParameterKid)
+            .unwrap(),
+        Some(&b"async-key"[..])
+    );
+}
+
+#[test]
+fn sign1_external_signature_flow_for_detached_payload() {
+    let verifier = MockVerifier::new(iana::AlgorithmES256, b"detached-key");
+    let mut msg = Sign1Message::new(None);
+
+    let tbs = msg
+        .prepare_detached_signature(
+            Some(iana::AlgorithmES256.into()),
+            Some(&b"detached-key"[..]),
+            b"detached async payload",
+            None,
+        )
+        .unwrap();
+    assert_eq!(msg.payload, None);
+    assert!(msg.to_vec().is_err());
+
+    msg.set_signature(toy_tag(b"signer-secret", &tbs)).unwrap();
+    let encoded = msg.to_vec().unwrap();
+    let decoded = Sign1Message::from_slice(&encoded).unwrap();
+
+    assert_eq!(decoded.payload, None);
+    assert!(decoded.verify(&verifier, None).is_err());
+    assert!(decoded
+        .verify_detached(&verifier, b"detached async payload", None)
+        .is_ok());
 }
 
 #[test]
@@ -231,6 +294,56 @@ fn mac0_detached_payload_round_trip() {
 }
 
 #[test]
+fn mac0_external_tag_flow() {
+    let macer = MockMacer::new(iana::AlgorithmHMAC_256_256, b"async-mac");
+    let mut msg = Mac0Message::new(Some(b"content".to_vec()));
+
+    let tbm = msg
+        .prepare_tag(
+            Some(iana::AlgorithmHMAC_256_256.into()),
+            Some(b"async-mac"),
+            Some(b"aad"),
+        )
+        .unwrap();
+    assert!(msg.to_vec().is_err());
+    assert_eq!(
+        tbm,
+        Mac0Message::to_be_maced(msg.protected_raw(), b"aad", b"content").unwrap()
+    );
+
+    let tag = cose2::Macer::mac_create(&macer, &tbm).unwrap();
+    msg.set_tag(tag).unwrap();
+    let encoded = msg.to_vec().unwrap();
+
+    assert!(Mac0Message::verify_and_decode(&macer, &encoded, Some(b"aad")).is_ok());
+}
+
+#[test]
+fn mac0_external_detached_tag_flow() {
+    let macer = MockMacer::new(iana::AlgorithmHMAC_256_256, b"async-mac");
+    let mut msg = Mac0Message::new(None);
+
+    let tbm = msg
+        .prepare_detached_tag(
+            Some(iana::AlgorithmHMAC_256_256.into()),
+            Some(b"async-mac"),
+            b"detached content",
+            None,
+        )
+        .unwrap();
+    assert_eq!(msg.payload, None);
+
+    let tag = cose2::Macer::mac_create(&macer, &tbm).unwrap();
+    msg.set_tag(tag).unwrap();
+    let encoded = msg.to_vec().unwrap();
+    let decoded = Mac0Message::from_slice(&encoded).unwrap();
+
+    assert!(decoded
+        .verify_detached(&macer, b"detached content", None)
+        .is_ok());
+}
+
+#[test]
 fn mac0_errors() {
     let macer = MockMacer::new(iana::AlgorithmHMAC_256_256, b"k");
     let msg = Mac0Message::new(Some(b"x".to_vec()));
@@ -292,6 +405,37 @@ fn encrypt0_round_trip_reversible() {
     // Wrong AAD fails authentication.
     let mut decoded2 = Encrypt0Message::from_slice(&encoded).unwrap();
     assert!(decoded2.decrypt(&enc, Some(b"wrong")).is_err());
+}
+
+#[test]
+fn encrypt0_external_ciphertext_flow() {
+    let enc = MockEncryptor::new(iana::AlgorithmA128GCM, b"async-enc", 12);
+    let mut msg = Encrypt0Message::new(Some(b"secret payload".to_vec()));
+    msg.unprotected.set_iv(vec![9u8; 12]);
+
+    let context = msg
+        .prepare_encryption(
+            Some(iana::AlgorithmA128GCM.into()),
+            Some(b"async-enc"),
+            12,
+            None,
+            Some(b"aad"),
+        )
+        .unwrap();
+    assert!(msg.to_vec().is_err());
+    assert_eq!(
+        context.aad,
+        Encrypt0Message::to_be_encrypted(msg.protected_raw(), b"aad").unwrap()
+    );
+    let plaintext = msg.payload.as_deref().unwrap().to_vec();
+    let ciphertext =
+        cose2::Encryptor::encrypt(&enc, &context.nonce, &plaintext, &context.aad).unwrap();
+
+    msg.set_ciphertext(ciphertext, false).unwrap();
+    let encoded = msg.to_vec().unwrap();
+    let decoded = Encrypt0Message::decrypt_and_decode(&enc, &encoded, Some(b"aad")).unwrap();
+
+    assert_eq!(decoded.payload.as_deref(), Some(&b"secret payload"[..]));
 }
 
 #[test]
@@ -535,6 +679,58 @@ fn mac_detached_payload_round_trip() {
 }
 
 #[test]
+fn mac_external_tag_flow_with_recipient() {
+    let macer = MockMacer::new(iana::AlgorithmHMAC_256_256, b"async-mac");
+    let mut msg = MacMessage::new(Some(b"content".to_vec()));
+    msg.recipients.push(direct_recipient());
+
+    let tbm = msg
+        .prepare_tag(
+            Some(iana::AlgorithmHMAC_256_256.into()),
+            Some(b"async-mac"),
+            None,
+        )
+        .unwrap();
+    assert!(msg.to_vec().is_err());
+    assert_eq!(
+        tbm,
+        MacMessage::to_be_maced(msg.protected_raw(), b"", b"content").unwrap()
+    );
+
+    let tag = cose2::Macer::mac_create(&macer, &tbm).unwrap();
+    msg.set_tag(tag).unwrap();
+    let encoded = msg.to_vec().unwrap();
+
+    assert!(MacMessage::verify_and_decode(&macer, &encoded, None).is_ok());
+}
+
+#[test]
+fn mac_external_detached_tag_flow_with_recipient() {
+    let macer = MockMacer::new(iana::AlgorithmHMAC_256_256, b"async-mac");
+    let mut msg = MacMessage::new(None);
+    msg.recipients.push(direct_recipient());
+
+    let tbm = msg
+        .prepare_detached_tag(
+            Some(iana::AlgorithmHMAC_256_256.into()),
+            Some(b"async-mac"),
+            b"detached content",
+            None,
+        )
+        .unwrap();
+    assert_eq!(msg.payload, None);
+
+    let tag = cose2::Macer::mac_create(&macer, &tbm).unwrap();
+    msg.set_tag(tag).unwrap();
+    let encoded = msg.to_vec().unwrap();
+    let decoded = MacMessage::from_slice(&encoded).unwrap();
+
+    assert!(decoded
+        .verify_detached(&macer, b"detached content", None)
+        .is_ok());
+}
+
+#[test]
 fn mac_requires_recipients() {
     let macer = MockMacer::new(iana::AlgorithmHMAC_256_256, b"m");
     let mut msg = MacMessage::new(Some(b"x".to_vec()));
@@ -574,6 +770,51 @@ fn encrypt_round_trip_with_recipient() {
     // decrypt again directly to exercise the method path.
     assert_eq!(decoded.decrypt(&enc, None).unwrap(), b"plaintext");
     assert_eq!(EncryptMessage::TAG, 96);
+}
+
+#[test]
+fn encrypt_external_ciphertext_flow_with_recipient() {
+    let enc = MockEncryptor::new(iana::AlgorithmA128GCM, b"async-enc", 12);
+    let mut msg = EncryptMessage::new(Some(b"plaintext".to_vec()));
+    msg.unprotected.set_iv(vec![4u8; 12]);
+    msg.recipients.push(direct_recipient());
+
+    let context = msg
+        .prepare_encryption(
+            Some(iana::AlgorithmA128GCM.into()),
+            Some(b"async-enc"),
+            12,
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(msg.to_vec().is_err());
+    assert_eq!(
+        context.aad,
+        EncryptMessage::to_be_encrypted(msg.protected_raw(), b"").unwrap()
+    );
+    let plaintext = msg.payload.as_deref().unwrap().to_vec();
+    let ciphertext =
+        cose2::Encryptor::encrypt(&enc, &context.nonce, &plaintext, &context.aad).unwrap();
+
+    msg.set_ciphertext(ciphertext, true).unwrap();
+    let encoded = msg.to_vec().unwrap();
+    let decoded = EncryptMessage::from_slice(&encoded).unwrap();
+    assert!(decoded.is_ciphertext_detached());
+
+    let decrypt_context = decoded
+        .prepare_decryption(Some(iana::AlgorithmA128GCM.into()), 12, None, None)
+        .unwrap();
+    assert_eq!(decrypt_context.nonce, context.nonce);
+    assert_eq!(decrypt_context.aad, context.aad);
+    let plaintext = cose2::Encryptor::decrypt(
+        &enc,
+        &decrypt_context.nonce,
+        msg.ciphertext(),
+        &decrypt_context.aad,
+    )
+    .unwrap();
+    assert_eq!(plaintext, b"plaintext");
 }
 
 #[test]
@@ -664,6 +905,73 @@ fn sign_round_trip_multiple_signers() {
     let verified = SignMessage::verify_and_decode(&verifiers, &encoded, None).unwrap();
     assert_eq!(verified.payload.as_deref(), Some(&b"content"[..]));
     assert_eq!(SignMessage::TAG, 98);
+}
+
+#[test]
+fn sign_external_signature_flow_for_multiple_signers() {
+    let v1 = MockVerifier::new(iana::AlgorithmES256, b"a");
+    let v2 = MockVerifier::new(iana::AlgorithmEdDSA, b"b");
+    let mut msg = SignMessage::new(Some(b"content".to_vec()));
+
+    let to_be_signed = msg
+        .prepare_signatures(
+            vec![
+                Signature::with_alg_kid(Some(iana::AlgorithmES256.into()), Some(b"a")),
+                Signature::with_alg_kid(Some(iana::AlgorithmEdDSA.into()), Some(b"b")),
+            ],
+            Some(b"aad"),
+        )
+        .unwrap();
+    assert_eq!(to_be_signed.len(), 2);
+    assert!(msg.to_vec().is_err());
+    assert_eq!(
+        to_be_signed[0],
+        SignMessage::to_be_signed(
+            msg.protected_raw(),
+            msg.signatures[0].protected_raw(),
+            b"aad",
+            b"content"
+        )
+        .unwrap()
+    );
+
+    let signatures = to_be_signed
+        .iter()
+        .map(|tbs| toy_tag(b"signer-secret", tbs))
+        .collect::<Vec<_>>();
+    msg.set_signatures(signatures).unwrap();
+    let encoded = msg.to_vec().unwrap();
+
+    let verifiers: [&dyn cose2::Verifier; 2] = [&v1, &v2];
+    assert!(SignMessage::verify_and_decode(&verifiers, &encoded, Some(b"aad")).is_ok());
+}
+
+#[test]
+fn sign_external_detached_signature_flow() {
+    let verifier = MockVerifier::new(iana::AlgorithmES256, b"a");
+    let mut msg = SignMessage::new(None);
+
+    let to_be_signed = msg
+        .prepare_detached_signatures(
+            vec![Signature::with_alg_kid(
+                Some(iana::AlgorithmES256.into()),
+                Some(b"a"),
+            )],
+            b"detached content",
+            None,
+        )
+        .unwrap();
+    assert_eq!(msg.payload, None);
+
+    msg.set_signatures(vec![toy_tag(b"signer-secret", &to_be_signed[0])])
+        .unwrap();
+    let encoded = msg.to_vec().unwrap();
+    let decoded = SignMessage::from_slice(&encoded).unwrap();
+    let verifiers: [&dyn cose2::Verifier; 1] = [&verifier];
+
+    assert!(decoded
+        .verify_detached(&verifiers, b"detached content", None)
+        .is_ok());
 }
 
 #[test]

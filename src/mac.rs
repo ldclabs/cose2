@@ -6,7 +6,7 @@ use crate::{
     header::{decode_protected, encode_protected, validate_header_buckets},
     iana,
     recipient::validate_recipient_list,
-    tag, util, Error, Header, Macer, Recipient, Value,
+    tag, util, Error, Header, Label, Macer, Recipient, Value,
 };
 
 /// The on-the-wire COSE_Mac array: `[protected, unprotected, payload, tag, recipients]`.
@@ -76,8 +76,13 @@ impl MacMessage {
         }
     }
 
-    /// The `MAC_structure` to be authenticated (RFC 9052 §6.3).
-    fn to_be_maced(
+    /// Encodes the `MAC_structure` to be authenticated (RFC 9052 §6.3).
+    ///
+    /// This is the low-level helper for external or async MAC code. New
+    /// messages should usually call [`prepare_tag`](Self::prepare_tag) or
+    /// [`prepare_detached_tag`](Self::prepare_detached_tag) so the protected
+    /// header bytes stored in the message match the bytes being MACed.
+    pub fn to_be_maced(
         protected_raw: &[u8],
         external_aad: &[u8],
         payload: &[u8],
@@ -88,6 +93,77 @@ impl MacMessage {
             Value::Bytes(external_aad.to_vec()),
             util::payload_value(payload),
         ])
+    }
+
+    /// Prepares this embedded-payload message for an externally produced tag.
+    ///
+    /// The returned bytes are the `MAC_structure` that must be MACed. After an
+    /// async or remote MAC service returns the tag bytes, call
+    /// [`set_tag`](Self::set_tag) and then [`to_vec`](Self::to_vec).
+    pub fn prepare_tag(
+        &mut self,
+        alg: Option<Label>,
+        kid: Option<&[u8]>,
+        external_aad: Option<&[u8]>,
+    ) -> Result<Vec<u8>, Error> {
+        let payload =
+            util::require_embedded_payload(&self.payload, "MacMessage::prepare_tag")?.to_vec();
+        self.prepare_tag_payload(alg, kid, &payload, external_aad.unwrap_or(&[]))
+    }
+
+    /// Prepares this detached-payload message for an externally produced tag.
+    ///
+    /// The message's on-the-wire payload is set to `nil`; `detached_payload` is
+    /// used only in the `MAC_structure`.
+    pub fn prepare_detached_tag(
+        &mut self,
+        alg: Option<Label>,
+        kid: Option<&[u8]>,
+        detached_payload: &[u8],
+        external_aad: Option<&[u8]>,
+    ) -> Result<Vec<u8>, Error> {
+        let tbm =
+            self.prepare_tag_payload(alg, kid, detached_payload, external_aad.unwrap_or(&[]))?;
+        self.payload = None;
+        Ok(tbm)
+    }
+
+    fn prepare_tag_payload(
+        &mut self,
+        alg: Option<Label>,
+        kid: Option<&[u8]>,
+        payload: &[u8],
+        external_aad: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        if self.recipients.is_empty() {
+            return Err(Error::Custom("MacMessage has no recipients".into()));
+        }
+        validate_recipient_list(&self.recipients)?;
+        util::ensure_protected_alg(&mut self.protected, alg)?;
+        util::ensure_unprotected_kid(&mut self.unprotected, kid);
+        validate_header_buckets(&self.protected, &self.unprotected)?;
+
+        let protected_raw = encode_protected(&self.protected)?;
+        let tbm = Self::to_be_maced(&protected_raw, external_aad, payload)?;
+        self.protected_raw = protected_raw;
+        self.tag.clear();
+        self.computed = false;
+        Ok(tbm)
+    }
+
+    /// Stores externally produced tag bytes on this message.
+    pub fn set_tag(&mut self, tag: impl Into<Vec<u8>>) -> Result<(), Error> {
+        if self.recipients.is_empty() {
+            return Err(Error::Custom("MacMessage has no recipients".into()));
+        }
+        validate_recipient_list(&self.recipients)?;
+        validate_header_buckets(&self.protected, &self.unprotected)?;
+        if self.protected_raw.is_empty() && !self.protected.is_empty() {
+            self.protected_raw = encode_protected(&self.protected)?;
+        }
+        self.tag = tag.into();
+        self.computed = true;
+        Ok(())
     }
 
     /// Computes the authentication tag with `macer`.
@@ -118,19 +194,9 @@ impl MacMessage {
         payload: &[u8],
         external_aad: &[u8],
     ) -> Result<(), Error> {
-        if self.recipients.is_empty() {
-            return Err(Error::Custom("MacMessage has no recipients".into()));
-        }
-        validate_recipient_list(&self.recipients)?;
-        util::ensure_protected_alg(&mut self.protected, macer.alg())?;
-        util::ensure_unprotected_kid(&mut self.unprotected, macer.kid());
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-
-        self.protected_raw = encode_protected(&self.protected)?;
-        let tbm = Self::to_be_maced(&self.protected_raw, external_aad, payload)?;
-        self.tag = macer.mac_create(&tbm)?;
-        self.computed = true;
-        Ok(())
+        let tbm = self.prepare_tag_payload(macer.alg(), macer.kid(), payload, external_aad)?;
+        let tag = macer.mac_create(&tbm)?;
+        self.set_tag(tag)
     }
 
     /// Computes the tag and encodes the message to tagged COSE_Mac bytes.

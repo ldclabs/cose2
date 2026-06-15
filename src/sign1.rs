@@ -4,7 +4,7 @@ use cbor2::Cbor;
 
 use crate::{
     header::{decode_protected, encode_protected, validate_header_buckets},
-    iana, tag, util, Error, Header, Signer, Value, Verifier,
+    iana, tag, util, Error, Header, Label, Signer, Value, Verifier,
 };
 
 /// The on-the-wire COSE_Sign1 array: `[protected, unprotected, payload, signature]`.
@@ -69,8 +69,16 @@ impl Sign1Message {
         }
     }
 
-    /// The `Sig_structure` to be signed (RFC 9052 §4.4).
-    fn to_be_signed(
+    /// Encodes the `Sig_structure` to be signed (RFC 9052 §4.4).
+    ///
+    /// This is the low-level helper for applications that sign outside the
+    /// synchronous [`Signer`] trait, such as remote KMS or other async signing
+    /// services. New messages should usually call
+    /// [`prepare_signature`](Self::prepare_signature) or
+    /// [`prepare_detached_signature`](Self::prepare_detached_signature) so the
+    /// protected header bytes stored in the message match the bytes being
+    /// signed.
+    pub fn to_be_signed(
         protected_raw: &[u8],
         external_aad: &[u8],
         payload: &[u8],
@@ -81,6 +89,82 @@ impl Sign1Message {
             Value::Bytes(external_aad.to_vec()),
             util::payload_value(payload),
         ])
+    }
+
+    /// Prepares this embedded-payload message for an external signature.
+    ///
+    /// The returned bytes are the `Sig_structure` that must be signed. After an
+    /// async or remote signer returns the signature bytes, call
+    /// [`set_signature`](Self::set_signature) and then [`to_vec`](Self::to_vec).
+    /// Passing `None` for `external_aad` is the same as an empty byte string.
+    pub fn prepare_signature(
+        &mut self,
+        alg: Option<Label>,
+        kid: Option<&[u8]>,
+        external_aad: Option<&[u8]>,
+    ) -> Result<Vec<u8>, Error> {
+        let payload =
+            util::require_embedded_payload(&self.payload, "Sign1Message::prepare_signature")?
+                .to_vec();
+        self.prepare_signature_payload(alg, kid, &payload, external_aad.unwrap_or(&[]))
+    }
+
+    /// Prepares this detached-payload message for an external signature.
+    ///
+    /// The returned bytes are the `Sig_structure` that must be signed. The
+    /// message's on-the-wire payload is set to `nil`; `detached_payload` is used
+    /// only in the `Sig_structure`.
+    pub fn prepare_detached_signature(
+        &mut self,
+        alg: Option<Label>,
+        kid: Option<&[u8]>,
+        detached_payload: &[u8],
+        external_aad: Option<&[u8]>,
+    ) -> Result<Vec<u8>, Error> {
+        let tbs = self.prepare_signature_payload(
+            alg,
+            kid,
+            detached_payload,
+            external_aad.unwrap_or(&[]),
+        )?;
+        self.payload = None;
+        Ok(tbs)
+    }
+
+    fn prepare_signature_payload(
+        &mut self,
+        alg: Option<Label>,
+        kid: Option<&[u8]>,
+        payload: &[u8],
+        external_aad: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        util::ensure_protected_alg(&mut self.protected, alg)?;
+        util::ensure_unprotected_kid(&mut self.unprotected, kid);
+        validate_header_buckets(&self.protected, &self.unprotected)?;
+
+        let protected_raw = encode_protected(&self.protected)?;
+        let tbs = Self::to_be_signed(&protected_raw, external_aad, payload)?;
+        self.protected_raw = protected_raw;
+        self.signature.clear();
+        self.signed = false;
+        Ok(tbs)
+    }
+
+    /// Stores externally produced signature bytes on this message.
+    ///
+    /// This completes the two-step external signing flow started by
+    /// [`prepare_signature`](Self::prepare_signature) or
+    /// [`prepare_detached_signature`](Self::prepare_detached_signature). If no
+    /// protected bytes were prepared yet, this method serializes the current
+    /// protected header canonically, which is valid for newly built messages.
+    pub fn set_signature(&mut self, signature: impl Into<Vec<u8>>) -> Result<(), Error> {
+        validate_header_buckets(&self.protected, &self.unprotected)?;
+        if self.protected_raw.is_empty() && !self.protected.is_empty() {
+            self.protected_raw = encode_protected(&self.protected)?;
+        }
+        self.signature = signature.into();
+        self.signed = true;
+        Ok(())
     }
 
     /// Signs the message with `signer`, filling in `alg`/`kid` headers as needed.
@@ -110,15 +194,10 @@ impl Sign1Message {
         payload: &[u8],
         external_aad: &[u8],
     ) -> Result<(), Error> {
-        util::ensure_protected_alg(&mut self.protected, signer.alg())?;
-        util::ensure_unprotected_kid(&mut self.unprotected, signer.kid());
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-
-        self.protected_raw = encode_protected(&self.protected)?;
-        let tbs = Self::to_be_signed(&self.protected_raw, external_aad, payload)?;
-        self.signature = signer.sign(&tbs)?;
-        self.signed = true;
-        Ok(())
+        let tbs =
+            self.prepare_signature_payload(signer.alg(), signer.kid(), payload, external_aad)?;
+        let signature = signer.sign(&tbs)?;
+        self.set_signature(signature)
     }
 
     /// Signs and encodes the message, returning the tagged COSE_Sign1 bytes.
