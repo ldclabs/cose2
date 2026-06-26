@@ -38,7 +38,8 @@ construction.
 - **Tagging** — tagged or untagged messages, with optional CWT and
   self-described CBOR prefixes handled transparently. Newly encoded COSE
   messages and CWT claims use their registered CBOR tags through
-  `#[derive(cbor2::Cbor)]`.
+  `#[derive(cbor2::Cbor)]`; use `to_untagged_vec` when a peer expects the
+  untagged wire body.
 - **Optional crypto** — `crypto-ring` provides `RingSigner`, `RingVerifier`,
   `RingMacer` and `RingEncryptor` implementations behind a feature flag.
 
@@ -131,7 +132,8 @@ crate's source should start from [AGENTS.md](AGENTS.md).
   `#[cbor(tag = ..., array)]`, preserving the COSE array wire shape while
   declaring their IANA CBOR tags. CWT claims declare their IANA CBOR tag with
   `#[cbor(tag = 61)]`. Decoders still accept untagged COSE messages and
-  untagged claim maps for compatibility.
+  untagged claim maps for compatibility, and tagged types provide
+  `to_untagged_vec` for tagless canonical encoding.
 - Detached payloads are explicit: use `sign_detached*`,
   `compute_detached*`, `verify_detached*`, or `verify_detached_and_decode`.
 - Detached ciphertext is explicit: use `encrypt_detached*` and

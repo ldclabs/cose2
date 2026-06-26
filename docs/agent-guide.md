@@ -204,8 +204,9 @@ verify/decrypt APIs.
   application code.
 - Detached payloads and detached ciphertext are explicit APIs. Do not encode
   `None` manually and then call the embedded-payload helpers.
-- Top-level COSE messages use registered CBOR tags when encoded. Decoders accept
-  untagged messages for compatibility.
+- Top-level COSE messages and CWT claims use registered CBOR tags from
+  `to_vec`. Decoders accept untagged messages for compatibility; use
+  `to_untagged_vec` when a peer expects the tagless body.
 - Header, key, and claim maps use `Label` keys and `cbor2::Value` values. Use
   typed accessors where they exist.
 

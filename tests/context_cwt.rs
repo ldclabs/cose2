@@ -107,15 +107,17 @@ fn claims_round_trip_integer_keys() {
     assert_eq!(&bytes[..2], tag::CWT_PREFIX);
     // Tagged map keyed by integers 1..=7.
     assert_eq!(bytes[2], 0xa7);
+    let untagged = claims.to_untagged_vec().unwrap();
+    assert_eq!(untagged.as_slice(), tag::skip_tag(tag::CWT_PREFIX, &bytes));
+    assert_eq!(untagged[0], 0xa7);
     let back = Claims::from_slice(&bytes).unwrap();
     assert_eq!(back, claims);
 
     // The cbor2 tag derive accepts untagged claim maps for compatibility.
-    let untagged = tag::skip_tag(tag::CWT_PREFIX, &bytes);
-    assert_eq!(cbor2::from_slice::<Claims>(untagged).unwrap(), claims);
-    assert_eq!(Claims::from_slice(untagged).unwrap(), claims);
+    assert_eq!(cbor2::from_slice::<Claims>(&untagged).unwrap(), claims);
+    assert_eq!(Claims::from_slice(&untagged).unwrap(), claims);
 
-    let wrong_tagged = tag::with_tag(tag::SIGN1_PREFIX, untagged);
+    let wrong_tagged = tag::with_tag(tag::SIGN1_PREFIX, &untagged);
     assert!(Claims::from_slice(&wrong_tagged).is_err());
 }
 
@@ -136,6 +138,7 @@ fn claims_omit_absent_fields_and_json() {
     let empty = Claims::new();
     assert_eq!(empty, Claims::default());
     assert_eq!(empty.to_vec().unwrap(), vec![0xd8, 0x3d, 0xa0]);
+    assert_eq!(empty.to_untagged_vec().unwrap(), vec![0xa0]);
 }
 
 #[test]

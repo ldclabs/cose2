@@ -9,7 +9,8 @@
 //! the COSE array wire shape, and encode with their registered CBOR tags
 //! through `#[derive(cbor2::Cbor)]`. CWT claims likewise encode with their
 //! registered CBOR tag. Decode helpers still accept untagged messages and claim
-//! maps for compatibility.
+//! maps for compatibility; use `to_untagged_vec` when a peer expects an
+//! untagged wire body.
 //! Headers reject malformed `crit` parameters and protected/unprotected bucket
 //! label collisions. Critical header parameters (`crit`) that an application
 //! must understand are validated structurally on decode; applications that

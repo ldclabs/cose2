@@ -29,24 +29,37 @@ fn untagged_decode_round_trips_every_message() {
     let macer = MockMacer::new(iana::AlgorithmHMAC_256_256, b"k");
     let enc = MockEncryptor::new(iana::AlgorithmA128GCM, b"k", 12);
 
+    // COSE_Sign1 (tag 18, 1-byte prefix).
+    let mut sign1 = Sign1Message::new(Some(b"p".to_vec()));
+    let tagged = sign1.sign_and_encode(&signer, None).unwrap();
+    let untagged = sign1.to_untagged_vec().unwrap();
+    assert_eq!(untagged.as_slice(), &tagged[tag::SIGN1_PREFIX.len()..]);
+    let decoded = Sign1Message::from_slice(&untagged).unwrap();
+    assert!(decoded.verify(&verifier, None).is_ok());
+
     // COSE_Sign (tag 98, 2-byte prefix).
     let mut sign = SignMessage::new(Some(b"p".to_vec()));
     let tagged = sign.sign_and_encode(&signers, None).unwrap();
-    let untagged = &tagged[tag::SIGN_PREFIX.len()..];
-    let decoded = SignMessage::from_slice(untagged).unwrap();
+    let untagged = sign.to_untagged_vec().unwrap();
+    assert_eq!(untagged.as_slice(), &tagged[tag::SIGN_PREFIX.len()..]);
+    let decoded = SignMessage::from_slice(&untagged).unwrap();
     assert!(decoded.verify(&verifiers, None).is_ok());
 
     // COSE_Mac (tag 97).
     let mut mac = MacMessage::new(Some(b"p".to_vec()));
     mac.recipients.push(key_wrap_recipient());
     let tagged = mac.compute_and_encode(&macer, None).unwrap();
-    let decoded = MacMessage::from_slice(&tagged[tag::MAC_PREFIX.len()..]).unwrap();
+    let untagged = mac.to_untagged_vec().unwrap();
+    assert_eq!(untagged.as_slice(), &tagged[tag::MAC_PREFIX.len()..]);
+    let decoded = MacMessage::from_slice(&untagged).unwrap();
     assert!(decoded.verify(&macer, None).is_ok());
 
     // COSE_Mac0 (tag 17, 1-byte prefix).
     let mut mac0 = Mac0Message::new(Some(b"p".to_vec()));
     let tagged = mac0.compute_and_encode(&macer, None).unwrap();
-    let decoded = Mac0Message::from_slice(&tagged[tag::MAC0_PREFIX.len()..]).unwrap();
+    let untagged = mac0.to_untagged_vec().unwrap();
+    assert_eq!(untagged.as_slice(), &tagged[tag::MAC0_PREFIX.len()..]);
+    let decoded = Mac0Message::from_slice(&untagged).unwrap();
     assert!(decoded.verify(&macer, None).is_ok());
 
     // COSE_Encrypt (tag 96).
@@ -54,14 +67,18 @@ fn untagged_decode_round_trips_every_message() {
     encm.recipients.push(key_wrap_recipient());
     encm.unprotected.set_iv(vec![1u8; 12]);
     let tagged = encm.encrypt_and_encode(&enc, None).unwrap();
-    let mut decoded = EncryptMessage::from_slice(&tagged[tag::ENCRYPT_PREFIX.len()..]).unwrap();
+    let untagged = encm.to_untagged_vec().unwrap();
+    assert_eq!(untagged.as_slice(), &tagged[tag::ENCRYPT_PREFIX.len()..]);
+    let mut decoded = EncryptMessage::from_slice(&untagged).unwrap();
     assert!(decoded.decrypt(&enc, None).is_ok());
 
     // COSE_Encrypt0 (tag 16).
     let mut enc0 = Encrypt0Message::new(Some(b"p".to_vec()));
     enc0.unprotected.set_iv(vec![1u8; 12]);
     let tagged = enc0.encrypt_and_encode(&enc, None).unwrap();
-    let mut decoded = Encrypt0Message::from_slice(&tagged[tag::ENCRYPT0_PREFIX.len()..]).unwrap();
+    let untagged = enc0.to_untagged_vec().unwrap();
+    assert_eq!(untagged.as_slice(), &tagged[tag::ENCRYPT0_PREFIX.len()..]);
+    let mut decoded = Encrypt0Message::from_slice(&untagged).unwrap();
     assert!(decoded.decrypt(&enc, None).is_ok());
 }
 

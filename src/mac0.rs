@@ -198,6 +198,12 @@ impl Mac0Message {
         Ok(cbor2::to_canonical_vec(&wire)?)
     }
 
+    /// Encodes a computed message to canonical COSE_Mac0 bytes without the CBOR tag.
+    pub fn to_untagged_vec(&self) -> Result<Vec<u8>, Error> {
+        let tagged = self.to_vec()?;
+        Ok(tag::skip_tag(tag::MAC0_PREFIX, &tagged).to_vec())
+    }
+
     /// Decodes a COSE_Mac0 message (tagged or untagged) without verifying it.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
         let body = tag::strip_message_wrappers(data);

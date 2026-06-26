@@ -78,6 +78,12 @@ impl Claims {
     pub fn to_vec(&self) -> Result<Vec<u8>, Error> {
         Ok(cbor2::to_canonical_vec(self)?)
     }
+
+    /// Encodes claims to canonical CBOR bytes without the CWT CBOR tag.
+    pub fn to_untagged_vec(&self) -> Result<Vec<u8>, Error> {
+        let tagged = self.to_vec()?;
+        Ok(tag::skip_tag(tag::CWT_PREFIX, &tagged).to_vec())
+    }
 }
 
 /// A CWT claims set keyed by [`Label`](crate::Label), preserving all claims
