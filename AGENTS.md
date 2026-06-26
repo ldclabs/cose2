@@ -43,21 +43,21 @@ cargo run --example sign1_ring --features crypto-ring
 
 ## Repository layout
 
-| Path | Contents |
-| --- | --- |
-| `src/lib.rs` | Crate root and public re-exports. |
-| `src/iana.rs` | IANA registry constants (algorithms, key params, claims, tags). |
-| `src/label.rs`, `src/map.rs` | `Label` (`int`/`tstr`) and the shared `CoseMap`. |
-| `src/header.rs`, `src/key.rs` | `Header`; `Key` / `KeySet`. |
-| `src/sign1.rs`, `src/sign.rs` | `Sign1Message`; `SignMessage` / `Signature`. |
-| `src/mac0.rs`, `src/mac.rs` | `Mac0Message`; `MacMessage`. |
-| `src/encrypt0.rs`, `src/encrypt.rs` | `Encrypt0Message`; `EncryptMessage`. |
-| `src/recipient.rs`, `src/context.rs` | `Recipient`; `KdfContext` / `PartyInfo` / `SuppPubInfo`. |
-| `src/traits.rs` | `Signer` / `Verifier` / `Macer` / `Encryptor`. |
-| `src/cwt.rs` | `Claims` / `ClaimsMap` / `Validator`. |
-| `src/crypto.rs` | `ring` providers (feature `crypto-ring`). |
-| `src/error.rs`, `src/tag.rs`, `src/util.rs` | `Error`; CBOR-tag helpers; internal helpers. |
-| `examples/`, `tests/`, `docs/` | Runnable examples, integration tests, the consumer agent guide. |
+| Path                                        | Contents                                                        |
+| ------------------------------------------- | --------------------------------------------------------------- |
+| `src/lib.rs`                                | Crate root and public re-exports.                               |
+| `src/iana.rs`                               | IANA registry constants (algorithms, key params, claims, tags). |
+| `src/label.rs`, `src/map.rs`                | `Label` (`int`/`tstr`) and the shared `CoseMap`.                |
+| `src/header.rs`, `src/key.rs`               | `Header`; `Key` / `KeySet`.                                     |
+| `src/sign1.rs`, `src/sign.rs`               | `Sign1Message`; `SignMessage` / `Signature`.                    |
+| `src/mac0.rs`, `src/mac.rs`                 | `Mac0Message`; `MacMessage`.                                    |
+| `src/encrypt0.rs`, `src/encrypt.rs`         | `Encrypt0Message`; `EncryptMessage`.                            |
+| `src/recipient.rs`, `src/context.rs`        | `Recipient`; `KdfContext` / `PartyInfo` / `SuppPubInfo`.        |
+| `src/traits.rs`                             | `Signer` / `Verifier` / `Macer` / `Encryptor`.                  |
+| `src/cwt.rs`                                | `Claims` / `ClaimsMap` / `Validator`.                           |
+| `src/crypto.rs`                             | `ring` providers (feature `crypto-ring`).                       |
+| `src/error.rs`, `src/tag.rs`, `src/util.rs` | `Error`; CBOR-tag helpers; internal helpers.                    |
+| `examples/`, `tests/`, `docs/`              | Runnable examples, integration tests, the consumer agent guide. |
 
 ## Invariants to preserve
 

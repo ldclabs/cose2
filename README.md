@@ -34,6 +34,9 @@ construction.
   labels and the full IANA parameter registry under [`iana`].
 - **CWT** — typed [`cwt::Claims`], a label-keyed [`cwt::ClaimsMap`], and a
   [`cwt::Validator`] for expiry, not-before, issued-at, issuer and audience.
+- **SD-CWT** — the workspace also includes [`sd-cwt`](sd-cwt/README.md), a
+  companion crate for selective-disclosure claims, `simple(59)`,
+  tag-60 redacted elements, `sd_claims`, and Holder/Verifier restoration.
 - **KDF context** — `KdfContext`, `PartyInfo`, `SuppPubInfo` (RFC 9053 §5.2).
 - **Tagging** — tagged or untagged messages, with optional CWT and
   self-described CBOR prefixes handled transparently. Newly encoded COSE
@@ -73,20 +76,21 @@ assert_eq!(verified.payload.as_deref(), Some(&b"This is the content"[..]));
 
 ## Use the API by task
 
-| Task                       | Start with                                                                            | Notes                                                                     |
-| -------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| Sign one embedded payload  | `Sign1Message::sign_and_encode` / `Sign1Message::verify_and_decode`                   | The common COSE_Sign1 flow.                                               |
-| Sign one detached payload  | `Sign1Message::sign_detached_and_encode` / `Sign1Message::verify_detached_and_decode` | The wire payload is `nil`; carry the payload out of band.                 |
-| Sign with multiple signers | `SignMessage`                                                                         | Each signer has its own `Signature`.                                      |
-| MAC one payload            | `Mac0Message::compute_and_encode` / `Mac0Message::verify_and_decode`                  | Symmetric authentication without recipients.                              |
-| MAC with recipients        | `MacMessage`                                                                          | Recipient-layer cryptography stays application-owned.                     |
-| Encrypt one payload        | `Encrypt0Message::encrypt_and_encode` / `Encrypt0Message::decrypt_and_decode`         | Requires a full `IV`, or `Partial IV` plus `Encryptor::base_iv`.          |
-| Encrypt with recipients    | `EncryptMessage`                                                                      | `cose2` validates recipient structure but does not wrap or agree the CEK. |
-| Async/remote signing       | `prepare_signature` / `prepare_signatures`, then `set_signature` / `set_signatures`   | Sign the returned `Sig_structure` bytes outside the synchronous trait.    |
-| Async/remote MAC           | `prepare_tag` / `prepare_detached_tag`, then `set_tag`                                | MAC the returned `MAC_structure` bytes outside the synchronous trait.     |
-| Async/remote encryption    | `prepare_encryption` then `set_ciphertext`                                            | Encrypt with the returned nonce and `Enc_structure` AAD.                  |
-| Work with CWT claims       | `cwt::Claims`, `cwt::ClaimsMap`, `cwt::Validator`                                     | `Claims::extra` preserves custom claims; use `ClaimsMap` for map-only use. |
-| Work with COSE keys        | `Key`, `KeySet`                                                                       | `KeySet::lookup(kid)` returns all matches because `kid` is not unique.    |
+| Task                       | Start with                                                                            | Notes                                                                                              |
+| -------------------------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| Sign one embedded payload  | `Sign1Message::sign_and_encode` / `Sign1Message::verify_and_decode`                   | The common COSE_Sign1 flow.                                                                        |
+| Sign one detached payload  | `Sign1Message::sign_detached_and_encode` / `Sign1Message::verify_detached_and_decode` | The wire payload is `nil`; carry the payload out of band.                                          |
+| Sign with multiple signers | `SignMessage`                                                                         | Each signer has its own `Signature`.                                                               |
+| MAC one payload            | `Mac0Message::compute_and_encode` / `Mac0Message::verify_and_decode`                  | Symmetric authentication without recipients.                                                       |
+| MAC with recipients        | `MacMessage`                                                                          | Recipient-layer cryptography stays application-owned.                                              |
+| Encrypt one payload        | `Encrypt0Message::encrypt_and_encode` / `Encrypt0Message::decrypt_and_decode`         | Requires a full `IV`, or `Partial IV` plus `Encryptor::base_iv`.                                   |
+| Encrypt with recipients    | `EncryptMessage`                                                                      | `cose2` validates recipient structure but does not wrap or agree the CEK.                          |
+| Async/remote signing       | `prepare_signature` / `prepare_signatures`, then `set_signature` / `set_signatures`   | Sign the returned `Sig_structure` bytes outside the synchronous trait.                             |
+| Async/remote MAC           | `prepare_tag` / `prepare_detached_tag`, then `set_tag`                                | MAC the returned `MAC_structure` bytes outside the synchronous trait.                              |
+| Async/remote encryption    | `prepare_encryption` then `set_ciphertext`                                            | Encrypt with the returned nonce and `Enc_structure` AAD.                                           |
+| Work with CWT claims       | `cwt::Claims`, `cwt::ClaimsMap`, `cwt::Validator`                                     | `Claims::extra` preserves custom claims; use `ClaimsMap` for map-only use.                         |
+| Work with SD-CWT claims    | `sd-cwt` companion crate                                                              | Issue tag-58/62 pre-issuance claims, write `sd_claims`, and restore Holder/Verifier presentations. |
+| Work with COSE keys        | `Key`, `KeySet`                                                                       | `KeySet::lookup(kid)` returns all matches because `kid` is not unique.                             |
 
 ## Runnable examples
 
@@ -100,12 +104,19 @@ cargo run --example cwt_sign1
 cargo run --example sign1_ring --features crypto-ring
 cargo run --example mac0_ring --features crypto-ring
 cargo run --example encrypt0_ring --features crypto-ring
+cargo run -p sd-cwt --example basic
 ```
 
 For a compact decision checklist — including a [`crypto-ring` algorithm
 recipe table][agent-recipes] mapping each algorithm to its required COSE key
 parameters — see the [Agent guide for cose2][agent-guide]. Agents modifying this
 crate's source should start from [AGENTS.md](AGENTS.md).
+
+For selective-disclosure credentials, start with the
+[`sd-cwt` README](sd-cwt/README.md) and its runnable `basic` example. The
+example shows pre-issuance redaction requests, issuer signing with
+`Sign1Message`, Holder validation, and Verifier presentation with a disclosure
+subset.
 
 ## Design notes
 

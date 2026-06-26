@@ -1,0 +1,16 @@
+[package]
+name = "sd-cwt"
+version = "0.1.0"
+description = "Selective Disclosure CBOR Web Token (SD-CWT) helpers for cose2."
+homepage = "https://github.com/ldclabs/cose2"
+repository = "https://github.com/ldclabs/cose2"
+documentation = "https://docs.rs/sd-cwt"
+readme = "README.md"
+license = "MIT"
+edition = "2021"
+rust-version = "1.85"
+
+[dependencies]
+cbor2 = { version = "1.1", features = ["derive"] }
+cose2 = { path = "..", version = "0.3.0" }
+sha2 = "0.10"
