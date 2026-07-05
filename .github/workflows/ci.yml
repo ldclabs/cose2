@@ -18,7 +18,7 @@ jobs:
       fail-fast: false
       matrix:
         # `stable` plus the crate's declared MSRV (Cargo.toml `rust-version`).
-        rust: [stable, "1.85"]
+        rust: [stable, "1.89"]
     steps:
       - uses: actions/checkout@v5
 

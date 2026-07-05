@@ -12,7 +12,7 @@ decision table and the protocol rules you should not guess.
 delegates cryptography to caller-supplied trait implementations, so the default
 build has **no cryptographic dependencies**.
 
-- Edition 2021, MSRV **1.85** (`rust-version` in `Cargo.toml`).
+- Edition 2021, MSRV **1.89** (`rust-version` in `Cargo.toml`).
 - `#![forbid(unsafe_code)]`.
 
 ## Setup and verification
