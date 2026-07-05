@@ -33,7 +33,10 @@
 //! Encryption accepts either a full `IV`, or a `Partial IV` combined with
 //! [`Encryptor::base_iv`], and never generates nonces internally.
 //! Optional crypto backends are available behind feature flags; enable
-//! `crypto-ring` or the aggregate `crypto` feature for a `ring`-based backend.
+//! `crypto-ring` (or the aggregate `crypto` feature) for a `ring`-based
+//! backend, or `crypto-aws-lc-rs` for an [`aws-lc-rs`](https://crates.io/crates/aws-lc-rs)-based
+//! one. The two backends expose the same providers; when both are enabled,
+//! `crypto-ring` takes precedence.
 //!
 //! # Example: COSE_Sign1 round trip
 //!
@@ -84,7 +87,7 @@ mod recipient;
 mod sign;
 mod sign1;
 
-#[cfg(feature = "crypto-ring")]
+#[cfg(any(feature = "crypto-ring", feature = "crypto-aws-lc-rs"))]
 pub mod crypto;
 pub mod cwt;
 

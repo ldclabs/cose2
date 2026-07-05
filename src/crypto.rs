@@ -1,32 +1,56 @@
-//! Optional `ring`-based cryptographic providers.
+//! Optional built-in cryptographic providers.
 //!
-//! This module is available with the `crypto-ring` feature. It implements the
-//! crate's pluggable traits for the algorithms that `ring` exposes in COSE
+//! This module is available with the `crypto-ring` or `crypto-aws-lc-rs`
+//! feature. Both back the same providers with an API-compatible backend
+//! ([`ring`](https://crates.io/crates/ring) or
+//! [`aws-lc-rs`](https://crates.io/crates/aws-lc-rs), respectively); when both
+//! features are enabled, `ring` takes precedence. It implements the crate's
+//! pluggable traits for the algorithms the backend exposes in COSE
 //! wire-compatible form:
 //!
 //! - signatures: Ed25519, ES256, ES384, RS256/384/512, PS256/384/512
 //! - MACs: HMAC 256/64, HMAC 256/256, HMAC 384/384, HMAC 512/512
 //! - AEAD content encryption: A128GCM, A256GCM, ChaCha20/Poly1305
 //!
-//! Algorithms not supported by `ring` are rejected during provider
+//! Algorithms not supported by the backend are rejected during provider
 //! construction.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
-use ring::{
+#[cfg(feature = "crypto-ring")]
+use ring as backend;
+
+#[cfg(all(feature = "crypto-aws-lc-rs", not(feature = "crypto-ring")))]
+use aws_lc_rs as backend;
+
+use backend::{
     aead, hmac, rand, rsa, signature,
     signature::{KeyPair, RsaParameters},
 };
 
 use crate::{iana, Encryptor, Error, Key, Label, Macer, Signer, Verifier};
 
-/// A `ring` HMAC provider for COSE_Mac and COSE_Mac0.
-#[derive(Clone, Debug)]
+/// A built-in HMAC provider for COSE_Mac and COSE_Mac0.
+#[derive(Clone)]
 pub struct RingMacer {
     alg: i64,
     kid: Option<Vec<u8>>,
     key: hmac::Key,
+    // Retained so the symmetric `k` can be re-exported by `to_cose_key`;
+    // `hmac::Key` does not expose its raw bytes.
+    raw_key: Vec<u8>,
     tag_len: usize,
+}
+
+// Manual `Debug` keeps the raw key material out of formatted output.
+impl fmt::Debug for RingMacer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RingMacer")
+            .field("alg", &self.alg)
+            .field("kid", &self.kid)
+            .field("tag_len", &self.tag_len)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RingMacer {
@@ -37,6 +61,7 @@ impl RingMacer {
             alg,
             kid,
             key: hmac::Key::new(algorithm, key),
+            raw_key: key.to_vec(),
             tag_len,
         })
     }
@@ -50,6 +75,18 @@ impl RingMacer {
             required_bytes(key, iana::SymmetricKeyParameterK, "k")?,
             key_kid(key)?,
         )
+    }
+
+    /// Exports this provider as a symmetric COSE_Key carrying `alg` and `k`.
+    ///
+    /// The result round-trips through [`RingMacer::from_cose_key`].
+    pub fn to_cose_key(&self) -> Result<Key, Error> {
+        Ok(symmetric_cose_key(
+            self.alg,
+            &self.raw_key,
+            self.kid.as_deref(),
+            None,
+        ))
     }
 
     /// The configured COSE algorithm.
@@ -85,13 +122,29 @@ impl Macer for RingMacer {
     }
 }
 
-/// A `ring` AEAD provider for COSE_Encrypt and COSE_Encrypt0 content.
-#[derive(Clone, Debug)]
+/// A built-in AEAD provider for COSE_Encrypt and COSE_Encrypt0 content.
+#[derive(Clone)]
 pub struct RingEncryptor {
     alg: i64,
     kid: Option<Vec<u8>>,
-    key: aead::LessSafeKey,
+    // `Arc` keeps `RingEncryptor: Clone` uniform across backends: `ring`'s
+    // `LessSafeKey` is `Clone` but `aws-lc-rs`'s is not.
+    key: Arc<aead::LessSafeKey>,
+    // Retained so the symmetric `k` can be re-exported by `to_cose_key`;
+    // `aead::LessSafeKey` does not expose its raw bytes.
+    raw_key: Vec<u8>,
     base_iv: Option<Vec<u8>>,
+}
+
+// Manual `Debug` keeps the raw key material out of formatted output.
+impl fmt::Debug for RingEncryptor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RingEncryptor")
+            .field("alg", &self.alg)
+            .field("kid", &self.kid)
+            .field("base_iv", &self.base_iv)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RingEncryptor {
@@ -103,7 +156,8 @@ impl RingEncryptor {
         Ok(Self {
             alg,
             kid,
-            key: aead::LessSafeKey::new(unbound),
+            key: Arc::new(aead::LessSafeKey::new(unbound)),
+            raw_key: key.to_vec(),
             base_iv: None,
         })
     }
@@ -125,6 +179,19 @@ impl RingEncryptor {
     pub fn with_base_iv(mut self, base_iv: impl Into<Vec<u8>>) -> Self {
         self.base_iv = Some(base_iv.into());
         self
+    }
+
+    /// Exports this provider as a symmetric COSE_Key carrying `alg`, `k` and,
+    /// when configured, the Base IV.
+    ///
+    /// The result round-trips through [`RingEncryptor::from_cose_key`].
+    pub fn to_cose_key(&self) -> Result<Key, Error> {
+        Ok(symmetric_cose_key(
+            self.alg,
+            &self.raw_key,
+            self.kid.as_deref(),
+            self.base_iv.as_deref(),
+        ))
     }
 
     /// The configured COSE algorithm.
@@ -172,7 +239,7 @@ impl Encryptor for RingEncryptor {
     }
 }
 
-/// A `ring` signing provider for COSE_Sign and COSE_Sign1.
+/// A built-in signing provider for COSE_Sign and COSE_Sign1.
 #[derive(Debug)]
 pub struct RingSigner {
     alg: i64,
@@ -295,6 +362,29 @@ impl RingSigner {
         }
     }
 
+    /// Exports the *public* COSE_Key for this signer.
+    ///
+    /// The backends do not expose the private scalar, so the result carries
+    /// only public parameters (`x`, and for EC2 also `y`) and can be consumed
+    /// by [`RingVerifier::from_cose_key`]. RSA signers are unsupported because
+    /// the backends expose no public modulus for them; use the raw modulus and
+    /// exponent with [`RingVerifier::rsa_components`] instead.
+    pub fn to_cose_key(&self) -> Result<Key, Error> {
+        match &self.key {
+            RingSigningKey::Ed25519(key) => Ok(okp_public_cose_key(
+                self.alg,
+                key.public_key().as_ref(),
+                self.kid.as_deref(),
+            )),
+            RingSigningKey::Ecdsa(key) => {
+                ec2_public_cose_key(self.alg, key.public_key().as_ref(), self.kid.as_deref())
+            }
+            RingSigningKey::Rsa { .. } => Err(Error::custom(
+                "cannot export a COSE_Key from an RSA RingSigner: the backend exposes no public key",
+            )),
+        }
+    }
+
     /// The configured COSE algorithm.
     pub fn algorithm(&self) -> i64 {
         self.alg
@@ -326,12 +416,21 @@ impl RingSigner {
         require_curve(key, iana::EC2KeyParameterCrv, curve)?;
         let kid = key_kid(key)?;
         let public_key = ec2_uncompressed_public_key(key)?;
-        let rng = rand::SystemRandom::new();
+        let d = required_bytes(key, iana::EC2KeyParameterD, "d")?;
+        // `ring` requires an RNG argument here; `aws-lc-rs` does not.
+        #[cfg(feature = "crypto-ring")]
         let signing_key = signature::EcdsaKeyPair::from_private_key_and_public_key(
             signing_algorithm,
-            required_bytes(key, iana::EC2KeyParameterD, "d")?,
+            d,
             &public_key,
-            &rng,
+            &rand::SystemRandom::new(),
+        )
+        .map_err(|_| Error::custom("invalid ECDSA key material"))?;
+        #[cfg(all(feature = "crypto-aws-lc-rs", not(feature = "crypto-ring")))]
+        let signing_key = signature::EcdsaKeyPair::from_private_key_and_public_key(
+            signing_algorithm,
+            d,
+            &public_key,
         )
         .map_err(|_| Error::custom("invalid ECDSA key material"))?;
         Ok(Self {
@@ -347,8 +446,16 @@ impl RingSigner {
         pkcs8: &[u8],
         kid: Option<Vec<u8>>,
     ) -> Result<Self, Error> {
-        let rng = rand::SystemRandom::new();
-        let key = signature::EcdsaKeyPair::from_pkcs8(signing_algorithm, pkcs8, &rng)
+        // `ring` requires an RNG argument here; `aws-lc-rs` does not.
+        #[cfg(feature = "crypto-ring")]
+        let key = signature::EcdsaKeyPair::from_pkcs8(
+            signing_algorithm,
+            pkcs8,
+            &rand::SystemRandom::new(),
+        )
+        .map_err(|_| Error::custom("invalid ECDSA PKCS#8 key"))?;
+        #[cfg(all(feature = "crypto-aws-lc-rs", not(feature = "crypto-ring")))]
+        let key = signature::EcdsaKeyPair::from_pkcs8(signing_algorithm, pkcs8)
             .map_err(|_| Error::custom("invalid ECDSA PKCS#8 key"))?;
         Ok(Self {
             alg,
@@ -360,20 +467,13 @@ impl RingSigner {
     fn rsa_from_cose_key(key: &Key, alg: i64) -> Result<Self, Error> {
         require_kty(key, iana::KeyTypeRSA)?;
         let padding = rsa_signing_algorithm(alg)?;
-        let components = rsa::KeyPairComponents {
-            public_key: rsa::PublicKeyComponents {
-                n: required_bytes(key, iana::RSAKeyParameterN, "n")?,
-                e: required_bytes(key, iana::RSAKeyParameterE, "e")?,
-            },
-            d: required_bytes(key, iana::RSAKeyParameterD, "d")?,
-            p: required_bytes(key, iana::RSAKeyParameterP, "p")?,
-            q: required_bytes(key, iana::RSAKeyParameterQ, "q")?,
-            dP: required_bytes(key, iana::RSAKeyParameterDP, "dP")?,
-            dQ: required_bytes(key, iana::RSAKeyParameterDQ, "dQ")?,
-            qInv: required_bytes(key, iana::RSAKeyParameterQInv, "qInv")?,
-        };
-        let key_pair = rsa::KeyPair::from_components(&components)
-            .map_err(|_| Error::custom("invalid RSA key material"))?;
+        // A COSE_Key carries the full RSA CRT parameter set, but the backends
+        // disagree on how to ingest it: `ring` offers `from_components` while
+        // `aws-lc-rs` only parses DER. Serialize the components into a PKCS#1
+        // `RSAPrivateKey` DER, which `RsaKeyPair::from_der` accepts on both.
+        let der = rsa_pkcs1_private_key_der(key)?;
+        let key_pair =
+            rsa::KeyPair::from_der(&der).map_err(|_| Error::custom("invalid RSA key material"))?;
         Ok(Self {
             alg,
             kid: key_kid(key)?,
@@ -404,7 +504,13 @@ impl Signer for RingSigner {
             }
             RingSigningKey::Rsa { key_pair, padding } => {
                 let rng = rand::SystemRandom::new();
-                let mut signature = vec![0; key_pair.public().modulus_len()];
+                // `ring` deprecates `public_modulus_len()` in favour of
+                // `public().modulus_len()`; `aws-lc-rs` exposes only the former.
+                #[cfg(feature = "crypto-ring")]
+                let sig_len = key_pair.public().modulus_len();
+                #[cfg(all(feature = "crypto-aws-lc-rs", not(feature = "crypto-ring")))]
+                let sig_len = key_pair.public_modulus_len();
+                let mut signature = vec![0; sig_len];
                 key_pair
                     .sign(*padding, &rng, data, &mut signature)
                     .map_err(|_| Error::custom("RSA signing failed"))?;
@@ -414,7 +520,7 @@ impl Signer for RingSigner {
     }
 }
 
-/// A `ring` verifier for COSE_Sign and COSE_Sign1.
+/// A built-in verifier for COSE_Sign and COSE_Sign1.
 #[derive(Clone, Debug)]
 pub struct RingVerifier {
     alg: i64,
@@ -516,6 +622,31 @@ impl RingVerifier {
             kid,
             key: RingVerificationKey::RsaDer(der.to_vec()),
         })
+    }
+
+    /// Exports this verifier as a public COSE_Key.
+    ///
+    /// The result round-trips through [`RingVerifier::from_cose_key`]. RSA
+    /// verifiers built from a DER public key have their PKCS#1 `RSAPublicKey`
+    /// parsed back into the COSE `n` and `e` parameters.
+    pub fn to_cose_key(&self) -> Result<Key, Error> {
+        match &self.key {
+            RingVerificationKey::Ed25519(public_key) => Ok(okp_public_cose_key(
+                self.alg,
+                public_key,
+                self.kid.as_deref(),
+            )),
+            RingVerificationKey::Ecdsa(public_key) => {
+                ec2_public_cose_key(self.alg, public_key, self.kid.as_deref())
+            }
+            RingVerificationKey::RsaComponents { n, e } => {
+                Ok(rsa_public_cose_key(self.alg, n, e, self.kid.as_deref()))
+            }
+            RingVerificationKey::RsaDer(der) => {
+                let (n, e) = rsa_public_key_from_der(der)?;
+                Ok(rsa_public_cose_key(self.alg, &n, &e, self.kid.as_deref()))
+            }
+        }
     }
 
     /// The configured COSE algorithm.
@@ -620,7 +751,7 @@ fn required_alg(key: &Key) -> Result<i64, Error> {
     match key.alg()? {
         Some(Label::Int(alg)) => Ok(alg),
         Some(Label::Text(_)) => Err(Error::custom(
-            "ring crypto backend does not support private text-string algorithms",
+            "the built-in crypto backend does not support private text-string algorithms",
         )),
         None => Err(Error::custom("COSE_Key is missing alg")),
     }
@@ -669,6 +800,194 @@ fn ec2_uncompressed_public_key(key: &Key) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
+/// Builds a symmetric COSE_Key (`kty` = Symmetric) carrying `alg`, `k`, an
+/// optional `kid` and an optional Base IV.
+fn symmetric_cose_key(alg: i64, k: &[u8], kid: Option<&[u8]>, base_iv: Option<&[u8]>) -> Key {
+    let mut key = Key::new();
+    key.set_kty(iana::KeyTypeSymmetric).set_alg(alg);
+    if let Some(kid) = kid {
+        key.set_kid(kid.to_vec());
+    }
+    key.insert(iana::SymmetricKeyParameterK, k.to_vec());
+    if let Some(base_iv) = base_iv {
+        key.insert(iana::KeyParameterBaseIV, base_iv.to_vec());
+    }
+    key
+}
+
+/// Builds an Ed25519 OKP public COSE_Key carrying `alg`, `crv`, `x` and an
+/// optional `kid`.
+fn okp_public_cose_key(alg: i64, x: &[u8], kid: Option<&[u8]>) -> Key {
+    let mut key = Key::new();
+    key.set_kty(iana::KeyTypeOKP).set_alg(alg);
+    if let Some(kid) = kid {
+        key.set_kid(kid.to_vec());
+    }
+    key.insert(iana::OKPKeyParameterCrv, iana::EllipticCurveEd25519);
+    key.insert(iana::OKPKeyParameterX, x.to_vec());
+    key
+}
+
+/// Builds an EC2 public COSE_Key from an uncompressed SEC1 point
+/// (`0x04 || x || y`), selecting the curve and fixed coordinate length from the
+/// ECDSA `alg`.
+fn ec2_public_cose_key(alg: i64, point: &[u8], kid: Option<&[u8]>) -> Result<Key, Error> {
+    let (curve, coord_len) = match alg {
+        iana::AlgorithmES256 => (iana::EllipticCurveP_256, 32),
+        iana::AlgorithmES384 => (iana::EllipticCurveP_384, 48),
+        _ => return Err(unsupported_alg("ECDSA", alg)),
+    };
+    // RFC 9053 EC2 keys use fixed-length field-element coordinates, so a valid
+    // uncompressed point is exactly `0x04` followed by two `coord_len` halves.
+    if point.first() != Some(&0x04) || point.len() != 1 + 2 * coord_len {
+        return Err(Error::custom("invalid uncompressed EC public key"));
+    }
+    let mut key = Key::new();
+    key.set_kty(iana::KeyTypeEC2).set_alg(alg);
+    if let Some(kid) = kid {
+        key.set_kid(kid.to_vec());
+    }
+    key.insert(iana::EC2KeyParameterCrv, curve);
+    key.insert(iana::EC2KeyParameterX, point[1..1 + coord_len].to_vec());
+    key.insert(iana::EC2KeyParameterY, point[1 + coord_len..].to_vec());
+    Ok(key)
+}
+
+/// Builds an RSA public COSE_Key carrying `alg`, `n`, `e` and an optional `kid`.
+fn rsa_public_cose_key(alg: i64, n: &[u8], e: &[u8], kid: Option<&[u8]>) -> Key {
+    let mut key = Key::new();
+    key.set_kty(iana::KeyTypeRSA).set_alg(alg);
+    if let Some(kid) = kid {
+        key.set_kid(kid.to_vec());
+    }
+    key.insert(iana::RSAKeyParameterN, n.to_vec());
+    key.insert(iana::RSAKeyParameterE, e.to_vec());
+    key
+}
+
+/// Serializes an RSA COSE_Key's CRT components into a PKCS#1 `RSAPrivateKey`
+/// DER document (RFC 8017 §A.1.2). Both crypto backends ingest this through
+/// `RsaKeyPair::from_der`.
+fn rsa_pkcs1_private_key_der(key: &Key) -> Result<Vec<u8>, Error> {
+    // Field order is fixed by the ASN.1 `RSAPrivateKey` SEQUENCE.
+    let fields = [
+        required_bytes(key, iana::RSAKeyParameterN, "n")?,
+        required_bytes(key, iana::RSAKeyParameterE, "e")?,
+        required_bytes(key, iana::RSAKeyParameterD, "d")?,
+        required_bytes(key, iana::RSAKeyParameterP, "p")?,
+        required_bytes(key, iana::RSAKeyParameterQ, "q")?,
+        required_bytes(key, iana::RSAKeyParameterDP, "dP")?,
+        required_bytes(key, iana::RSAKeyParameterDQ, "dQ")?,
+        required_bytes(key, iana::RSAKeyParameterQInv, "qInv")?,
+    ];
+
+    let mut body = Vec::new();
+    der_unsigned_integer(&[0], &mut body); // version: 0 (two-prime)
+    for field in fields {
+        der_unsigned_integer(field, &mut body);
+    }
+
+    let mut der = Vec::with_capacity(body.len() + 4);
+    der.push(0x30); // SEQUENCE
+    der_length(body.len(), &mut der);
+    der.extend_from_slice(&body);
+    Ok(der)
+}
+
+/// Appends a DER `INTEGER` TLV holding the unsigned big-endian magnitude `value`.
+fn der_unsigned_integer(value: &[u8], out: &mut Vec<u8>) {
+    // DER integers are minimally encoded: drop leading zero bytes, keeping one.
+    let mut magnitude = value;
+    while magnitude.len() > 1 && magnitude[0] == 0 {
+        magnitude = &magnitude[1..];
+    }
+    out.push(0x02); // INTEGER
+                    // Prepend 0x00 when the high bit is set so the value stays positive.
+    if magnitude.first().is_some_and(|&b| b & 0x80 != 0) {
+        der_length(magnitude.len() + 1, out);
+        out.push(0x00);
+    } else {
+        der_length(magnitude.len(), out);
+    }
+    out.extend_from_slice(magnitude);
+}
+
+/// Appends DER definite-form length octets for `len`.
+fn der_length(len: usize, out: &mut Vec<u8>) {
+    if len < 0x80 {
+        out.push(len as u8);
+        return;
+    }
+    let be = len.to_be_bytes();
+    let first = be.iter().position(|&b| b != 0).unwrap_or(be.len() - 1);
+    let bytes = &be[first..];
+    out.push(0x80 | bytes.len() as u8);
+    out.extend_from_slice(bytes);
+}
+
+/// Parses a PKCS#1 `RSAPublicKey` DER (RFC 8017 §A.1.1),
+/// `SEQUENCE { modulus INTEGER, publicExponent INTEGER }`, returning the
+/// unsigned big-endian magnitudes of `n` and `e`.
+fn rsa_public_key_from_der(der: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let invalid = || Error::custom("invalid RSA public key DER");
+    let (seq, trailing) = der_take_tlv(der, 0x30).ok_or_else(invalid)?;
+    if !trailing.is_empty() {
+        return Err(invalid());
+    }
+    let (n, rest) = der_take_tlv(seq, 0x02).ok_or_else(invalid)?;
+    let (e, rest) = der_take_tlv(rest, 0x02).ok_or_else(invalid)?;
+    if !rest.is_empty() {
+        return Err(invalid());
+    }
+    Ok((
+        der_integer_magnitude(n).to_vec(),
+        der_integer_magnitude(e).to_vec(),
+    ))
+}
+
+/// Reads one DER TLV whose tag must equal `tag`, returning `(contents, rest)`
+/// where `rest` is the bytes following the value. Returns `None` on any
+/// malformation.
+fn der_take_tlv(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
+    let (&first, rest) = input.split_first()?;
+    if first != tag {
+        return None;
+    }
+    let (len, rest) = der_read_length(rest)?;
+    if rest.len() < len {
+        return None;
+    }
+    Some(rest.split_at(len))
+}
+
+/// Reads DER definite-form length octets, returning `(length, rest)`. Rejects
+/// the indefinite form and lengths that would overflow `usize`.
+fn der_read_length(input: &[u8]) -> Option<(usize, &[u8])> {
+    let (&first, rest) = input.split_first()?;
+    if first < 0x80 {
+        return Some((first as usize, rest));
+    }
+    let count = (first & 0x7f) as usize;
+    if count == 0 || count > std::mem::size_of::<usize>() || rest.len() < count {
+        return None;
+    }
+    let (bytes, rest) = rest.split_at(count);
+    let mut len = 0usize;
+    for &b in bytes {
+        len = (len << 8) | b as usize;
+    }
+    Some((len, rest))
+}
+
+/// Strips a DER sign byte (a single leading `0x00`) to yield the unsigned
+/// big-endian magnitude used by COSE RSA parameters.
+fn der_integer_magnitude(bytes: &[u8]) -> &[u8] {
+    match bytes.split_first() {
+        Some((&0x00, rest)) if !rest.is_empty() => rest,
+        _ => bytes,
+    }
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -682,7 +1001,140 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 fn unsupported_alg(operation: &str, alg: i64) -> Error {
     Error::custom(format!(
-        "unsupported {operation} algorithm {} for the ring crypto backend",
+        "unsupported {operation} algorithm {} for the built-in crypto backend",
         Label::from(alg)
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        der_length, der_unsigned_integer, ec2_public_cose_key, rsa_pkcs1_private_key_der,
+        rsa_public_key_from_der,
+    };
+    use crate::{iana, Key};
+
+    #[test]
+    fn der_length_uses_minimal_definite_form() {
+        let cases: &[(usize, &[u8])] = &[
+            (0, &[0x00]),
+            (5, &[0x05]),
+            (127, &[0x7f]),
+            (128, &[0x81, 0x80]),
+            (200, &[0x81, 0xc8]),
+            (257, &[0x82, 0x01, 0x01]),
+        ];
+        for (len, expected) in cases {
+            let mut out = Vec::new();
+            der_length(*len, &mut out);
+            assert_eq!(out, *expected, "length {len}");
+        }
+    }
+
+    #[test]
+    fn der_unsigned_integer_is_minimal_and_positive() {
+        let cases: &[(&[u8], &[u8])] = &[
+            // version 0
+            (&[0x00], &[0x02, 0x01, 0x00]),
+            // no high bit: encoded verbatim
+            (&[0x7f], &[0x02, 0x01, 0x7f]),
+            // high bit set: 0x00 prepended to stay positive
+            (&[0x80], &[0x02, 0x02, 0x00, 0x80]),
+            // redundant leading zeros are stripped to the minimal magnitude
+            (&[0x00, 0x00, 0x01], &[0x02, 0x01, 0x01]),
+            // stripped down to a single high-bit byte, which is then padded
+            (&[0x00, 0xb6], &[0x02, 0x02, 0x00, 0xb6]),
+        ];
+        for (value, expected) in cases {
+            let mut out = Vec::new();
+            der_unsigned_integer(value, &mut out);
+            assert_eq!(out, *expected, "value {value:02x?}");
+        }
+    }
+
+    #[test]
+    fn rsa_pkcs1_der_wraps_components_in_a_sequence() {
+        let mut key = Key::new();
+        key.set_kty(iana::KeyTypeRSA);
+        for label in [
+            iana::RSAKeyParameterN,
+            iana::RSAKeyParameterE,
+            iana::RSAKeyParameterD,
+            iana::RSAKeyParameterP,
+            iana::RSAKeyParameterQ,
+            iana::RSAKeyParameterDP,
+            iana::RSAKeyParameterDQ,
+            iana::RSAKeyParameterQInv,
+        ] {
+            key.insert(label, vec![0x01u8]);
+        }
+
+        let der = rsa_pkcs1_private_key_der(&key).unwrap();
+        // SEQUENCE { version 0, then the eight single-byte INTEGERs }.
+        let mut expected = vec![0x30, 0x1b, 0x02, 0x01, 0x00];
+        for _ in 0..8 {
+            expected.extend_from_slice(&[0x02, 0x01, 0x01]);
+        }
+        assert_eq!(der, expected);
+
+        // A missing component is a clear error rather than a malformed DER.
+        let mut incomplete = Key::new();
+        incomplete.set_kty(iana::KeyTypeRSA);
+        incomplete.insert(iana::RSAKeyParameterN, vec![0x01u8]);
+        assert!(rsa_pkcs1_private_key_der(&incomplete).is_err());
+    }
+
+    #[test]
+    fn rsa_public_key_from_der_extracts_minimal_magnitudes() {
+        // SEQUENCE { INTEGER 0x00B6 (sign-padded), INTEGER 0x010001 }.
+        let der = &[
+            0x30, 0x09, // SEQUENCE, length 9
+            0x02, 0x02, 0x00, 0xb6, // INTEGER n = 0xB6 with DER sign byte
+            0x02, 0x03, 0x01, 0x00, 0x01, // INTEGER e = 65537
+        ];
+        let (n, e) = rsa_public_key_from_der(der).unwrap();
+        // The sign byte is stripped back to the unsigned magnitude.
+        assert_eq!(n, vec![0xb6]);
+        assert_eq!(e, vec![0x01, 0x00, 0x01]);
+
+        // Trailing garbage, a wrong outer tag and a truncated value are rejected.
+        let mut trailing = der.to_vec();
+        trailing.push(0x00);
+        assert!(rsa_public_key_from_der(&trailing).is_err());
+        assert!(rsa_public_key_from_der(&[0x31, 0x00]).is_err());
+        assert!(rsa_public_key_from_der(&[0x30, 0x05, 0x02, 0x02, 0x00]).is_err());
+    }
+
+    #[test]
+    fn ec2_public_cose_key_splits_fixed_length_coordinates() {
+        // 0x04 || x(32) || y(32) for a P-256 point.
+        let mut point = vec![0x04];
+        point.extend_from_slice(&[0xaa; 32]);
+        point.extend_from_slice(&[0xbb; 32]);
+        let key = ec2_public_cose_key(iana::AlgorithmES256, &point, Some(b"p256")).unwrap();
+
+        assert_eq!(key.kty().unwrap(), Some(iana::KeyTypeEC2.into()));
+        assert_eq!(key.alg().unwrap(), Some(iana::AlgorithmES256.into()));
+        assert_eq!(key.kid().unwrap(), Some(&b"p256"[..]));
+        assert_eq!(
+            key.get_label(iana::EC2KeyParameterCrv).unwrap(),
+            Some(iana::EllipticCurveP_256.into())
+        );
+        assert_eq!(
+            key.get_bytes(iana::EC2KeyParameterX).unwrap(),
+            Some(&[0xaa; 32][..])
+        );
+        assert_eq!(
+            key.get_bytes(iana::EC2KeyParameterY).unwrap(),
+            Some(&[0xbb; 32][..])
+        );
+
+        // A point whose length does not match the curve is rejected, as is a
+        // point without the uncompressed `0x04` prefix or an unknown algorithm.
+        assert!(ec2_public_cose_key(iana::AlgorithmES256, &point[..64], None).is_err());
+        let mut compressed = point.clone();
+        compressed[0] = 0x02;
+        assert!(ec2_public_cose_key(iana::AlgorithmES256, &compressed, None).is_err());
+        assert!(ec2_public_cose_key(iana::AlgorithmEdDSA, &point, None).is_err());
+    }
 }

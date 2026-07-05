@@ -445,3 +445,120 @@ fn ring_accessor_and_debug_and_error_paths() {
     no_kty.set_alg(iana::AlgorithmHMAC_256_256);
     assert!(RingMacer::from_cose_key(&no_kty).is_err());
 }
+
+// ----------------------------------------------------------------------------
+// `to_cose_key`: exporting a COSE_Key back out of each provider.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn ring_symmetric_providers_export_cose_keys() {
+    // HMAC: exporting reproduces the symmetric COSE_Key it was built from.
+    let mac_key = symmetric_key(iana::AlgorithmHMAC_256_256, vec![0x11; 32]);
+    let macer = RingMacer::from_cose_key(&mac_key).unwrap();
+    assert_eq!(macer.to_cose_key().unwrap(), mac_key);
+
+    // AEAD: the Base IV is carried across the round trip too.
+    let mut enc_key = symmetric_key(iana::AlgorithmA128GCM, vec![0x22; 16]);
+    enc_key.insert(iana::KeyParameterBaseIV, vec![0xaau8; 12]);
+    let encryptor = RingEncryptor::from_cose_key(&enc_key).unwrap();
+    assert_eq!(encryptor.to_cose_key().unwrap(), enc_key);
+
+    // The retained raw key stays out of the redacted Debug output.
+    assert!(!format!("{macer:?}").contains("raw_key"));
+    assert!(!format!("{encryptor:?}").contains("raw_key"));
+
+    // A provider built from raw bytes (no kid) exports a kid-less key that
+    // re-imports into an equivalent provider.
+    let raw = RingEncryptor::new(iana::AlgorithmA256GCM, &[0x33; 32], None).unwrap();
+    let exported = raw.to_cose_key().unwrap();
+    assert_eq!(exported.kid().unwrap(), None);
+    assert_eq!(
+        exported.get_bytes(iana::SymmetricKeyParameterK).unwrap(),
+        Some(&[0x33u8; 32][..])
+    );
+    RingEncryptor::from_cose_key(&exported).unwrap();
+}
+
+#[test]
+fn ring_signer_and_verifier_export_public_cose_keys() {
+    // Ed25519: sign with the signer, then verify with a verifier rebuilt from
+    // the signer's exported *public* COSE_Key.
+    let seed = [7u8; 32];
+    let pair = signature::Ed25519KeyPair::from_seed_unchecked(&seed).unwrap();
+    let mut priv_key = Key::new();
+    priv_key
+        .set_kty(iana::KeyTypeOKP)
+        .set_alg(iana::AlgorithmEdDSA)
+        .set_kid(b"ed25519-1".to_vec());
+    priv_key.insert(iana::OKPKeyParameterCrv, iana::EllipticCurveEd25519);
+    priv_key.insert(iana::OKPKeyParameterX, pair.public_key().as_ref().to_vec());
+    priv_key.insert(iana::OKPKeyParameterD, seed.to_vec());
+
+    let signer = RingSigner::from_cose_key(&priv_key).unwrap();
+    let public = signer.to_cose_key().unwrap();
+    // Public only: the private `d` is dropped, but kid and curve survive.
+    assert!(public.get_bytes(iana::OKPKeyParameterD).unwrap().is_none());
+    assert_eq!(public.kid().unwrap(), Some(&b"ed25519-1"[..]));
+
+    let mut msg = Sign1Message::new(Some(b"ed25519 export".to_vec()));
+    let encoded = msg.sign_and_encode(&signer, None).unwrap();
+    let verifier = RingVerifier::from_cose_key(&public).unwrap();
+    assert!(Sign1Message::verify_and_decode(&verifier, &encoded, None).is_ok());
+    // The verifier re-exports the very same public key.
+    assert_eq!(verifier.to_cose_key().unwrap(), public);
+
+    // ES256: the signer's exported EC2 key drives verification too.
+    let rng = SystemRandom::new();
+    let pkcs8 =
+        signature::EcdsaKeyPair::generate_pkcs8(&signature::ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+            .unwrap();
+    let es256 = RingSigner::es256_from_pkcs8(pkcs8.as_ref(), Some(b"p256-1".to_vec())).unwrap();
+    let es256_pub = es256.to_cose_key().unwrap();
+    assert_eq!(
+        es256_pub.get_label(iana::EC2KeyParameterCrv).unwrap(),
+        Some(iana::EllipticCurveP_256.into())
+    );
+    let mut msg = Sign1Message::new(Some(b"es256 export".to_vec()));
+    let encoded = msg.sign_and_encode(&es256, None).unwrap();
+    let verifier = RingVerifier::from_cose_key(&es256_pub).unwrap();
+    assert!(Sign1Message::verify_and_decode(&verifier, &encoded, None).is_ok());
+}
+
+#[test]
+fn ring_rsa_verifier_exports_n_and_e() {
+    // From explicit components: exporting reproduces n and e verbatim.
+    let from_components = RingVerifier::rsa_components(
+        iana::AlgorithmRS256,
+        &hx(RSA_N),
+        &hx(RSA_E),
+        Some(b"rsa-1".to_vec()),
+    )
+    .unwrap();
+    let exported = from_components.to_cose_key().unwrap();
+    assert_eq!(exported.kty().unwrap(), Some(iana::KeyTypeRSA.into()));
+    assert_eq!(exported.kid().unwrap(), Some(&b"rsa-1"[..]));
+    assert_eq!(
+        exported.get_bytes(iana::RSAKeyParameterN).unwrap(),
+        Some(&hx(RSA_N)[..])
+    );
+    assert_eq!(
+        exported.get_bytes(iana::RSAKeyParameterE).unwrap(),
+        Some(&hx(RSA_E)[..])
+    );
+
+    // From a DER public key: the PKCS#1 RSAPublicKey is parsed back to n and e.
+    let from_der = RingVerifier::rsa_der(iana::AlgorithmRS256, &hx(RSA_PKCS1_PUB), None).unwrap();
+    let exported = from_der.to_cose_key().unwrap();
+    assert_eq!(
+        exported.get_bytes(iana::RSAKeyParameterN).unwrap(),
+        Some(&hx(RSA_N)[..])
+    );
+    assert_eq!(
+        exported.get_bytes(iana::RSAKeyParameterE).unwrap(),
+        Some(&hx(RSA_E)[..])
+    );
+
+    // An RSA signer exposes no public modulus, so it cannot export a COSE_Key.
+    let signer = RingSigner::rsa_from_der(iana::AlgorithmRS256, &hx(RSA_PKCS1_PRIV), None).unwrap();
+    assert!(signer.to_cose_key().is_err());
+}

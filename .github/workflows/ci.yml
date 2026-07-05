@@ -44,6 +44,23 @@ jobs:
           RUSTDOCFLAGS: "-D warnings"
         run: cargo doc --workspace --all-features --no-deps
 
+  # The `aws-lc-rs` backend is only compiled when `crypto-ring` is off, so the
+  # `--all-features` job above (where `crypto-ring` wins) never exercises it.
+  # This job lints and tests the `aws-lc-rs`-specific code paths on their own.
+  aws-lc-rs:
+    name: aws-lc-rs backend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy -p cose2 --no-default-features --features crypto-aws-lc-rs --all-targets -- -D warnings
+      - name: Test
+        run: cargo test -p cose2 --no-default-features --features crypto-aws-lc-rs --all-targets
+
   # The default build must stay free of cryptographic dependencies.
   no-default-features:
     name: default build has no crypto deps
@@ -54,11 +71,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build (no default features)
         run: cargo build --no-default-features
-      - name: Assert `ring` is not linked by default
-        # `cargo tree -i ring` exits non-zero when ring is absent from the
-        # default dependency graph, which is exactly what we want.
+      - name: Assert crypto backends are not linked by default
+        # `cargo tree -i <crate>` exits non-zero when the crate is absent from
+        # the default dependency graph, which is exactly what we want.
         run: |
-          if cargo tree --no-default-features -e normal -i ring >/dev/null 2>&1; then
-            echo "::error::ring must not be a default dependency"
-            exit 1
-          fi
+          for dep in ring aws-lc-rs; do
+            if cargo tree --no-default-features -e normal -i "$dep" >/dev/null 2>&1; then
+              echo "::error::$dep must not be a default dependency"
+              exit 1
+            fi
+          done

@@ -39,6 +39,10 @@ cargo run --example sign1_ring --features crypto-ring
 - `default = []` — no crypto backend. The pluggable traits are always available.
 - `crypto-ring` — `ring`-based `RingSigner` / `RingVerifier` / `RingMacer` /
   `RingEncryptor` (module `crypto`).
+- `crypto-aws-lc-rs` — the same providers backed by `aws-lc-rs` instead of
+  `ring`. The two backends share `src/crypto.rs` via a `use ring as backend` /
+  `use aws_lc_rs as backend` alias; a handful of API differences are bridged
+  with `#[cfg]` arms. When both features are enabled, `crypto-ring` wins.
 - `crypto` — aggregate alias that currently enables `crypto-ring`.
 
 ## Repository layout
@@ -55,7 +59,7 @@ cargo run --example sign1_ring --features crypto-ring
 | `src/recipient.rs`, `src/context.rs`        | `Recipient`; `KdfContext` / `PartyInfo` / `SuppPubInfo`.        |
 | `src/traits.rs`                             | `Signer` / `Verifier` / `Macer` / `Encryptor`.                  |
 | `src/cwt.rs`                                | `Claims` / `ClaimsMap` / `Validator`.                           |
-| `src/crypto.rs`                             | `ring` providers (feature `crypto-ring`).                       |
+| `src/crypto.rs`                             | Built-in providers (`crypto-ring` / `crypto-aws-lc-rs`).        |
 | `src/error.rs`, `src/tag.rs`, `src/util.rs` | `Error`; CBOR-tag helpers; internal helpers.                    |
 | `examples/`, `tests/`, `docs/`              | Runnable examples, integration tests, the consumer agent guide. |
 
@@ -66,7 +70,8 @@ are load-bearing for cryptographic soundness:
 
 1. **No `unsafe`.** The crate is `#![forbid(unsafe_code)]`.
 2. **Default build stays crypto-free.** Any crypto dependency must live behind a
-   feature flag (`crypto-ring`). Never add an always-on crypto dep.
+   feature flag (`crypto-ring` / `crypto-aws-lc-rs`). Never add an always-on
+   crypto dep.
 3. **Reuse decoded protected-header bytes verbatim.** The raw protected header
    captured on decode is fed back into `Sig_structure` / `MAC_structure` /
    `Enc_structure` so signatures over non-canonical encodings still verify. Do
@@ -84,7 +89,7 @@ are load-bearing for cryptographic soundness:
    serialization error paths. New code paths need tests in `tests/` or inline.
 9. **`clippy -D warnings`, `rustdoc -D warnings`, and `rustfmt` must all pass.**
 
-## Adding a `ring` algorithm
+## Adding a backend algorithm
 
 The provider→algorithm mapping lives in the helper functions at the bottom of
 `src/crypto.rs` (`hmac_algorithm`, `aead_algorithm`, `ecdsa_verification_algorithm`,
@@ -93,6 +98,12 @@ must return an explicit `unsupported_alg(...)` error rather than silently fallin
 back to a different primitive. Add the algorithm to
 [docs/agent-guide.md](docs/agent-guide.md#crypto-ring-algorithm-recipes) and a
 round-trip test in `tests/crypto_ring.rs`.
+
+`src/crypto.rs` is shared by both backends. `--all-features` builds run against
+`ring` (it wins when both features are on), so the `aws-lc-rs`-only `#[cfg]` arms
+are exercised separately by `tests/crypto_aws_lc_rs.rs` under
+`cargo test --no-default-features --features crypto-aws-lc-rs`. When you touch a
+backend-specific arm, run that command too.
 
 [cose]: https://datatracker.ietf.org/doc/html/rfc9052
 [cwt]: https://datatracker.ietf.org/doc/html/rfc8392

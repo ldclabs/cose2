@@ -29,7 +29,9 @@ This guide is for AI coding agents and code-generation tools that need to use
 - Use the `Signer`, `Verifier`, `Macer`, and `Encryptor` traits when the
   application already owns cryptography.
 - Enable `crypto-ring` or aggregate `crypto` to use `RingSigner`,
-  `RingVerifier`, `RingMacer`, and `RingEncryptor`.
+  `RingVerifier`, `RingMacer`, and `RingEncryptor`, or `crypto-aws-lc-rs` to
+  back those same providers with `aws-lc-rs` instead of `ring`. When both
+  backend features are enabled, `crypto-ring` takes precedence.
 - Do not add an always-on crypto dependency to this crate. Optional crypto
   providers belong behind feature flags.
 
@@ -42,7 +44,7 @@ constant, and omitting a required COSE key parameter. All constants live in the
 plain `i64` values.
 
 `from_cose_key` requires the key's `alg` to be a registered **integer**
-algorithm; private text-string algorithms are rejected by the ring backend.
+algorithm; private text-string algorithms are rejected by the built-in backend.
 
 ### Signatures — `RingSigner` / `RingVerifier`
 

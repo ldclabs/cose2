@@ -14,12 +14,14 @@ traits, so the default build carries **no cryptographic dependencies**.
 Pick any crypto library (e.g. `ed25519-dalek`, `p256`, `aes-gcm`, `hmac`) and
 implement the relevant trait.
 
-Enable the optional `crypto-ring` feature, or the aggregate `crypto` feature,
-to use the built-in [`crypto`] module backed by [`ring`]. The ring backend
-implements Ed25519, ES256, ES384, RS256/384/512, PS256/384/512, HMAC
+Enable the optional `crypto-ring` feature (or the aggregate `crypto` feature)
+to use the built-in [`crypto`] module backed by [`ring`], or `crypto-aws-lc-rs`
+to back it with [`aws-lc-rs`] instead. Both backends expose the same providers
+and implement Ed25519, ES256, ES384, RS256/384/512, PS256/384/512, HMAC
 256/64, HMAC 256/256, HMAC 384/384, HMAC 512/512, A128GCM, A256GCM and
-ChaCha20/Poly1305. Algorithms outside ring's support are rejected at provider
-construction.
+ChaCha20/Poly1305. Algorithms outside the backend's support are rejected at
+provider construction. When both backend features are enabled, `crypto-ring`
+takes precedence.
 
 - Typescript version: [https://github.com/ldclabs/cose-ts](https://github.com/ldclabs/cose-ts)
 - Golang version: [https://github.com/ldclabs/cose](https://github.com/ldclabs/cose)
@@ -43,8 +45,9 @@ construction.
   messages and CWT claims use their registered CBOR tags through
   `#[derive(cbor2::Cbor)]`; use `to_untagged_vec` when a peer expects the
   untagged wire body.
-- **Optional crypto** — `crypto-ring` provides `RingSigner`, `RingVerifier`,
-  `RingMacer` and `RingEncryptor` implementations behind a feature flag.
+- **Optional crypto** — `crypto-ring` or `crypto-aws-lc-rs` provides
+  `RingSigner`, `RingVerifier`, `RingMacer` and `RingEncryptor` implementations
+  behind a feature flag, backed by `ring` or `aws-lc-rs` respectively.
 
 ## Quick start
 
@@ -132,10 +135,10 @@ subset.
   identifiers are not unique.
 - `alg` values in crypto traits are `Option<Label>`, so both registered
   integer algorithms and private text-string algorithms are representable.
-- The default build has no crypto dependency. The `crypto-ring` feature offers
-  ready-to-use providers for the algorithms listed above, while unsupported
-  algorithms return an explicit error instead of falling back to a mismatched
-  primitive.
+- The default build has no crypto dependency. The `crypto-ring` and
+  `crypto-aws-lc-rs` features offer ready-to-use providers for the algorithms
+  listed above, while unsupported algorithms return an explicit error instead of
+  falling back to a mismatched primitive.
 - The protected header is captured as raw bytes on decode and reused verbatim
   in the `Sig_structure`/`MAC_structure`/`Enc_structure`, so signatures made
   with non-canonical encodings still verify.
@@ -177,6 +180,7 @@ Licensed under the MIT License.
 [cwt]: https://datatracker.ietf.org/doc/html/rfc8392
 [cbor2]: https://crates.io/crates/cbor2
 [ring]: https://crates.io/crates/ring
+[`aws-lc-rs`]: https://crates.io/crates/aws-lc-rs
 [c41]: https://datatracker.ietf.org/doc/html/rfc9052#appendix-C.4
 [`Signer`]: https://docs.rs/cose2/latest/cose2/trait.Signer.html
 [`Verifier`]: https://docs.rs/cose2/latest/cose2/trait.Verifier.html

@@ -11,6 +11,6 @@ edition = "2021"
 rust-version = "1.85"
 
 [dependencies]
-cbor2 = { version = "1.1", features = ["derive"] }
-cose2 = { path = "..", version = "0.3.0" }
-sha2 = "0.10"
+cose2 = { path = "..", version = "0.3" }
+cbor2 = { workspace = true }
+sha2 = { workspace = true }
