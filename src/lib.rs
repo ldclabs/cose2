@@ -36,7 +36,11 @@
 //! `crypto-ring` (or the aggregate `crypto` feature) for a `ring`-based
 //! backend, or `crypto-aws-lc-rs` for an [`aws-lc-rs`](https://crates.io/crates/aws-lc-rs)-based
 //! one. The two backends expose the same providers; when both are enabled,
-//! `crypto-ring` takes precedence.
+//! `crypto-ring` takes precedence. The `crypto-ed25519-dalek` feature adds a
+//! standalone Ed25519 [`Signer`]/[`Verifier`] backed by
+//! [`ed25519-dalek`](https://crates.io/crates/ed25519-dalek) (module
+//! `ed25519`), and `crypto-aes-gcm` adds an AES-GCM [`Encryptor`] backed by
+//! [`aes-gcm`](https://crates.io/crates/aes-gcm) (module `aes_gcm`).
 //!
 //! # Example: COSE_Sign1 round trip
 //!
@@ -87,9 +91,13 @@ mod recipient;
 mod sign;
 mod sign1;
 
+#[cfg(feature = "crypto-aes-gcm")]
+pub mod aes_gcm;
 #[cfg(any(feature = "crypto-ring", feature = "crypto-aws-lc-rs"))]
 pub mod crypto;
 pub mod cwt;
+#[cfg(feature = "crypto-ed25519-dalek")]
+pub mod ed25519;
 
 pub use error::Error;
 pub use header::{is_understood_header, Header};

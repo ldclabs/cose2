@@ -23,6 +23,12 @@ ChaCha20/Poly1305. Algorithms outside the backend's support are rejected at
 provider construction. When both backend features are enabled, `crypto-ring`
 takes precedence.
 
+Alternatively, enable `crypto-ed25519-dalek` for a standalone Ed25519
+`Signer`/`Verifier` (module [`ed25519`]) backed by [`ed25519-dalek`], or
+`crypto-aes-gcm` for an AES-GCM (`A128GCM`/`A256GCM`) `Encryptor` (module
+[`aes_gcm`]) backed by [`aes-gcm`] — both without a `ring`/`aws-lc-rs`
+dependency.
+
 - Typescript version: [https://github.com/ldclabs/cose-ts](https://github.com/ldclabs/cose-ts)
 - Golang version: [https://github.com/ldclabs/cose](https://github.com/ldclabs/cose)
 
@@ -48,6 +54,9 @@ takes precedence.
 - **Optional crypto** — `crypto-ring` or `crypto-aws-lc-rs` provides
   `RingSigner`, `RingVerifier`, `RingMacer` and `RingEncryptor` implementations
   behind a feature flag, backed by `ring` or `aws-lc-rs` respectively.
+  `crypto-ed25519-dalek` adds an `Ed25519Signer`/`Ed25519Verifier` backed by
+  `ed25519-dalek`, and `crypto-aes-gcm` adds an `AesGcmEncryptor` backed by
+  `aes-gcm`.
 
 ## Quick start
 
@@ -196,5 +205,9 @@ Licensed under the MIT License.
 [`cwt::ClaimsMap`]: https://docs.rs/cose2/latest/cose2/cwt/type.ClaimsMap.html
 [`cwt::Validator`]: https://docs.rs/cose2/latest/cose2/cwt/struct.Validator.html
 [`crypto`]: https://docs.rs/cose2/latest/cose2/crypto/index.html
+[`ed25519`]: https://docs.rs/cose2/latest/cose2/ed25519/index.html
+[`ed25519-dalek`]: https://crates.io/crates/ed25519-dalek
+[`aes_gcm`]: https://docs.rs/cose2/latest/cose2/aes_gcm/index.html
+[`aes-gcm`]: https://crates.io/crates/aes-gcm
 [agent-guide]: docs/agent-guide.md
 [agent-recipes]: docs/agent-guide.md#crypto-ring-algorithm-recipes
