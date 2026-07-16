@@ -274,6 +274,19 @@ fn claims_reject_fractional_or_pre_epoch_numeric_dates() {
     let err = Claims::from_slice(&bytes).unwrap_err();
     assert!(format!("{err}").contains("pre-epoch NumericDate"));
 
+    // validate_map rejects pre-epoch integers too — including `nbf`, which a
+    // plain range check would otherwise accept as "already valid".
+    let err = validator(ValidatorOptions::default())
+        .validate_map(&negative)
+        .unwrap_err();
+    assert!(format!("{err}").contains("pre-epoch NumericDate"));
+    let mut negative_nbf = ClaimsMap::new();
+    negative_nbf.insert(iana::CWTClaimNbf, -5i64);
+    let err = validator(ValidatorOptions::default())
+        .validate_map(&negative_nbf)
+        .unwrap_err();
+    assert!(format!("{err}").contains("pre-epoch NumericDate"));
+
     // Non-numeric dates remain type errors.
     let mut text = ClaimsMap::new();
     text.insert(iana::CWTClaimExp, "soon");

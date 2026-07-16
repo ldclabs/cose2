@@ -238,12 +238,18 @@ fn to_secs(value: u64) -> i64 {
 
 /// Reads a registered NumericDate claim from a [`ClaimsMap`], accepting a
 /// CBOR integer or an integral-valued float (RFC 8392 NumericDate).
+/// Pre-epoch (negative) dates are rejected, matching [`Claims`] decoding.
 fn numeric_date_claim(claims: &ClaimsMap, key: i64) -> Result<Option<i64>, Error> {
     match claims.get(key) {
         Some(Value::Float(f)) => numeric_date::from_f64::<serde::de::value::Error>(*f)
             .map(|secs| Some(to_secs(secs)))
             .map_err(|err| Error::UnexpectedType(err.to_string())),
-        _ => claims.get_i64(key),
+        _ => match claims.get_i64(key)? {
+            Some(secs) if secs < 0 => Err(Error::UnexpectedType(
+                "pre-epoch NumericDate is not supported".into(),
+            )),
+            other => Ok(other),
+        },
     }
 }
 

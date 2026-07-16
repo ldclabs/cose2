@@ -83,6 +83,8 @@ impl RingMacer {
     /// Exports this provider as a symmetric COSE_Key carrying `alg` and `k`.
     ///
     /// The result round-trips through [`RingMacer::from_cose_key`].
+    /// Note the exported [`Key`] holds an unprotected copy of the secret; it
+    /// is the caller's responsibility to handle it carefully.
     pub fn to_cose_key(&self) -> Result<Key, Error> {
         Ok(symmetric_cose_key(
             self.alg,
@@ -189,6 +191,8 @@ impl RingEncryptor {
     /// when configured, the Base IV.
     ///
     /// The result round-trips through [`RingEncryptor::from_cose_key`].
+    /// Note the exported [`Key`] holds an unprotected copy of the secret; it
+    /// is the caller's responsibility to handle it carefully.
     pub fn to_cose_key(&self) -> Result<Key, Error> {
         Ok(symmetric_cose_key(
             self.alg,

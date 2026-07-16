@@ -14,6 +14,9 @@ use crate::{
 
 /// A `PartyInfo` nonce: `bstr / int` (RFC 9053 §5.2, where the field is
 /// `bstr / int / nil`; absence is modeled with `Option`).
+///
+/// Integer nonces are modeled as `i64`; a CBOR integer outside that range
+/// is rejected during decode with an "out of range" error.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PartyNonce {
     /// A byte-string nonce.
