@@ -14,6 +14,7 @@ use ::aes_gcm::{
     aead::{Aead, Nonce, Payload},
     Aes128Gcm, Aes256Gcm, KeyInit,
 };
+use zeroize::Zeroizing;
 
 use crate::{iana, Encryptor, Error, Key, Label};
 
@@ -27,8 +28,9 @@ pub struct AesGcmEncryptor {
     kid: Option<Vec<u8>>,
     cipher: AesGcmCipher,
     // Retained so the symmetric `k` can be re-exported by `to_cose_key`; the
-    // cipher does not expose its raw bytes.
-    raw_key: Vec<u8>,
+    // cipher does not expose its raw bytes. Zeroized on drop (every clone
+    // wipes its own copy).
+    raw_key: Zeroizing<Vec<u8>>,
     base_iv: Option<Vec<u8>>,
 }
 
@@ -58,7 +60,7 @@ impl AesGcmEncryptor {
             alg,
             kid,
             cipher,
-            raw_key: key.to_vec(),
+            raw_key: Zeroizing::new(key.to_vec()),
             base_iv: None,
         })
     }
@@ -89,13 +91,15 @@ impl AesGcmEncryptor {
     /// when configured, the Base IV.
     ///
     /// The result round-trips through [`AesGcmEncryptor::from_cose_key`].
+    /// Note the exported [`Key`] holds an unprotected copy of the secret; it
+    /// is the caller's responsibility to handle it carefully.
     pub fn to_cose_key(&self) -> Result<Key, Error> {
         let mut key = Key::new();
         key.set_kty(iana::KeyTypeSymmetric).set_alg(self.alg);
         if let Some(kid) = &self.kid {
             key.set_kid(kid.clone());
         }
-        key.insert(iana::SymmetricKeyParameterK, self.raw_key.clone());
+        key.insert(iana::SymmetricKeyParameterK, self.raw_key.to_vec());
         if let Some(base_iv) = &self.base_iv {
             key.insert(iana::KeyParameterBaseIV, base_iv.clone());
         }

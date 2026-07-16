@@ -213,6 +213,32 @@ fn ring_es256_from_cose_key_signs_and_verifies() {
 }
 
 #[test]
+fn ring_ecdsa_rejects_boundary_shifted_ec2_coordinates() {
+    // x/y whose individual lengths are wrong but whose total still matches
+    // the curve must be rejected before the backend sees the joined point.
+    let x = hx("bac5b11cad8f99f9c72b05cf4b9e26d244dc189f745228255a219a86d6a09eff");
+    let y = hx("20138bf82dc1b6d562be0fa54ab7804a3a64b6d72ccfed6b6fb6ed28bbfc117e");
+    let mut shifted_y = vec![x[31]];
+    shifted_y.extend_from_slice(&y);
+
+    let mut key = Key::new();
+    key.set_kty(iana::KeyTypeEC2).set_alg(iana::AlgorithmES256);
+    key.insert(iana::EC2KeyParameterCrv, iana::EllipticCurveP_256);
+    key.insert(iana::EC2KeyParameterX, x[..31].to_vec()); // 31 bytes
+    key.insert(iana::EC2KeyParameterY, shifted_y); // 33 bytes
+
+    let err = RingVerifier::from_cose_key(&key).unwrap_err();
+    assert!(format!("{err}").contains("EC2 coordinates must be 32 bytes"));
+
+    key.insert(
+        iana::EC2KeyParameterD,
+        hx("57c92077664146e876760c9520d054aa93c3afb04e306705db6090308507b4d3"),
+    );
+    let err = RingSigner::from_cose_key(&key).unwrap_err();
+    assert!(format!("{err}").contains("EC2 coordinates must be 32 bytes"));
+}
+
+#[test]
 fn ring_es384_pkcs8_and_cose_key_round_trip() {
     // ES384 via PKCS#8 (signer) verified with a raw uncompressed public key.
     let rng = SystemRandom::new();

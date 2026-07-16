@@ -39,6 +39,22 @@ pub(crate) fn encode_structure(parts: Vec<Value>) -> Result<Vec<u8>, Error> {
     Ok(cbor2::to_canonical_vec(&Value::Array(parts))?)
 }
 
+/// Serializes a borrowed wire body as canonical CBOR into a buffer that
+/// starts with `prefix` (a COSE tag prefix from [`tag`](crate::tag), or empty
+/// for untagged output).
+///
+/// The message modules pass tuples of borrowed fields here so encoding does
+/// not clone payloads, ciphertexts or recipient lists.
+pub(crate) fn encode_prefixed<T: serde::Serialize>(
+    prefix: &[u8],
+    body: &T,
+) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::with_capacity(prefix.len() + 64);
+    out.extend_from_slice(prefix);
+    cbor2::to_canonical_writer(body, &mut out)?;
+    Ok(out)
+}
+
 /// On the signing/encrypting/MACing side: writes `alg` into the protected
 /// header if absent, or checks it matches when already present.
 ///

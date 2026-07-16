@@ -263,6 +263,16 @@ fn header_ensure_crit_understood_enforces_rfc9052_3_1() {
     assert!(app
         .ensure_crit_understood(&[Label::Text("private".into())])
         .is_ok());
+
+    // RFC 9052 §3.1: the RFC 8152 "counter signature" parameter (label 7)
+    // must be understood by new implementations, so an RFC 8152 sender that
+    // marks it critical must not be rejected.
+    let mut legacy = Header::new();
+    legacy.set_crit([iana::HeaderParameterCounterSignature]);
+    assert!(legacy.ensure_crit_understood(&[]).is_ok());
+    assert!(cose2::is_understood_header(&Label::Int(
+        iana::HeaderParameterCounterSignature
+    )));
 }
 
 // ----------------------------------------------------------------------------
@@ -359,12 +369,12 @@ fn keyset_lookup_and_round_trip() {
 }
 
 #[test]
-fn keyset_lookup_returns_all_matching_kids_and_ignores_bad_keys_on_decode() {
+fn keyset_decode_is_strict_by_default_and_lenient_on_request() {
     let mut k1 = Key::new();
     k1.set_kty(iana::KeyTypeOKP).set_kid(b"same".to_vec());
     let mut k2 = Key::new();
     k2.set_kty("private-kty").set_kid(b"same".to_vec());
-    let bad = CoseMap::new();
+    let bad = CoseMap::new(); // missing required kty
 
     let raw = cbor2::to_vec(&vec![
         cbor2::from_slice::<Value>(&k1.to_vec().unwrap()).unwrap(),
@@ -372,8 +382,80 @@ fn keyset_lookup_returns_all_matching_kids_and_ignores_bad_keys_on_decode() {
         cbor2::from_slice::<Value>(&k2.to_vec().unwrap()).unwrap(),
     ])
     .unwrap();
-    let set = KeySet::from_slice(&raw).unwrap();
+
+    // Default decode: one malformed entry fails the whole key set.
+    assert!(KeySet::from_slice(&raw).is_err());
+
+    // Lenient decode: malformed entries are dropped, valid ones survive.
+    let set = KeySet::from_slice_lenient(&raw).unwrap();
+    assert_eq!(set.len(), 2);
     assert_eq!(set.lookup(b"same").count(), 2);
+
+    // A fully valid key set decodes identically through both paths.
+    let good = set.to_vec().unwrap();
+    assert_eq!(KeySet::from_slice(&good).unwrap(), set);
+    assert_eq!(KeySet::from_slice_lenient(&good).unwrap(), set);
+
+    // Lenient decode still errors when no entry survives.
+    let all_bad = cbor2::to_vec(&vec![
+        cbor2::from_slice::<Value>(&bad.to_vec().unwrap()).unwrap()
+    ])
+    .unwrap();
+    assert!(KeySet::from_slice_lenient(&all_bad).is_err());
+}
+
+// ----------------------------------------------------------------------------
+// IANA registry spot checks
+// ----------------------------------------------------------------------------
+
+/// Pins registry-assigned constants to the values published by IANA so an
+/// accidental edit (or a draft-era value that changed before final
+/// registration) fails loudly. Sources:
+/// <https://www.iana.org/assignments/cose/cose.xhtml> and
+/// <https://www.iana.org/assignments/cwt/cwt.xhtml>.
+#[test]
+fn iana_constants_match_registry() {
+    // COSE header parameters (RFC 9052).
+    assert_eq!(iana::HeaderParameterAlg, 1);
+    assert_eq!(iana::HeaderParameterCrit, 2);
+    assert_eq!(iana::HeaderParameterContentType, 3);
+    assert_eq!(iana::HeaderParameterKid, 4);
+    assert_eq!(iana::HeaderParameterIV, 5);
+    assert_eq!(iana::HeaderParameterPartialIV, 6);
+    assert_eq!(iana::HeaderParameterCounterSignature, 7);
+
+    // CWT claims (RFC 8392).
+    assert_eq!(iana::CWTClaimIss, 1);
+    assert_eq!(iana::CWTClaimSub, 2);
+    assert_eq!(iana::CWTClaimAud, 3);
+    assert_eq!(iana::CWTClaimExp, 4);
+    assert_eq!(iana::CWTClaimNbf, 5);
+    assert_eq!(iana::CWTClaimIat, 6);
+    assert_eq!(iana::CWTClaimCti, 7);
+
+    // EAT claims (RFC 9711).
+    assert_eq!(iana::CWTClaimUEID, 256);
+    assert_eq!(iana::CWTClaimSUEIDs, 257);
+    assert_eq!(iana::CWTClaimOEMID, 258);
+    assert_eq!(iana::CWTClaimHWModel, 259);
+    assert_eq!(iana::CWTClaimHWVersion, 260);
+    assert_eq!(iana::CWTClaimUptime, 261);
+    assert_eq!(iana::CWTClaimOEMBoot, 262);
+    assert_eq!(iana::CWTClaimDebugStatus, 263);
+    assert_eq!(iana::CWTClaimLocation, 264);
+    assert_eq!(iana::CWTClaimProfile, 265);
+    assert_eq!(iana::CWTClaimSubmodules, 266);
+    assert_eq!(iana::CWTClaimBootCount, 267);
+    assert_eq!(iana::CWTClaimBootSeed, 268);
+
+    // PSA attestation token claims (RFC 9783). 2397 is unassigned: the
+    // draft-era PSA boot seed was replaced by the shared EAT `bootseed`.
+    assert_eq!(iana::CWTClaimPSAClientID, 2394);
+    assert_eq!(iana::CWTClaimPSASecurityLifecycle, 2395);
+    assert_eq!(iana::CWTClaimPSAImplementationID, 2396);
+    assert_eq!(iana::CWTClaimPSACertificationReference, 2398);
+    assert_eq!(iana::CWTClaimPSASoftwareComponents, 2399);
+    assert_eq!(iana::CWTClaimPSAVerificationServiceIndicator, 2400);
 }
 
 // ----------------------------------------------------------------------------

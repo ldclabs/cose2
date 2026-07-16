@@ -30,6 +30,20 @@ struct SignWire {
     signatures: Vec<SignatureWire>,
 }
 
+/// Borrowed encode-only view of a COSE_Signature, sharing its buffers.
+struct SignatureRef<'a>(&'a Signature);
+
+impl serde::Serialize for SignatureRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (
+            serde_bytes::Bytes::new(&self.0.protected_raw),
+            &self.0.unprotected,
+            serde_bytes::Bytes::new(&self.0.signature),
+        )
+            .serialize(serializer)
+    }
+}
+
 /// A COSE_Signature inside a [`SignMessage`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Signature {
@@ -316,6 +330,16 @@ impl SignMessage {
 
     /// Encodes a signed message to tagged COSE_Sign bytes.
     pub fn to_vec(&self) -> Result<Vec<u8>, Error> {
+        self.encode(tag::SIGN_PREFIX)
+    }
+
+    /// Encodes a signed message to canonical COSE_Sign bytes without the CBOR tag.
+    pub fn to_untagged_vec(&self) -> Result<Vec<u8>, Error> {
+        self.encode(&[])
+    }
+
+    /// Serializes the wire array borrowing this message's buffers.
+    fn encode(&self, prefix: &[u8]) -> Result<Vec<u8>, Error> {
         if !self.signed {
             return Err(Error::Custom(
                 "SignMessage must be signed before encoding".into(),
@@ -328,28 +352,16 @@ impl SignMessage {
         for sig in &self.signatures {
             validate_header_buckets(&sig.protected, &sig.unprotected)?;
         }
-        let signatures = self
-            .signatures
-            .iter()
-            .map(|s| SignatureWire {
-                protected: s.protected_raw.clone(),
-                unprotected: s.unprotected.clone(),
-                signature: s.signature.clone(),
-            })
-            .collect();
-        let wire = SignWire {
-            protected: self.protected_raw.clone(),
-            unprotected: self.unprotected.clone(),
-            payload: self.payload.clone(),
-            signatures,
-        };
-        Ok(cbor2::to_canonical_vec(&wire)?)
-    }
-
-    /// Encodes a signed message to canonical COSE_Sign bytes without the CBOR tag.
-    pub fn to_untagged_vec(&self) -> Result<Vec<u8>, Error> {
-        let tagged = self.to_vec()?;
-        Ok(tag::skip_tag(tag::SIGN_PREFIX, &tagged).to_vec())
+        let signatures: Vec<SignatureRef<'_>> = self.signatures.iter().map(SignatureRef).collect();
+        util::encode_prefixed(
+            prefix,
+            &(
+                serde_bytes::Bytes::new(&self.protected_raw),
+                &self.unprotected,
+                self.payload.as_deref().map(serde_bytes::Bytes::new),
+                signatures,
+            ),
+        )
     }
 
     /// Decodes a COSE_Sign message (tagged or untagged) without verifying it.

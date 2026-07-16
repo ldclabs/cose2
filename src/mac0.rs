@@ -183,25 +183,31 @@ impl Mac0Message {
 
     /// Encodes a computed message to tagged COSE_Mac0 bytes.
     pub fn to_vec(&self) -> Result<Vec<u8>, Error> {
+        self.encode(tag::MAC0_PREFIX)
+    }
+
+    /// Encodes a computed message to canonical COSE_Mac0 bytes without the CBOR tag.
+    pub fn to_untagged_vec(&self) -> Result<Vec<u8>, Error> {
+        self.encode(&[])
+    }
+
+    /// Serializes the wire array borrowing this message's buffers.
+    fn encode(&self, prefix: &[u8]) -> Result<Vec<u8>, Error> {
         if !self.computed {
             return Err(Error::Custom(
                 "Mac0Message must be computed before encoding".into(),
             ));
         }
         validate_header_buckets(&self.protected, &self.unprotected)?;
-        let wire = Mac0Wire {
-            protected: self.protected_raw.clone(),
-            unprotected: self.unprotected.clone(),
-            payload: self.payload.clone(),
-            tag: self.tag.clone(),
-        };
-        Ok(cbor2::to_canonical_vec(&wire)?)
-    }
-
-    /// Encodes a computed message to canonical COSE_Mac0 bytes without the CBOR tag.
-    pub fn to_untagged_vec(&self) -> Result<Vec<u8>, Error> {
-        let tagged = self.to_vec()?;
-        Ok(tag::skip_tag(tag::MAC0_PREFIX, &tagged).to_vec())
+        util::encode_prefixed(
+            prefix,
+            &(
+                serde_bytes::Bytes::new(&self.protected_raw),
+                &self.unprotected,
+                self.payload.as_deref().map(serde_bytes::Bytes::new),
+                serde_bytes::Bytes::new(&self.tag),
+            ),
+        )
     }
 
     /// Decodes a COSE_Mac0 message (tagged or untagged) without verifying it.

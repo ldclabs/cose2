@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cbor2::Cbor;
 
-use crate::{iana, tag, CoseMap, Error};
+use crate::{iana, tag, CoseMap, Error, Value};
 
 /// The maximum permitted clock skew, in seconds (10 minutes).
 const MAX_CLOCK_SKEW_SECS: u64 = 10 * 60;
@@ -30,16 +30,37 @@ pub struct Claims {
     #[serde(rename = "aud", skip_serializing_if = "Option::is_none", default)]
     pub audience: Option<String>,
     /// Expiration time, seconds since the UNIX epoch (`exp`, claim 4).
+    ///
+    /// See [`numeric_date`] for the accepted NumericDate encodings.
     #[cbor(key = 4)]
-    #[serde(rename = "exp", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "exp",
+        with = "numeric_date",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub expiration: Option<u64>,
     /// Not-before time, seconds since the UNIX epoch (`nbf`, claim 5).
+    ///
+    /// See [`numeric_date`] for the accepted NumericDate encodings.
     #[cbor(key = 5)]
-    #[serde(rename = "nbf", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "nbf",
+        with = "numeric_date",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub not_before: Option<u64>,
     /// Issued-at time, seconds since the UNIX epoch (`iat`, claim 6).
+    ///
+    /// See [`numeric_date`] for the accepted NumericDate encodings.
     #[cbor(key = 6)]
-    #[serde(rename = "iat", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "iat",
+        with = "numeric_date",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub issued_at: Option<u64>,
     /// CWT ID (`cti`, claim 7).
     #[cbor(key = 7)]
@@ -57,6 +78,103 @@ pub struct Claims {
     /// claim map on encode and retained on decode.
     #[serde(flatten, skip_serializing_if = "CoseMap::is_empty", default)]
     pub extra: CoseMap,
+}
+
+/// Serde helpers for RFC 8392 `NumericDate` claims modeled as `Option<u64>`.
+///
+/// RFC 8392 allows a NumericDate to be a CBOR integer or float. This crate
+/// models timestamps as whole seconds since the UNIX epoch: integer encodings
+/// and integral-valued float encodings (e.g. `1700000000.0`) are accepted;
+/// fractional-second floats and pre-epoch (negative) dates are rejected with
+/// a descriptive error. Encoding always produces an integer.
+pub mod numeric_date {
+    use serde::{de, Deserializer, Serializer};
+
+    /// Converts an integral, in-range CBOR float to whole seconds.
+    pub(crate) fn from_f64<E: de::Error>(v: f64) -> Result<u64, E> {
+        if !v.is_finite() || v.fract() != 0.0 {
+            return Err(E::custom(
+                "fractional-second NumericDate is not supported, use whole seconds",
+            ));
+        }
+        if v < 0.0 {
+            return Err(E::custom("pre-epoch NumericDate is not supported"));
+        }
+        if v >= u64::MAX as f64 {
+            return Err(E::custom("NumericDate out of range"));
+        }
+        Ok(v as u64)
+    }
+
+    /// Serializes the timestamp as a CBOR integer.
+    pub fn serialize<S: Serializer>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(v) => serializer.serialize_u64(*v),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    /// Deserializes a NumericDate encoded as a CBOR integer or integral float.
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<u64>, D::Error> {
+        struct DateVisitor;
+
+        impl de::Visitor<'_> for DateVisitor {
+            type Value = u64;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a NumericDate in whole seconds since the UNIX epoch")
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<u64, E> {
+                Ok(v)
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<u64, E> {
+                u64::try_from(v).map_err(|_| E::custom("pre-epoch NumericDate is not supported"))
+            }
+
+            fn visit_u128<E: de::Error>(self, v: u128) -> Result<u64, E> {
+                u64::try_from(v).map_err(|_| E::custom("NumericDate out of range"))
+            }
+
+            fn visit_i128<E: de::Error>(self, v: i128) -> Result<u64, E> {
+                u64::try_from(v).map_err(|_| E::custom("NumericDate out of range or pre-epoch"))
+            }
+
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<u64, E> {
+                from_f64(v)
+            }
+        }
+
+        struct OptionVisitor;
+
+        impl<'de> de::Visitor<'de> for OptionVisitor {
+            type Value = Option<u64>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an optional NumericDate")
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+
+            fn visit_some<D2: Deserializer<'de>>(
+                self,
+                deserializer: D2,
+            ) -> Result<Self::Value, D2::Error> {
+                deserializer.deserialize_any(DateVisitor).map(Some)
+            }
+        }
+
+        deserializer.deserialize_option(OptionVisitor)
+    }
 }
 
 impl Claims {
@@ -118,6 +236,17 @@ fn to_secs(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
 }
 
+/// Reads a registered NumericDate claim from a [`ClaimsMap`], accepting a
+/// CBOR integer or an integral-valued float (RFC 8392 NumericDate).
+fn numeric_date_claim(claims: &ClaimsMap, key: i64) -> Result<Option<i64>, Error> {
+    match claims.get(key) {
+        Some(Value::Float(f)) => numeric_date::from_f64::<serde::de::value::Error>(*f)
+            .map(|secs| Some(to_secs(secs)))
+            .map_err(|err| Error::UnexpectedType(err.to_string())),
+        _ => claims.get_i64(key),
+    }
+}
+
 impl Validator {
     /// Creates a validator, rejecting a clock skew above 10 minutes.
     pub fn new(opts: ValidatorOptions) -> Result<Self, Error> {
@@ -151,11 +280,14 @@ impl Validator {
     }
 
     /// Validates a [`ClaimsMap`], reading the registered time/identity claims.
+    ///
+    /// The time claims accept integer and integral-valued float NumericDate
+    /// encodings (see [`numeric_date`]).
     pub fn validate_map(&self, claims: &ClaimsMap) -> Result<(), Error> {
         self.check_times(
-            claims.get_i64(iana::CWTClaimExp)?,
-            claims.get_i64(iana::CWTClaimNbf)?,
-            claims.get_i64(iana::CWTClaimIat)?,
+            numeric_date_claim(claims, iana::CWTClaimExp)?,
+            numeric_date_claim(claims, iana::CWTClaimNbf)?,
+            numeric_date_claim(claims, iana::CWTClaimIat)?,
         )?;
         self.check_identity(
             claims.get_text(iana::CWTClaimIss)?,

@@ -176,8 +176,32 @@ impl KeySet {
     }
 
     /// Decodes a key set from CBOR bytes.
+    ///
+    /// Every entry must be a valid COSE_Key; a single malformed entry fails
+    /// the whole decode. Use [`KeySet::from_slice_lenient`] for best-effort
+    /// parsing.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
         Ok(cbor2::from_slice(data)?)
+    }
+
+    /// Decodes a key set from CBOR bytes, silently discarding entries that
+    /// are not valid COSE_Keys.
+    ///
+    /// Callers that treat a key set as an integrity-checked document should
+    /// prefer [`KeySet::from_slice`]: with this method a corrupted or
+    /// tampered entry disappears without any diagnostic. Errors only when
+    /// the input is not a CBOR array or no entry survives.
+    pub fn from_slice_lenient(data: &[u8]) -> Result<Self, Error> {
+        let values = cbor2::from_slice::<Vec<Value>>(data)?;
+        let mut keys = Vec::with_capacity(values.len());
+        for value in values {
+            if let Ok(key) = Key::try_from(value) {
+                keys.push(key);
+            }
+        }
+        let key_set = KeySet(keys);
+        key_set.validate()?;
+        Ok(key_set)
     }
 
     /// Encodes the key set to canonical CBOR bytes.
@@ -236,14 +260,7 @@ impl<'de> Deserialize<'de> for KeySet {
     where
         D: Deserializer<'de>,
     {
-        let values = Vec::<Value>::deserialize(deserializer)?;
-        let mut keys = Vec::with_capacity(values.len());
-        for value in values {
-            if let Ok(key) = Key::try_from(value) {
-                keys.push(key);
-            }
-        }
-        let key_set = KeySet(keys);
+        let key_set = KeySet(Vec::<Key>::deserialize(deserializer)?);
         key_set.validate().map_err(serde::de::Error::custom)?;
         Ok(key_set)
     }

@@ -168,6 +168,10 @@ impl Header {
 /// Returns `true` when `label` is a common header parameter this crate models
 /// natively and therefore always understands (RFC 9052 §3.1: "Header
 /// parameters defined in [RFC 9052] do not need to be included [in `crit`]").
+///
+/// The RFC 8152 "counter signature" parameter (label 7) is included because
+/// RFC 9052 §3.1 requires new implementations to understand it for
+/// compatibility with senders that adhere to RFC 8152.
 pub fn is_understood_header(label: &Label) -> bool {
     matches!(
         label,
@@ -178,6 +182,7 @@ pub fn is_understood_header(label: &Label) -> bool {
                 | iana::HeaderParameterKid
                 | iana::HeaderParameterIV
                 | iana::HeaderParameterPartialIV
+                | iana::HeaderParameterCounterSignature
         )
     )
 }

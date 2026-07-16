@@ -436,7 +436,7 @@ pub const CWTClaimCNonce: i64 = 39;
 pub const CWTClaimExi: i64 = 40;
 /// The Universal Entity ID ("ueid": bstr).
 pub const CWTClaimUEID: i64 = 256;
-/// Hardware OEM ID ("sueids": map).
+/// Semipermanent UEIDs ("sueids": map).
 pub const CWTClaimSUEIDs: i64 = 257;
 /// Hardware OEM ID ("oemid": bstr/int).
 pub const CWTClaimOEMID: i64 = 258;
@@ -444,8 +444,10 @@ pub const CWTClaimOEMID: i64 = 258;
 pub const CWTClaimHWModel: i64 = 259;
 /// Hardware Version Identifier ("hwversion": array).
 pub const CWTClaimHWVersion: i64 = 260;
-/// Indicate whether the boot was secure ("secboot": bool).
-pub const CWTClaimSecureBoot: i64 = 262;
+/// Uptime since boot ("uptime": uint).
+pub const CWTClaimUptime: i64 = 261;
+/// Indicates whether the software booted was OEM authorized ("oemboot": bool).
+pub const CWTClaimOEMBoot: i64 = 262;
 /// Indicate status of debug facilities ("dbgstat": int).
 pub const CWTClaimDebugStatus: i64 = 263;
 /// The geographic location ("location": map).
@@ -454,14 +456,19 @@ pub const CWTClaimLocation: i64 = 264;
 pub const CWTClaimProfile: i64 = 265;
 /// The section containing submodules ("submods": map).
 pub const CWTClaimSubmodules: i64 = 266;
+/// The number of times the entity or submodule has been booted ("bootcount": uint).
+pub const CWTClaimBootCount: i64 = 267;
+/// Identifies a boot cycle ("bootseed": bstr).
+pub const CWTClaimBootSeed: i64 = 268;
 /// PSA Client ID (signed integer).
 pub const CWTClaimPSAClientID: i64 = 2394;
 /// PSA Security Lifecycle (unsigned integer).
 pub const CWTClaimPSASecurityLifecycle: i64 = 2395;
 /// PSA Implementation ID (bstr).
 pub const CWTClaimPSAImplementationID: i64 = 2396;
-/// PSA Boot Seed (bstr).
-pub const CWTClaimPSABootSeed: i64 = 2397;
+// Claim key 2397 is unassigned: the final PSA token spec (RFC 9783) dropped
+// its draft-era boot-seed claim in favor of the shared EAT `bootseed` (268),
+// exposed above as `CWTClaimBootSeed`.
 /// PSA Certification Reference (tstr).
 pub const CWTClaimPSACertificationReference: i64 = 2398;
 /// PSA Software Components (array).

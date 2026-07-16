@@ -106,7 +106,7 @@ pub use label::Label;
 pub use map::CoseMap;
 pub use traits::{EncryptionContext, Encryptor, Macer, Signer, Verifier};
 
-pub use context::{KdfContext, PartyInfo, SuppPubInfo};
+pub use context::{KdfContext, PartyInfo, PartyNonce, SuppPubInfo};
 pub use encrypt::EncryptMessage;
 pub use encrypt0::Encrypt0Message;
 pub use mac::MacMessage;

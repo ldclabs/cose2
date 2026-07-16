@@ -4,7 +4,7 @@ use cbor2::Cbor;
 use common::*;
 use cose2::{
     cwt::{Claims, ClaimsMap, Validator, ValidatorOptions},
-    iana, tag, KdfContext, PartyInfo, Sign1Message, SuppPubInfo,
+    iana, tag, KdfContext, Label, PartyInfo, PartyNonce, Sign1Message, SuppPubInfo, Value,
 };
 
 // ----------------------------------------------------------------------------
@@ -15,7 +15,7 @@ use cose2::{
 fn party_info_round_trip() {
     let info = PartyInfo {
         identity: Some(b"id".to_vec()),
-        nonce: Some(b"nonce".to_vec()),
+        nonce: Some(PartyNonce::Bytes(b"nonce".to_vec())),
         other: None,
     };
     let bytes = cbor2::to_canonical_vec(&info).unwrap();
@@ -23,6 +23,49 @@ fn party_info_round_trip() {
     assert_eq!(bytes[0], 0x83);
     let back: PartyInfo = cbor2::from_slice(&bytes).unwrap();
     assert_eq!(back, info);
+}
+
+#[test]
+fn party_info_supports_integer_nonce() {
+    // RFC 9053 §5.2: nonce is `bstr / int / nil`.
+    let info = PartyInfo {
+        identity: None,
+        nonce: Some(PartyNonce::Int(-42)),
+        other: None,
+    };
+    let bytes = cbor2::to_canonical_vec(&info).unwrap();
+    let back: PartyInfo = cbor2::from_slice(&bytes).unwrap();
+    assert_eq!(back, info);
+
+    // A peer-encoded `[null, 7, null]` decodes to an integer nonce.
+    let wire = cbor2::to_vec(&(
+        Option::<&serde_bytes::Bytes>::None,
+        7u64,
+        Option::<&serde_bytes::Bytes>::None,
+    ))
+    .unwrap();
+    let back: PartyInfo = cbor2::from_slice(&wire).unwrap();
+    assert_eq!(back.nonce, Some(PartyNonce::Int(7)));
+
+    // From conversions.
+    assert_eq!(PartyNonce::from(7i64), PartyNonce::Int(7));
+    assert_eq!(
+        PartyNonce::from(b"n".to_vec()),
+        PartyNonce::Bytes(b"n".to_vec())
+    );
+    assert_eq!(
+        PartyNonce::from(&b"n"[..]),
+        PartyNonce::Bytes(b"n".to_vec())
+    );
+
+    // A non-bstr/int nonce (e.g. bool) is rejected.
+    let bad = cbor2::to_vec(&(
+        Option::<&serde_bytes::Bytes>::None,
+        true,
+        Option::<&serde_bytes::Bytes>::None,
+    ))
+    .unwrap();
+    assert!(cbor2::from_slice::<PartyInfo>(&bad).is_err());
 }
 
 #[test]
@@ -48,13 +91,13 @@ fn supp_pub_info_two_and_three_elements() {
 #[test]
 fn kdf_context_four_and_five_elements() {
     let mut ctx = KdfContext {
-        algorithm_id: iana::AlgorithmA128GCM,
+        algorithm_id: Label::Int(iana::AlgorithmA128GCM),
         party_u_info: PartyInfo {
             identity: Some(b"u".to_vec()),
             ..Default::default()
         },
         party_v_info: PartyInfo {
-            nonce: Some(b"v".to_vec()),
+            nonce: Some(PartyNonce::Bytes(b"v".to_vec())),
             ..Default::default()
         },
         supp_pub_info: SuppPubInfo {
@@ -74,6 +117,25 @@ fn kdf_context_four_and_five_elements() {
     assert_eq!(bytes[0], 0x85); // 5-element
     let back = KdfContext::from_slice(&bytes).unwrap();
     assert_eq!(back, ctx);
+}
+
+#[test]
+fn kdf_context_supports_text_algorithm_id() {
+    // RFC 9053 §5.2: AlgorithmID is `int / tstr`.
+    let ctx = KdfContext {
+        algorithm_id: Label::Text("private-alg".into()),
+        party_u_info: PartyInfo::default(),
+        party_v_info: PartyInfo::default(),
+        supp_pub_info: SuppPubInfo {
+            key_data_length: 256,
+            ..Default::default()
+        },
+        supp_priv_info: None,
+    };
+    let bytes = ctx.to_vec().unwrap();
+    let back = KdfContext::from_slice(&bytes).unwrap();
+    assert_eq!(back, ctx);
+    assert_eq!(back.algorithm_id.as_text(), Some("private-alg"));
 }
 
 #[test]
@@ -167,6 +229,56 @@ fn claims_preserve_extra_claims() {
     let canonical = cbor2::to_canonical_vec(&claims).unwrap();
     assert_eq!(canonical, encoded);
     assert_eq!(cbor2::from_slice::<Claims>(&canonical).unwrap(), claims);
+}
+
+#[test]
+fn claims_accept_integral_float_numeric_dates() {
+    // RFC 8392 NumericDate may be a CBOR float; whole-second values decode.
+    let mut map = ClaimsMap::new();
+    map.insert(iana::CWTClaimExp, Value::Float(1_700_000_300.0));
+    map.insert(iana::CWTClaimNbf, Value::Float(1_700_000_000.0));
+    map.insert(iana::CWTClaimIat, Value::Float(1_700_000_000.0));
+    let bytes = map.to_vec().unwrap();
+
+    let claims = Claims::from_slice(&bytes).unwrap();
+    assert_eq!(claims.expiration, Some(1_700_000_300));
+    assert_eq!(claims.not_before, Some(1_700_000_000));
+    assert_eq!(claims.issued_at, Some(1_700_000_000));
+
+    // validate_map tolerates the float encodings too.
+    let v = validator(ValidatorOptions {
+        fixed_now: Some(1_700_000_100),
+        ..Default::default()
+    });
+    assert!(v.validate_map(&map).is_ok());
+    assert!(v.validate(&claims).is_ok());
+}
+
+#[test]
+fn claims_reject_fractional_or_pre_epoch_numeric_dates() {
+    // Fractional seconds are not representable as whole-second timestamps.
+    let mut fractional = ClaimsMap::new();
+    fractional.insert(iana::CWTClaimExp, Value::Float(1_700_000_300.5));
+    let bytes = fractional.to_vec().unwrap();
+    let err = Claims::from_slice(&bytes).unwrap_err();
+    assert!(format!("{err}").contains("fractional-second NumericDate"));
+    let err = validator(ValidatorOptions::default())
+        .validate_map(&fractional)
+        .unwrap_err();
+    assert!(format!("{err}").contains("fractional-second NumericDate"));
+
+    // Pre-epoch (negative) dates are rejected.
+    let mut negative = ClaimsMap::new();
+    negative.insert(iana::CWTClaimExp, -5i64);
+    let bytes = negative.to_vec().unwrap();
+    let err = Claims::from_slice(&bytes).unwrap_err();
+    assert!(format!("{err}").contains("pre-epoch NumericDate"));
+
+    // Non-numeric dates remain type errors.
+    let mut text = ClaimsMap::new();
+    text.insert(iana::CWTClaimExp, "soon");
+    let bytes = text.to_vec().unwrap();
+    assert!(Claims::from_slice(&bytes).is_err());
 }
 
 #[test]

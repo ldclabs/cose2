@@ -97,14 +97,24 @@ fn main() -> Result<(), Error> {
     let holder_claims = restore_payload_from_message(&holder_sd_cwt, RestoreMode::Holder)?;
     println!("holder disclosed claims: {}", holder_claims.disclosed);
 
-    // During presentation, the Holder can disclose a subset. Unprotected
-    // headers are not issuer-signed; production presentations bind the selected
-    // disclosures with a Key Binding Token (KBT).
+    // During presentation, the Holder can disclose a subset.
     let mut presented = holder_sd_cwt.clone();
     let selected = issued.disclosures.as_slice()[0].clone();
     set_disclosures(&mut presented.unprotected, std::slice::from_ref(&selected));
+    let presented_bytes = presented.to_vec()?;
 
-    let verifier_claims = restore_payload_from_message(&presented, RestoreMode::Verifier)?;
+    // Verifier side. Two checks are mandatory before trusting anything:
+    //
+    // 1. Verify the issuer signature over the wire bytes actually received —
+    //    never reuse a struct verified elsewhere.
+    // 2. Verify holder binding: `sd_claims` sits in the *unprotected* header,
+    //    so without a Key Binding Token (kcwt, header 13) signed with the
+    //    holder's `cnf` key over this verifier's audience and cnonce, a
+    //    captured presentation can be replayed by anyone. The sd-cwt crate
+    //    does not implement KBT verification; production verifiers must do it
+    //    (this toy example skips it).
+    let verified = Sign1Message::verify_and_decode(&IssuerVerifier, &presented_bytes, None)?;
+    let verifier_claims = restore_payload_from_message(&verified, RestoreMode::Verifier)?;
     println!(
         "verifier disclosed claims: {}, removed redactions: {}",
         verifier_claims.disclosed, verifier_claims.removed_redactions

@@ -2,19 +2,109 @@
 
 use cbor2::Cbor;
 use serde::{
-    de::{Error as _, IgnoredAny, SeqAccess, Visitor},
+    de::{Error as DeError, IgnoredAny, SeqAccess, Visitor},
     ser::{Error as _, SerializeSeq},
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
 use crate::{
     header::{decode_protected, encode_protected},
-    Error, Header,
+    Error, Header, Label,
 };
+
+/// A `PartyInfo` nonce: `bstr / int` (RFC 9053 §5.2, where the field is
+/// `bstr / int / nil`; absence is modeled with `Option`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum PartyNonce {
+    /// A byte-string nonce.
+    Bytes(Vec<u8>),
+    /// An integer nonce.
+    Int(i64),
+}
+
+impl From<Vec<u8>> for PartyNonce {
+    fn from(value: Vec<u8>) -> Self {
+        PartyNonce::Bytes(value)
+    }
+}
+
+impl From<&[u8]> for PartyNonce {
+    fn from(value: &[u8]) -> Self {
+        PartyNonce::Bytes(value.to_vec())
+    }
+}
+
+impl From<i64> for PartyNonce {
+    fn from(value: i64) -> Self {
+        PartyNonce::Int(value)
+    }
+}
+
+impl Serialize for PartyNonce {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            PartyNonce::Bytes(b) => serializer.serialize_bytes(b),
+            PartyNonce::Int(i) => serializer.serialize_i64(*i),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PartyNonce {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct NonceVisitor;
+
+        impl Visitor<'_> for NonceVisitor {
+            type Value = PartyNonce;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a byte string or integer PartyInfo nonce")
+            }
+
+            fn visit_bytes<E: DeError>(self, v: &[u8]) -> Result<PartyNonce, E> {
+                Ok(PartyNonce::Bytes(v.to_vec()))
+            }
+
+            fn visit_byte_buf<E: DeError>(self, v: Vec<u8>) -> Result<PartyNonce, E> {
+                Ok(PartyNonce::Bytes(v))
+            }
+
+            fn visit_i64<E: DeError>(self, v: i64) -> Result<PartyNonce, E> {
+                Ok(PartyNonce::Int(v))
+            }
+
+            fn visit_u64<E: DeError>(self, v: u64) -> Result<PartyNonce, E> {
+                i64::try_from(v)
+                    .map(PartyNonce::Int)
+                    .map_err(|_| E::custom("integer nonce out of range"))
+            }
+
+            fn visit_i128<E: DeError>(self, v: i128) -> Result<PartyNonce, E> {
+                i64::try_from(v)
+                    .map(PartyNonce::Int)
+                    .map_err(|_| E::custom("integer nonce out of range"))
+            }
+
+            fn visit_u128<E: DeError>(self, v: u128) -> Result<PartyNonce, E> {
+                i64::try_from(v)
+                    .map(PartyNonce::Int)
+                    .map_err(|_| E::custom("integer nonce out of range"))
+            }
+        }
+
+        deserializer.deserialize_any(NonceVisitor)
+    }
+}
 
 /// A `PartyInfo` array `[identity, nonce, other]` (RFC 9053 §5.2).
 ///
-/// Each element is a byte string or `null`.
+/// `identity` and `other` are byte strings or `null`; `nonce` is a byte
+/// string, an integer, or `null`.
 #[derive(Clone, Debug, Default, PartialEq, Cbor)]
 #[cbor(array)]
 pub struct PartyInfo {
@@ -22,8 +112,7 @@ pub struct PartyInfo {
     #[serde(with = "serde_bytes")]
     pub identity: Option<Vec<u8>>,
     /// Party-provided nonce.
-    #[serde(with = "serde_bytes")]
-    pub nonce: Option<Vec<u8>>,
+    pub nonce: Option<PartyNonce>,
     /// Other party-provided information.
     #[serde(with = "serde_bytes")]
     pub other: Option<Vec<u8>>,
@@ -100,10 +189,11 @@ impl<'de> Deserialize<'de> for SuppPubInfo {
 
 /// A COSE_KDF_Context structure (RFC 9053 §5.2):
 /// `[AlgorithmID, PartyUInfo, PartyVInfo, SuppPubInfo, ?SuppPrivInfo]`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct KdfContext {
-    /// Identifier of the algorithm the derived key is used with.
-    pub algorithm_id: i64,
+    /// Identifier of the algorithm the derived key is used with
+    /// (`int / tstr`, RFC 9053 §5.2).
+    pub algorithm_id: Label,
     /// Information about party U.
     pub party_u_info: PartyInfo,
     /// Information about party V.
@@ -162,7 +252,7 @@ impl<'de> Deserialize<'de> for KdfContext {
             where
                 A: SeqAccess<'de>,
             {
-                let algorithm_id: i64 = seq
+                let algorithm_id: Label = seq
                     .next_element()?
                     .ok_or_else(|| A::Error::custom("missing AlgorithmID"))?;
                 let party_u_info: PartyInfo = seq

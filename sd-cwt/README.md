@@ -27,8 +27,8 @@ policy for you. Issuers provide 16-byte salts; applications still use
 
 ```toml
 [dependencies]
-cose2 = "0.3"
-sd-cwt = "0.1"
+cose2 = "0.4"
+sd-cwt = "0.2"
 ```
 
 When working from this repository:

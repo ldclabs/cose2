@@ -6,6 +6,25 @@
 //! cover SD-CWT-specific header parameters, salted disclosures, redacted claim
 //! markers, AEAD-encrypted disclosure wire structures, and restoration of a
 //! presented claims set.
+//!
+//! # Security
+//!
+//! This crate implements only the disclosure/redaction mechanics. Two
+//! independent checks remain the application's responsibility:
+//!
+//! 1. **Issuer signature.** The restore helpers never verify COSE signatures.
+//!    A Verifier must decode and verify the signature of the wire bytes it
+//!    received (e.g. with [`cose2::Sign1Message::verify_and_decode`]) before
+//!    calling any restore helper, and must not reuse a struct it did not
+//!    verify itself.
+//! 2. **Holder binding.** `sd_claims` lives in the *unprotected* header, so
+//!    the issuer's signature does not cover which disclosures are presented.
+//!    A presentation is bound to the holder and transaction with a Key
+//!    Binding Token (`kcwt`, header parameter 13, [`HEADER_KCWT`]): a CWT
+//!    signed with the holder's `cnf` key over the verifier's audience,
+//!    `cnonce` and issuance time. This crate does not yet implement KBT
+//!    issuance or verification; until the application performs that check, a
+//!    captured presentation can be replayed by anyone.
 
 use std::collections::{HashMap, HashSet};
 
@@ -620,6 +639,13 @@ where
 ///
 /// This helper supports the SD-CWT default hash algorithm, SHA-256. Use
 /// [`restore_payload_with_disclosures`] when a profile uses another hash.
+///
+/// # Security
+///
+/// This helper does **not** verify the COSE signature or holder binding.
+/// Pass only messages whose signature was verified from the received wire
+/// bytes, and check holder binding (KBT) separately — see the crate-level
+/// Security notes.
 pub fn restore_payload_from_message(
     message: &cose2::Sign1Message,
     mode: RestoreMode,
@@ -630,6 +656,11 @@ pub fn restore_payload_from_message(
 }
 
 /// Decodes a COSE payload as CBOR and restores it with caller-supplied disclosures.
+///
+/// # Security
+///
+/// This helper does **not** verify the COSE signature or holder binding —
+/// see the crate-level Security notes.
 pub fn restore_payload_with_disclosures<I>(
     message: &cose2::Sign1Message,
     disclosures: I,
@@ -1245,6 +1276,54 @@ mod tests {
                 Value::Map(vec![(Value::from("country"), Value::from("FR"))]),
             )])
         );
+    }
+
+    #[test]
+    fn extraneous_disclosure_is_rejected_in_both_modes() {
+        // A disclosure whose digest matches no redacted digest in the signed
+        // payload must fail: otherwise a holder or MITM could inject
+        // unrelated claims into a presentation.
+        let matched = Disclosure::claim(salt(20), 2, "ok").unwrap();
+        let extraneous = Disclosure::claim(salt(21), "email", "eve@example.com").unwrap();
+        let payload = Value::Map(vec![(
+            redacted_claim_keys_label(),
+            Value::Array(vec![Value::Bytes(hash(&matched))]),
+        )]);
+
+        for mode in [RestoreMode::Holder, RestoreMode::Verifier] {
+            let err = restore(
+                payload.clone(),
+                vec![matched.clone(), extraneous.clone()],
+                &Sha256RedactionHasher,
+                mode,
+            )
+            .unwrap_err();
+            assert!(format!("{err}").contains("without a matching redacted claim"));
+        }
+    }
+
+    #[test]
+    fn duplicate_disclosure_digests_are_rejected() {
+        let disclosure = Disclosure::claim(salt(22), 2, "dup").unwrap();
+        let payload = Value::Map(vec![(
+            redacted_claim_keys_label(),
+            Value::Array(vec![Value::Bytes(hash(&disclosure))]),
+        )]);
+
+        let err = restore_for_verifier(
+            payload,
+            vec![disclosure.clone(), disclosure],
+            &Sha256RedactionHasher,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("duplicate SD-CWT disclosure digest"));
+    }
+
+    #[test]
+    fn holder_rejects_undisclosed_array_element_redaction() {
+        let payload = Value::Array(vec![redacted_element(vec![0xcc; 32]), Value::from("kept")]);
+        let err = restore_for_holder(payload, Vec::new(), &Sha256RedactionHasher).unwrap_err();
+        assert!(format!("{err}").contains("redacted array element without disclosure"));
     }
 
     #[test]

@@ -202,6 +202,16 @@ impl Encrypt0Message {
 
     /// Encodes an encrypted message to tagged COSE_Encrypt0 bytes.
     pub fn to_vec(&self) -> Result<Vec<u8>, Error> {
+        self.encode(tag::ENCRYPT0_PREFIX)
+    }
+
+    /// Encodes an encrypted message to canonical COSE_Encrypt0 bytes without the CBOR tag.
+    pub fn to_untagged_vec(&self) -> Result<Vec<u8>, Error> {
+        self.encode(&[])
+    }
+
+    /// Serializes the wire array borrowing this message's buffers.
+    fn encode(&self, prefix: &[u8]) -> Result<Vec<u8>, Error> {
         if !self.encrypted {
             return Err(Error::Custom(
                 "Encrypt0Message must be encrypted before encoding".into(),
@@ -211,20 +221,16 @@ impl Encrypt0Message {
         let ciphertext = if self.ciphertext_detached {
             None
         } else {
-            Some(self.ciphertext.clone())
+            Some(serde_bytes::Bytes::new(&self.ciphertext))
         };
-        let wire = Encrypt0Wire {
-            protected: self.protected_raw.clone(),
-            unprotected: self.unprotected.clone(),
-            ciphertext,
-        };
-        Ok(cbor2::to_canonical_vec(&wire)?)
-    }
-
-    /// Encodes an encrypted message to canonical COSE_Encrypt0 bytes without the CBOR tag.
-    pub fn to_untagged_vec(&self) -> Result<Vec<u8>, Error> {
-        let tagged = self.to_vec()?;
-        Ok(tag::skip_tag(tag::ENCRYPT0_PREFIX, &tagged).to_vec())
+        util::encode_prefixed(
+            prefix,
+            &(
+                serde_bytes::Bytes::new(&self.protected_raw),
+                &self.unprotected,
+                ciphertext,
+            ),
+        )
     }
 
     /// Decodes a COSE_Encrypt0 message (tagged or untagged) without decrypting.

@@ -28,6 +28,8 @@ use backend::{
     signature::{KeyPair, RsaParameters},
 };
 
+use zeroize::Zeroizing;
+
 use crate::{iana, Encryptor, Error, Key, Label, Macer, Signer, Verifier};
 
 /// A built-in HMAC provider for COSE_Mac and COSE_Mac0.
@@ -37,8 +39,9 @@ pub struct RingMacer {
     kid: Option<Vec<u8>>,
     key: hmac::Key,
     // Retained so the symmetric `k` can be re-exported by `to_cose_key`;
-    // `hmac::Key` does not expose its raw bytes.
-    raw_key: Vec<u8>,
+    // `hmac::Key` does not expose its raw bytes. Zeroized on drop (every
+    // clone wipes its own copy).
+    raw_key: Zeroizing<Vec<u8>>,
     tag_len: usize,
 }
 
@@ -61,7 +64,7 @@ impl RingMacer {
             alg,
             kid,
             key: hmac::Key::new(algorithm, key),
-            raw_key: key.to_vec(),
+            raw_key: Zeroizing::new(key.to_vec()),
             tag_len,
         })
     }
@@ -131,8 +134,9 @@ pub struct RingEncryptor {
     // `LessSafeKey` is `Clone` but `aws-lc-rs`'s is not.
     key: Arc<aead::LessSafeKey>,
     // Retained so the symmetric `k` can be re-exported by `to_cose_key`;
-    // `aead::LessSafeKey` does not expose its raw bytes.
-    raw_key: Vec<u8>,
+    // `aead::LessSafeKey` does not expose its raw bytes. Zeroized on drop
+    // (every clone wipes its own copy).
+    raw_key: Zeroizing<Vec<u8>>,
     base_iv: Option<Vec<u8>>,
 }
 
@@ -157,7 +161,7 @@ impl RingEncryptor {
             alg,
             kid,
             key: Arc::new(aead::LessSafeKey::new(unbound)),
-            raw_key: key.to_vec(),
+            raw_key: Zeroizing::new(key.to_vec()),
             base_iv: None,
         })
     }
@@ -402,20 +406,22 @@ impl RingSigner {
 
     fn ecdsa_from_cose_key(key: &Key, alg: i64) -> Result<Self, Error> {
         require_kty(key, iana::KeyTypeEC2)?;
-        let (curve, signing_algorithm) = match alg {
+        let (curve, signing_algorithm, coordinate_len) = match alg {
             iana::AlgorithmES256 => (
                 iana::EllipticCurveP_256,
                 &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+                32,
             ),
             iana::AlgorithmES384 => (
                 iana::EllipticCurveP_384,
                 &signature::ECDSA_P384_SHA384_FIXED_SIGNING,
+                48,
             ),
             _ => return Err(unsupported_alg("ECDSA signing", alg)),
         };
         require_curve(key, iana::EC2KeyParameterCrv, curve)?;
         let kid = key_kid(key)?;
-        let public_key = ec2_uncompressed_public_key(key)?;
+        let public_key = ec2_uncompressed_public_key(key, coordinate_len)?;
         let d = required_bytes(key, iana::EC2KeyParameterD, "d")?;
         // `ring` requires an RNG argument here; `aws-lc-rs` does not.
         #[cfg(feature = "crypto-ring")]
@@ -551,13 +557,17 @@ impl RingVerifier {
             }
             iana::AlgorithmES256 | iana::AlgorithmES384 => {
                 require_kty(key, iana::KeyTypeEC2)?;
-                let expected_curve = if alg == iana::AlgorithmES256 {
-                    iana::EllipticCurveP_256
+                let (expected_curve, coordinate_len) = if alg == iana::AlgorithmES256 {
+                    (iana::EllipticCurveP_256, 32)
                 } else {
-                    iana::EllipticCurveP_384
+                    (iana::EllipticCurveP_384, 48)
                 };
                 require_curve(key, iana::EC2KeyParameterCrv, expected_curve)?;
-                Self::ecdsa(alg, &ec2_uncompressed_public_key(key)?, key_kid(key)?)
+                Self::ecdsa(
+                    alg,
+                    &ec2_uncompressed_public_key(key, coordinate_len)?,
+                    key_kid(key)?,
+                )
             }
             iana::AlgorithmRS256
             | iana::AlgorithmRS384
@@ -790,9 +800,20 @@ fn key_kid(key: &Key) -> Result<Option<Vec<u8>>, Error> {
     Ok(key.kid()?.map(ToOwned::to_owned))
 }
 
-fn ec2_uncompressed_public_key(key: &Key) -> Result<Vec<u8>, Error> {
+/// Concatenates an EC2 key's `x`/`y` into an uncompressed SEC 1 point.
+///
+/// Each coordinate must be exactly `coordinate_len` bytes for the curve, so
+/// a boundary-shifted `x`/`y` pair cannot pass as an aggregate-length match.
+fn ec2_uncompressed_public_key(key: &Key, coordinate_len: usize) -> Result<Vec<u8>, Error> {
     let x = required_bytes(key, iana::EC2KeyParameterX, "x")?;
     let y = required_bytes(key, iana::EC2KeyParameterY, "y")?;
+    if x.len() != coordinate_len || y.len() != coordinate_len {
+        return Err(Error::custom(format!(
+            "EC2 coordinates must be {coordinate_len} bytes, got x = {} and y = {}",
+            x.len(),
+            y.len()
+        )));
+    }
     let mut out = Vec::with_capacity(1 + x.len() + y.len());
     out.push(0x04);
     out.extend_from_slice(x);
