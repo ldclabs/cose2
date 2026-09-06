@@ -75,9 +75,75 @@ jobs:
         # `cargo tree -i <crate>` exits non-zero when the crate is absent from
         # the default dependency graph, which is exactly what we want.
         run: |
-          for dep in ring aws-lc-rs; do
+          for dep in ring aws-lc-rs ed25519-dalek aes-gcm; do
             if cargo tree --no-default-features -e normal -i "$dep" >/dev/null 2>&1; then
               echo "::error::$dep must not be a default dependency"
               exit 1
             fi
           done
+
+  standalone-backends:
+    name: standalone backend (${{ matrix.feature }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        feature: [crypto-ed25519-dalek, crypto-aes-gcm]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p cose2 --no-default-features --features ${{ matrix.feature }} --all-targets -- -D warnings
+      - run: cargo test -p cose2 --no-default-features --features ${{ matrix.feature }} --all-targets
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-llvm-cov --locked
+      - run: cargo llvm-cov --workspace --all-targets --all-features --fail-under-lines 85
+
+  fuzz-build:
+    name: fuzz targets compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --manifest-path fuzz/Cargo.toml
+
+  package:
+    name: package artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo package -p cose2
+      # Full sd-cwt verification becomes possible only after the matching
+      # cose2 version reaches crates.io; validate its archive file set here.
+      - run: cargo package -p sd-cwt --list
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+
+  iana-registry:
+    name: IANA registry snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: curl --fail --retry 3 --silent --show-error https://www.iana.org/assignments/cose/cose.xml --output /tmp/cose.xml
+      - run: python3 scripts/check_iana_algorithms.py /tmp/cose.xml src/iana.rs

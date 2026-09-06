@@ -121,10 +121,25 @@ fn rfc8392_a1_claims_set_decodes_registered_claims() {
 
     assert_eq!(claims.issuer.as_deref(), Some("coap://as.example.com"));
     assert_eq!(claims.subject.as_deref(), Some("erikw"));
-    assert_eq!(claims.audience.as_deref(), Some("coap://light.example.com"));
-    assert_eq!(claims.expiration, Some(1_444_064_944));
-    assert_eq!(claims.not_before, Some(1_443_944_944));
-    assert_eq!(claims.issued_at, Some(1_443_944_944));
+    assert_eq!(
+        claims
+            .audience
+            .as_ref()
+            .and_then(cose2::cwt::Audience::as_str),
+        Some("coap://light.example.com")
+    );
+    assert_eq!(
+        claims.expiration,
+        Some(cose2::cwt::NumericDate::from(1_444_064_944i64))
+    );
+    assert_eq!(
+        claims.not_before,
+        Some(cose2::cwt::NumericDate::from(1_443_944_944i64))
+    );
+    assert_eq!(
+        claims.issued_at,
+        Some(cose2::cwt::NumericDate::from(1_443_944_944i64))
+    );
     assert_eq!(claims.cwt_id.as_deref(), Some(&[0x0b, 0x71][..]));
 }
 
@@ -206,7 +221,13 @@ fn rfc8392_a3_signed_cwt_verifies_with_appendix_key() {
     let msg = Sign1Message::verify_and_decode(&verifier, &rfc8392_signed_cwt(), None).unwrap();
 
     let claims = Claims::from_slice(msg.payload.as_deref().unwrap()).unwrap();
-    assert_eq!(claims.audience.as_deref(), Some("coap://light.example.com"));
+    assert_eq!(
+        claims
+            .audience
+            .as_ref()
+            .and_then(cose2::cwt::Audience::as_str),
+        Some("coap://light.example.com")
+    );
 }
 
 #[test]

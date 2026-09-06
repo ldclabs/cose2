@@ -17,7 +17,12 @@ with `cose2::Sign1Message`:
   disclosures;
 - Salted Disclosed Claim encoding, decoding, and SHA-256 hashing;
 - Holder and Verifier restoration modes;
-- AEAD encrypted disclosure wire structures and header helpers.
+- strict draft-08 validation with configurable input, depth, item, disclosure,
+  byte, and container limits;
+- restoration and consistency checks for claims carried in the protected
+  `CWT_Claims` header as well as the payload;
+- AEAD encrypted disclosure wire structures, header helpers, and validation of
+  the selected algorithm's nonce and authentication-tag sizes.
 
 The crate does not generate randomness and does not implement KBT signing
 policy for you. Issuers provide 16-byte salts; applications still use
@@ -27,8 +32,8 @@ policy for you. Issuers provide 16-byte salts; applications still use
 
 ```toml
 [dependencies]
-cose2 = "0.4"
-sd-cwt = "0.2"
+cose2 = "0.5"
+sd-cwt = "0.3"
 ```
 
 When working from this repository:
@@ -55,19 +60,19 @@ The example below shows the core SD-CWT flow without real cryptography:
 use cbor2::Value;
 use cose2::{Error, Sign1Message};
 use sd_cwt::{
-    issue_from_preissuance, restore_payload_from_message, set_disclosures,
-    set_sd_alg, set_sd_cwt_typ, RedactionHasher, RestoreMode, Sha256RedactionHasher,
-    TO_BE_REDACTED_TAG,
+    issue_from_preissuance, set_disclosures, set_sd_alg, set_sd_cwt_typ,
+    verify_validate_and_restore_sd_cwt, RedactionHasher, RestoreMode,
+    SdCwtValidationOptions, Sha256RedactionHasher, TO_BE_REDACTED_TAG,
 };
 
 # struct DemoSigner;
 # impl cose2::Signer for DemoSigner {
-#     fn alg(&self) -> Option<cose2::Label> { Some(cose2::iana::AlgorithmEdDSA.into()) }
+#     fn alg(&self) -> Option<cose2::Label> { Some(cose2::iana::AlgorithmEd25519.into()) }
 #     fn sign(&self, data: &[u8]) -> Result<Vec<u8>, Error> { Ok(data.to_vec()) }
 # }
 # struct DemoVerifier;
 # impl cose2::Verifier for DemoVerifier {
-#     fn alg(&self) -> Option<cose2::Label> { Some(cose2::iana::AlgorithmEdDSA.into()) }
+#     fn alg(&self) -> Option<cose2::Label> { Some(cose2::iana::AlgorithmEd25519.into()) }
 #     fn verify(&self, data: &[u8], signature: &[u8]) -> Result<(), Error> {
 #         if data == signature { Ok(()) } else { Err(Error::verify("signature mismatch")) }
 #     }
@@ -75,6 +80,8 @@ use sd_cwt::{
 # fn example() -> Result<(), Error> {
 let preissued = Value::Map(vec![
     (Value::from(1), Value::from("https://issuer.example")),
+    (Value::from(2), Value::from("https://holder.example")),
+    (Value::from(8), Value::Map(vec![])),
     (
         Value::Tag(TO_BE_REDACTED_TAG, Box::new(Value::from("name"))),
         Value::from("Alice Example"),
@@ -97,8 +104,13 @@ set_sd_alg(&mut msg.protected, Sha256RedactionHasher.algorithm());
 set_disclosures(&mut msg.unprotected, issued.disclosures.as_slice());
 
 let encoded = msg.sign_and_encode(&DemoSigner, None)?;
-let verified = Sign1Message::verify_and_decode(&DemoVerifier, &encoded, None)?;
-let restored = restore_payload_from_message(&verified, RestoreMode::Holder)?;
+let (_verified, restored) = verify_validate_and_restore_sd_cwt(
+    &DemoVerifier,
+    &encoded,
+    None,
+    RestoreMode::Holder,
+    SdCwtValidationOptions::default(),
+)?;
 
 assert_eq!(restored.disclosed, 1);
 # Ok(())
@@ -124,6 +136,8 @@ cargo run -p sd-cwt --example basic
 | Read or write `sd_alg`                                          | `sd_alg`, `set_sd_alg`, `default_hasher_for_sd_alg`                                                        |
 | Restore as Holder                                               | `restore_for_holder` or `restore_payload_from_message(..., RestoreMode::Holder)`                           |
 | Restore as Verifier                                             | `restore_for_verifier` or `restore_payload_from_message(..., RestoreMode::Verifier)`                       |
+| Verify, structurally validate, and restore an SD-CWT            | `verify_validate_and_restore_sd_cwt(...)`                                                                  |
+| Configure resource limits                                       | `ProcessingLimits`, `SdCwtValidationOptions`                                                               |
 | Handle AEAD encrypted disclosure metadata                       | `AeadEncryptedDisclosure`, `set_aead_encrypted_disclosures`, `aead_encrypted_disclosures_from_unprotected` |
 
 ## Holder vs Verifier restoration
@@ -139,11 +153,18 @@ disclosure are removed from the validated claims set.
 In both modes, a disclosure that restores a map key already present at the same
 level is rejected.
 
+When the protected `CWT_Claims` header is present, its restored map is returned
+as `RestoreReport::protected_claims`. Any unredacted claim repeated there and
+in the payload must have the same value.
+
 ## Protocol boundaries
 
 - `sd_claims` is an unprotected COSE header parameter. A production
   presentation needs a Key Binding Token (KBT) to bind the selected
   disclosures to the Holder.
+- Expected issuer, subject and audience policy, current-time validity,
+  confirmation-key control, and `cnonce` freshness remain application inputs;
+  apply them in addition to the structural validator.
 - `sd_alg` defaults to SHA-256 (`-16`) when omitted. The built-in helper
   supports SHA-256; profiles using another hash can implement
   `RedactionHasher`.
@@ -152,6 +173,11 @@ level is rejected.
   decryption are profile/application responsibilities.
 - Salted disclosures are hashed over their bstr-encoded Salted Disclosed Claim
   bytes. `Disclosure::from_encoded` preserves those exact bytes for hashing.
+- SD-CWT and disclosure decoders reject indefinite-length CBOR, empty present
+  disclosure arrays, duplicate salts or encrypted-disclosure nonces, invalid
+  reserved-tag placement, non-label map keys, unsafe nested header maps,
+  forbidden AEAD choices, and resource-limit violations. Profile media types
+  ending in `+sd-cwt` are accepted by the strict validator.
 
 ## Verification
 

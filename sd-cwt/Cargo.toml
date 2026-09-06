@@ -1,6 +1,6 @@
 [package]
 name = "sd-cwt"
-version = "0.2.0"
+version = "0.3.0"
 description = "Selective Disclosure CBOR Web Token (SD-CWT) helpers for cose2."
 homepage = "https://github.com/ldclabs/cose2"
 repository = "https://github.com/ldclabs/cose2"
@@ -13,6 +13,6 @@ edition = "2021"
 rust-version = "1.89"
 
 [dependencies]
-cose2 = { path = "..", version = "0.4" }
+cose2 = { path = "..", version = "0.5" }
 cbor2 = { workspace = true }
 sha2 = { workspace = true }

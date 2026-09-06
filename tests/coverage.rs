@@ -330,15 +330,15 @@ fn validator_iat_in_past_is_accepted() {
     })
     .unwrap();
     let claims = Claims {
-        expiration: Some(2_000),
-        issued_at: Some(900), // in the past → reaches the post-check path
+        expiration: Some(cose2::cwt::NumericDate::from(2_000i64)),
+        issued_at: Some(cose2::cwt::NumericDate::from(900i64)),
         ..Default::default()
     };
     assert!(v.validate(&claims).is_ok());
 
     // expect_issued_in_the_past with no iat: the inner `if let` falls through.
     let no_iat = Claims {
-        expiration: Some(2_000),
+        expiration: Some(cose2::cwt::NumericDate::from(2_000i64)),
         ..Default::default()
     };
     assert!(v.validate(&no_iat).is_ok());

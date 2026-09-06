@@ -20,8 +20,9 @@ This guide is for AI coding agents and code-generation tools that need to use
 | Async or remote signing | `prepare_signature` / `prepare_signatures`, then `set_signature` / `set_signatures` | Sign the returned `Sig_structure` bytes with KMS/HSM/async code. |
 | Async or remote MAC | `prepare_tag` / `prepare_detached_tag`, then `set_tag` | MAC the returned `MAC_structure` bytes with HSM/KMS/async code. |
 | Async or remote encryption | `prepare_encryption`, then `set_ciphertext` | Encrypt with the returned nonce and `Enc_structure` AAD. |
-| Encode or validate CWT claims | `cwt::Claims`, `cwt::ClaimsMap`, `cwt::Validator` | `Claims` preserves the registered typed subset plus `extra` custom claims. Use `ClaimsMap` when you want a map-only workflow. |
-| Store COSE keys | `Key` and `KeySet` | `KeySet::lookup(kid)` returns an iterator because `kid` is not unique. |
+| Encode or validate CWT claims | `cwt::Claims`, `cwt::ClaimsMap`, `cwt::Validator` | `Claims::to_vec` emits the untagged payload map; call `message.to_cwt_vec()` after protecting it. |
+| Store COSE keys | `Key` and `KeySet` | Default decode ignores malformed members per RFC 9052; use `from_slice_strict` for all-or-nothing input. |
+| Verify a legacy countersignature | `Header::counter_signatures`, then `CounterSignature::verify` | Pass the target structure's exact protected bytes and its third body field. Prefer RFC 9338 countersignature V2 in new protocols. |
 
 ## Feature selection
 
@@ -32,6 +33,9 @@ This guide is for AI coding agents and code-generation tools that need to use
   `RingVerifier`, `RingMacer`, and `RingEncryptor`, or `crypto-aws-lc-rs` to
   back those same providers with `aws-lc-rs` instead of `ring`. When both
   backend features are enabled, `crypto-ring` takes precedence.
+- New code that may switch between those features can use the neutral
+  `BackendSigner`, `BackendVerifier`, `BackendMacer`, and `BackendEncryptor`
+  aliases.
 - Do not add an always-on crypto dependency to this crate. Optional crypto
   providers belong behind feature flags.
 
@@ -45,14 +49,16 @@ plain `i64` values.
 
 `from_cose_key` requires the key's `alg` to be a registered **integer**
 algorithm; private text-string algorithms are rejected by the built-in backend.
+If `key_ops` is present, providers enforce it for every operation. SD-CWT
+profiles should use the fully specified `Ed25519` or `ESP*` identifiers.
 
 ### Signatures — `RingSigner` / `RingVerifier`
 
 | Algorithm | `iana` algorithm constant | `kty` | `crv` | Signer key params (private) | Verifier key params (public) |
 | --- | --- | --- | --- | --- | --- |
-| EdDSA (Ed25519) | `AlgorithmEdDSA` | `KeyTypeOKP` | `EllipticCurveEd25519` | `d`, `x` | `x` |
-| ES256 | `AlgorithmES256` | `KeyTypeEC2` | `EllipticCurveP_256` | `d`, `x`, `y` | `x`, `y` |
-| ES384 | `AlgorithmES384` | `KeyTypeEC2` | `EllipticCurveP_384` | `d`, `x`, `y` | `x`, `y` |
+| Ed25519 / legacy EdDSA | `AlgorithmEd25519` / `AlgorithmEdDSA` | `KeyTypeOKP` | `EllipticCurveEd25519` | `d`, optional matching `x` | `x` |
+| ESP256 / ES256 | `AlgorithmESP256` / `AlgorithmES256` | `KeyTypeEC2` | `EllipticCurveP_256` | `d`, `x`, `y` | `x`, `y` |
+| ESP384 / ES384 | `AlgorithmESP384` / `AlgorithmES384` | `KeyTypeEC2` | `EllipticCurveP_384` | `d`, `x`, `y` | `x`, `y` |
 | RS256 / RS384 / RS512 | `AlgorithmRS256` / `AlgorithmRS384` / `AlgorithmRS512` | `KeyTypeRSA` | — | `n`, `e`, `d`, `p`, `q`, `dP`, `dQ`, `qInv` | `n`, `e` |
 | PS256 / PS384 / PS512 | `AlgorithmPS256` / `AlgorithmPS384` / `AlgorithmPS512` | `KeyTypeRSA` | — | `n`, `e`, `d`, `p`, `q`, `dP`, `dQ`, `qInv` | `n`, `e` |
 
@@ -62,7 +68,8 @@ Key-parameter constants: `OKPKeyParameterD` / `OKPKeyParameterX`,
 are the raw affine coordinates; the provider builds the uncompressed SEC1 point.
 
 Non-key constructors also exist: `RingSigner::ed25519_from_pkcs8`,
-`es256_from_pkcs8`, `es384_from_pkcs8`, `rsa_from_pkcs8`, `rsa_from_der`;
+`esp256_from_pkcs8`, `es256_from_pkcs8`, `esp384_from_pkcs8`,
+`es384_from_pkcs8`, `rsa_from_pkcs8`, `rsa_from_der`;
 `RingVerifier::ed25519`, `ecdsa`, `rsa_components`, `rsa_der`.
 
 ### MAC — `RingMacer` (`kty = KeyTypeSymmetric`, key param `k`)
@@ -195,9 +202,8 @@ verify/decrypt APIs.
 - Protected header parameters are authenticated. Unprotected `kid` is only a
   key hint and is not globally unique.
 - Decoding validates malformed `crit` and protected/unprotected label
-  collisions. For untrusted messages, applications must still call
-  `Header::ensure_crit_understood` with the private critical labels they
-  understand.
+  collisions. Verification/decryption rejects unknown critical labels; custom
+  providers declare processed labels through `understood_critical_headers`.
 - `cose2` does not generate randomness or nonces. Encryption needs a full `IV`
   or a `Partial IV` combined with the encryptor's Base IV. Never reuse an AEAD
   nonce with the same key.
@@ -206,9 +212,9 @@ verify/decrypt APIs.
   application code.
 - Detached payloads and detached ciphertext are explicit APIs. Do not encode
   `None` manually and then call the embedded-payload helpers.
-- Top-level COSE messages and CWT claims use registered CBOR tags from
-  `to_vec`. Decoders accept untagged messages for compatibility; use
-  `to_untagged_vec` when a peer expects the tagless body.
+- Top-level COSE messages use their registered tags from `to_vec`; decoders
+  also accept an untagged body. CWT Claims Sets are untagged payload maps.
+  Use `message.to_cwt_vec()` for `61(COSE_Tagged(...))`.
 - Header, key, and claim maps use `Label` keys and `cbor2::Value` values. Use
   typed accessors where they exist.
 

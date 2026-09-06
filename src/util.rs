@@ -1,13 +1,69 @@
 //! Internal helpers shared by the message modules.
 
-use crate::{Error, Header, Label, Value};
+use crate::{Error, Header, Label};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum OperationState {
+    #[default]
+    New,
+    Prepared,
+    Complete,
+}
+
+impl OperationState {
+    pub(crate) fn initialized(self) -> bool {
+        self != Self::New
+    }
+
+    pub(crate) fn complete(self) -> bool {
+        self == Self::Complete
+    }
+}
+
+#[cfg(any(
+    feature = "crypto-ring",
+    feature = "crypto-aws-lc-rs",
+    feature = "crypto-aes-gcm"
+))]
+pub(crate) fn key_ops_allow(ops: &Option<Vec<Label>>, allowed: &[i64]) -> bool {
+    ops.as_ref().is_none_or(|ops| {
+        ops.iter()
+            .any(|op| matches!(op, Label::Int(value) if allowed.contains(value)))
+    })
+}
+
+#[cfg(any(
+    feature = "crypto-ring",
+    feature = "crypto-aws-lc-rs",
+    feature = "crypto-aes-gcm"
+))]
+pub(crate) fn require_key_ops(
+    ops: &Option<Vec<Label>>,
+    allowed: &[i64],
+    operation: &str,
+) -> Result<(), Error> {
+    if key_ops_allow(ops, allowed) {
+        Ok(())
+    } else {
+        Err(Error::key_operation(format!(
+            "COSE_Key key_ops does not permit {operation}"
+        )))
+    }
+}
+
+#[cfg(any(
+    feature = "crypto-ring",
+    feature = "crypto-aws-lc-rs",
+    feature = "crypto-aes-gcm"
+))]
+pub(crate) fn set_key_ops(key: &mut crate::Key, ops: &Option<Vec<Label>>) {
+    if let Some(ops) = ops {
+        key.set_ops(ops.clone());
+    }
+}
 
 /// Maps payload bytes to the CBOR value used in the `*_structure` to be
 /// signed or MACed.
-pub(crate) fn payload_value(payload: &[u8]) -> Value {
-    Value::Bytes(payload.to_vec())
-}
-
 /// Returns an embedded payload, or an error that points callers at the
 /// detached-payload API.
 pub(crate) fn require_embedded_payload<'a>(
@@ -35,24 +91,42 @@ pub(crate) fn require_plaintext<'a>(
 }
 
 /// Serializes a fixed COSE `*_structure` array to its canonical CBOR bytes.
-pub(crate) fn encode_structure(parts: Vec<Value>) -> Result<Vec<u8>, Error> {
-    Ok(cbor2::to_canonical_vec(&Value::Array(parts))?)
+pub(crate) fn encode_structure<T: serde::Serialize>(parts: &T) -> Result<Vec<u8>, Error> {
+    // Every authenticated structure is a fixed array of text and byte strings;
+    // the normal encoder already emits their unique preferred form. Avoid the
+    // canonical encoder here because it first materializes a dynamic Value and
+    // would copy large payloads an extra time merely to sort maps that cannot
+    // occur in these structures.
+    Ok(cbor2::to_vec(parts)?)
 }
 
-/// Serializes a borrowed wire body as canonical CBOR into a buffer that
-/// starts with `prefix` (a COSE tag prefix from [`tag`](crate::tag), or empty
-/// for untagged output).
+/// Streams a borrowed wire body into an exactly sized buffer that starts with
+/// `prefix` (a COSE tag prefix from [`tag`](crate::tag), or empty for untagged
+/// output).
 ///
-/// The message modules pass tuples of borrowed fields here so encoding does
-/// not clone payloads, ciphertexts or recipient lists.
+/// Message modules pre-encode map-containing fragments with [`canonical_raw`]
+/// so the ordinary streaming encoder still produces canonical output without
+/// copying large payload or ciphertext byte strings through a dynamic value.
 pub(crate) fn encode_prefixed<T: serde::Serialize>(
     prefix: &[u8],
     body: &T,
 ) -> Result<Vec<u8>, Error> {
-    let mut out = Vec::with_capacity(prefix.len() + 64);
+    let body_len = usize::try_from(cbor2::serialized_size(body)?)
+        .map_err(|_| Error::custom("encoded CBOR size does not fit usize"))?;
+    let capacity = prefix
+        .len()
+        .checked_add(body_len)
+        .ok_or_else(|| Error::custom("encoded CBOR size overflow"))?;
+    let mut out = Vec::with_capacity(capacity);
     out.extend_from_slice(prefix);
-    cbor2::to_canonical_writer(body, &mut out)?;
+    cbor2::to_writer(body, &mut out)?;
     Ok(out)
+}
+
+/// Canonically encodes a map-containing fragment for zero-copy splicing into
+/// an otherwise streaming CBOR message.
+pub(crate) fn canonical_raw<T: serde::Serialize>(value: &T) -> Result<cbor2::RawValue, Error> {
+    Ok(cbor2::RawValue::new(cbor2::to_canonical_vec(value)?)?)
 }
 
 /// On the signing/encrypting/MACing side: writes `alg` into the protected
@@ -60,17 +134,28 @@ pub(crate) fn encode_prefixed<T: serde::Serialize>(
 ///
 pub(crate) fn ensure_protected_alg(
     protected: &mut Header,
+    unprotected: &mut Header,
     alg: Option<Label>,
 ) -> Result<(), Error> {
     let Some(alg) = alg else {
         return Ok(());
     };
     match protected.alg()? {
-        Some(existing) if existing != alg => Err(Error::Custom(format!(
-            "algorithm mismatch, header has {existing}, crypto provider has {alg}"
-        ))),
+        Some(existing) if existing != alg => Err(Error::AlgorithmMismatch {
+            declared: existing.to_string(),
+            expected: alg.to_string(),
+        }),
         Some(_) => Ok(()),
         None => {
+            if let Some(existing) = unprotected.alg()? {
+                if existing != alg {
+                    return Err(Error::AlgorithmMismatch {
+                        declared: existing.to_string(),
+                        expected: alg.to_string(),
+                    });
+                }
+                unprotected.remove(crate::iana::HeaderParameterAlg);
+            }
             protected.set_alg(alg);
             Ok(())
         }
@@ -79,13 +164,22 @@ pub(crate) fn ensure_protected_alg(
 
 /// On the verifying/decrypting side: checks the protected header's `alg`
 /// matches the verifier's algorithm, when both are present.
-pub(crate) fn check_protected_alg(protected: &Header, alg: Option<Label>) -> Result<(), Error> {
+pub(crate) fn check_protected_alg(
+    protected: &Header,
+    unprotected: &Header,
+    alg: Option<Label>,
+) -> Result<(), Error> {
     if let Some(expected) = alg {
-        if let Some(existing) = protected.alg()? {
+        let existing = match protected.alg()? {
+            Some(existing) => Some(existing),
+            None => unprotected.alg()?,
+        };
+        if let Some(existing) = existing {
             if existing != expected {
-                return Err(Error::Custom(format!(
-                    "algorithm mismatch, header has {existing}, verifier has {expected}"
-                )));
+                return Err(Error::AlgorithmMismatch {
+                    declared: existing.to_string(),
+                    expected: expected.to_string(),
+                });
             }
         }
     }
@@ -93,21 +187,30 @@ pub(crate) fn check_protected_alg(protected: &Header, alg: Option<Label>) -> Res
 }
 
 /// Checks whether a verifier key identifier matches a message key identifier.
-pub(crate) fn kid_matches(message_kid: Option<&[u8]>, verifier_kid: Option<&[u8]>) -> bool {
+pub(crate) fn kid_match_rank(
+    message_kid: Option<&[u8]>,
+    verifier_kid: Option<&[u8]>,
+) -> Option<u8> {
     match (message_kid, verifier_kid) {
-        (Some(message_kid), Some(verifier_kid)) => message_kid == verifier_kid,
-        (None, None) => true,
-        _ => false,
+        (Some(message_kid), Some(verifier_kid)) if message_kid == verifier_kid => Some(0),
+        (Some(_), Some(_)) => None,
+        _ => Some(1),
     }
 }
 
 /// Writes `kid` into the unprotected header if absent.
-pub(crate) fn ensure_unprotected_kid(unprotected: &mut Header, kid: Option<&[u8]>) {
+pub(crate) fn ensure_unprotected_kid(
+    protected: &Header,
+    unprotected: &mut Header,
+    kid: Option<&[u8]>,
+) -> Result<(), Error> {
     if let Some(kid) = kid {
-        if !unprotected.contains_key(crate::iana::HeaderParameterKid) {
+        if protected.kid()?.is_none() && !unprotected.contains_key(crate::iana::HeaderParameterKid)
+        {
             unprotected.set_kid(kid.to_vec());
         }
     }
+    Ok(())
 }
 
 /// Looks a byte-string header parameter up in the protected bucket first, then

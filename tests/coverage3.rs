@@ -63,8 +63,8 @@ fn key_ops_non_label_and_deserialize() {
 }
 
 #[test]
-fn sign_kid_present_but_verifier_has_none() {
-    // kid_matches mismatch arm: message signature has a kid, verifier does not.
+fn sign_kid_is_only_a_verifier_hint() {
+    // A verifier selected explicitly remains usable when either side omits kid.
     let signer = MockSigner::new(iana::AlgorithmEdDSA, b"k");
     let signers: [&dyn cose2::Signer; 1] = [&signer];
     let mut msg = SignMessage::new(Some(b"p".to_vec()));
@@ -73,7 +73,7 @@ fn sign_kid_present_but_verifier_has_none() {
 
     let no_kid = MockVerifier::new(iana::AlgorithmEdDSA, b""); // kid() -> None
     let verifiers: [&dyn cose2::Verifier; 1] = [&no_kid];
-    assert!(decoded.verify(&verifiers, None).is_err());
+    assert!(decoded.verify(&verifiers, None).is_ok());
 }
 
 #[test]

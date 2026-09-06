@@ -4,19 +4,19 @@ use cbor2::Cbor;
 
 use crate::{
     header::{decode_protected, encode_protected, validate_header_buckets},
-    iana, tag, util, Error, Header, Label, Signer, Value, Verifier,
+    iana, tag, util, Error, Header, Label, Signer, Verifier,
 };
 
 /// The on-the-wire COSE_Sign1 array: `[protected, unprotected, payload, signature]`.
 #[derive(Clone, Debug, PartialEq, Cbor)]
 #[cbor(tag = 18, array)]
 struct Sign1Wire {
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::strict::bytes")]
     protected: Vec<u8>,
     unprotected: Header,
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::strict::optional_bytes")]
     payload: Option<Vec<u8>>,
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::strict::bytes")]
     signature: Vec<u8>,
 }
 
@@ -33,7 +33,7 @@ pub struct Sign1Message {
     pub payload: Option<Vec<u8>>,
     signature: Vec<u8>,
     protected_raw: Vec<u8>,
-    signed: bool,
+    state: util::OperationState,
 }
 
 impl Sign1Message {
@@ -59,12 +59,12 @@ impl Sign1Message {
         external_aad: &[u8],
         payload: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        util::encode_structure(vec![
-            Value::from("Signature1"),
-            Value::Bytes(protected_raw.to_vec()),
-            Value::Bytes(external_aad.to_vec()),
-            util::payload_value(payload),
-        ])
+        util::encode_structure(&(
+            "Signature1",
+            serde_bytes::Bytes::new(protected_raw),
+            serde_bytes::Bytes::new(external_aad),
+            serde_bytes::Bytes::new(payload),
+        ))
     }
 
     /// Prepares this embedded-payload message for an external signature.
@@ -79,10 +79,10 @@ impl Sign1Message {
         kid: Option<&[u8]>,
         external_aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, Error> {
+        self.prepare_signature_headers(alg, kid)?;
         let payload =
-            util::require_embedded_payload(&self.payload, "Sign1Message::prepare_signature")?
-                .to_vec();
-        self.prepare_signature_payload(alg, kid, &payload, external_aad.unwrap_or(&[]))
+            util::require_embedded_payload(&self.payload, "Sign1Message::prepare_signature")?;
+        Self::to_be_signed(&self.protected_raw, external_aad.unwrap_or(&[]), payload)
     }
 
     /// Prepares this detached-payload message for an external signature.
@@ -97,33 +97,29 @@ impl Sign1Message {
         detached_payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, Error> {
-        let tbs = self.prepare_signature_payload(
-            alg,
-            kid,
-            detached_payload,
+        self.prepare_signature_headers(alg, kid)?;
+        let tbs = Self::to_be_signed(
+            &self.protected_raw,
             external_aad.unwrap_or(&[]),
+            detached_payload,
         )?;
         self.payload = None;
         Ok(tbs)
     }
 
-    fn prepare_signature_payload(
+    fn prepare_signature_headers(
         &mut self,
         alg: Option<Label>,
         kid: Option<&[u8]>,
-        payload: &[u8],
-        external_aad: &[u8],
-    ) -> Result<Vec<u8>, Error> {
-        util::ensure_protected_alg(&mut self.protected, alg)?;
-        util::ensure_unprotected_kid(&mut self.unprotected, kid);
+    ) -> Result<(), Error> {
+        util::ensure_protected_alg(&mut self.protected, &mut self.unprotected, alg)?;
+        util::ensure_unprotected_kid(&self.protected, &mut self.unprotected, kid)?;
         validate_header_buckets(&self.protected, &self.unprotected)?;
-
         let protected_raw = encode_protected(&self.protected)?;
-        let tbs = Self::to_be_signed(&protected_raw, external_aad, payload)?;
         self.protected_raw = protected_raw;
+        self.state = util::OperationState::Prepared;
         self.signature.clear();
-        self.signed = false;
-        Ok(tbs)
+        Ok(())
     }
 
     /// Stores externally produced signature bytes on this message.
@@ -135,18 +131,22 @@ impl Sign1Message {
     /// protected header canonically, which is valid for newly built messages.
     pub fn set_signature(&mut self, signature: impl Into<Vec<u8>>) -> Result<(), Error> {
         validate_header_buckets(&self.protected, &self.unprotected)?;
-        if self.protected_raw.is_empty() && !self.protected.is_empty() {
+        if !self.state.initialized() {
             self.protected_raw = encode_protected(&self.protected)?;
         }
+        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
         self.signature = signature.into();
-        self.signed = true;
+        self.state = util::OperationState::Complete;
         Ok(())
     }
 
     /// Signs the message with `signer`, filling in `alg`/`kid` headers as needed.
     pub fn sign(&mut self, signer: &dyn Signer, external_aad: Option<&[u8]>) -> Result<(), Error> {
-        let payload = util::require_embedded_payload(&self.payload, "Sign1Message::sign")?.to_vec();
-        self.sign_payload(signer, &payload, external_aad.unwrap_or(&[]))
+        self.prepare_signature_headers(signer.alg(), signer.kid())?;
+        let payload = util::require_embedded_payload(&self.payload, "Sign1Message::sign")?;
+        let tbs = Self::to_be_signed(&self.protected_raw, external_aad.unwrap_or(&[]), payload)?;
+        let signature = signer.sign(&tbs)?;
+        self.set_signature(signature)
     }
 
     /// Signs a detached payload.
@@ -159,21 +159,16 @@ impl Sign1Message {
         detached_payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        self.sign_payload(signer, detached_payload, external_aad.unwrap_or(&[]))?;
+        self.prepare_signature_headers(signer.alg(), signer.kid())?;
+        let tbs = Self::to_be_signed(
+            &self.protected_raw,
+            external_aad.unwrap_or(&[]),
+            detached_payload,
+        )?;
+        let signature = signer.sign(&tbs)?;
+        self.set_signature(signature)?;
         self.payload = None;
         Ok(())
-    }
-
-    fn sign_payload(
-        &mut self,
-        signer: &dyn Signer,
-        payload: &[u8],
-        external_aad: &[u8],
-    ) -> Result<(), Error> {
-        let tbs =
-            self.prepare_signature_payload(signer.alg(), signer.kid(), payload, external_aad)?;
-        let signature = signer.sign(&tbs)?;
-        self.set_signature(signature)
     }
 
     /// Signs and encodes the message, returning the tagged COSE_Sign1 bytes.
@@ -202,6 +197,11 @@ impl Sign1Message {
         self.encode(tag::SIGN1_PREFIX)
     }
 
+    /// Encodes this tagged COSE_Sign1 as a CWT (`61(18(...))`).
+    pub fn to_cwt_vec(&self) -> Result<Vec<u8>, Error> {
+        self.encode(tag::CWT_SIGN1_PREFIX)
+    }
+
     /// Encodes a signed message to canonical COSE_Sign1 bytes without the CBOR tag.
     pub fn to_untagged_vec(&self) -> Result<Vec<u8>, Error> {
         self.encode(&[])
@@ -209,17 +209,19 @@ impl Sign1Message {
 
     /// Serializes the wire array borrowing this message's buffers.
     fn encode(&self, prefix: &[u8]) -> Result<Vec<u8>, Error> {
-        if !self.signed {
-            return Err(Error::Custom(
+        if !self.state.complete() {
+            return Err(Error::InvalidState(
                 "Sign1Message must be signed before encoding".into(),
             ));
         }
         validate_header_buckets(&self.protected, &self.unprotected)?;
+        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        let unprotected = util::canonical_raw(&self.unprotected)?;
         util::encode_prefixed(
             prefix,
             &(
                 serde_bytes::Bytes::new(&self.protected_raw),
-                &self.unprotected,
+                &unprotected,
                 self.payload.as_deref().map(serde_bytes::Bytes::new),
                 serde_bytes::Bytes::new(&self.signature),
             ),
@@ -228,10 +230,7 @@ impl Sign1Message {
 
     /// Decodes a COSE_Sign1 message (tagged or untagged) without verifying it.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
-        let body = tag::strip_message_wrappers(data);
-        if !body.starts_with(tag::SIGN1_PREFIX) && tag::starts_with_cbor_tag(body) {
-            return Err(Error::Custom("unexpected CBOR tag for COSE_Sign1".into()));
-        }
+        let body = tag::message_body(data, Self::TAG)?;
         let wire: Sign1Wire = cbor2::from_slice(body)?;
         let protected = decode_protected(&wire.protected)?;
         validate_header_buckets(&protected, &wire.unprotected)?;
@@ -241,7 +240,7 @@ impl Sign1Message {
             payload: wire.payload,
             signature: wire.signature,
             protected_raw: wire.protected,
-            signed: true,
+            state: util::OperationState::Complete,
         })
     }
 
@@ -254,8 +253,8 @@ impl Sign1Message {
         verifier: &dyn Verifier,
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        if !self.signed {
-            return Err(Error::Custom(
+        if !self.state.complete() {
+            return Err(Error::InvalidState(
                 "Sign1Message must be decoded before verifying".into(),
             ));
         }
@@ -270,8 +269,8 @@ impl Sign1Message {
         detached_payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        if !self.signed {
-            return Err(Error::Custom(
+        if !self.state.complete() {
+            return Err(Error::InvalidState(
                 "Sign1Message must be decoded before verifying".into(),
             ));
         }
@@ -289,7 +288,10 @@ impl Sign1Message {
         payload: &[u8],
         external_aad: &[u8],
     ) -> Result<(), Error> {
-        util::check_protected_alg(&self.protected, verifier.alg())?;
+        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        self.protected
+            .ensure_crit_understood(verifier.understood_critical_headers())?;
+        util::check_protected_alg(&self.protected, &self.unprotected, verifier.alg())?;
         let tbs = Self::to_be_signed(&self.protected_raw, external_aad, payload)?;
         verifier.verify(&tbs, &self.signature)
     }

@@ -128,7 +128,9 @@ impl CoseMap {
 
     /// Decodes a `CoseMap` from CBOR bytes.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
-        Ok(cbor2::from_slice(data)?)
+        crate::strict::validate_map(data)?;
+        let map = cbor2::from_slice::<BTreeMap<Label, Value>>(data)?;
+        Ok(CoseMap(map))
     }
 
     /// Encodes the map to canonical (deterministic) CBOR bytes.
@@ -202,6 +204,14 @@ impl<'de> Deserialize<'de> for CoseMap {
             }
         }
 
-        deserializer.deserialize_map(MapVisitor)
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_map(MapVisitor)
+        } else {
+            let raw = cbor2::RawValue::deserialize(deserializer)?;
+            crate::strict::validate_map(raw.as_bytes()).map_err(serde::de::Error::custom)?;
+            let map = cbor2::from_slice::<BTreeMap<Label, Value>>(raw.as_bytes())
+                .map_err(serde::de::Error::custom)?;
+            Ok(CoseMap(map))
+        }
     }
 }

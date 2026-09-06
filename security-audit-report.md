@@ -1,92 +1,66 @@
-# Security Review: cose2
+# Security and Protocol Review: cose2 0.5
 
-## Scope
+Date: 2026-09-06
+Base revision: `847d74aef0217139ec188dd4be5d3a2e10caaaf4`
+Scope: the complete `cose2` and `sd-cwt` runtime, public decoders, optional
+crypto providers, tests, examples, documentation, packaging, and CI.
 
-Standard repository-wide security scan of cose2, a Rust COSE/CWT library. The deterministic inventory selected all 21 runtime source-like files for deep review.
+The review used RFC 9052, RFC 9053, RFC 8392,
+`draft-ietf-spice-sd-cwt-08`, and the IANA COSE registry. The resulting 0.5
+working-tree changes close every validated finding below.
 
-- Scan mode: repository
-- Target kind: git_worktree
-- Target ID: target_sha256_abdeef65af2465cb9f058ce7570b8c6ee7a4295c045a0c66c4f50aad196bd53f
-- Revision: 4e643d819c2b39b8a080d2cb9b389434408f2cd4
-- Snapshot digest: codex-security-snapshot/v1:sha256:af637baa0821172ac115eaee661c2d3388dff23dd4d27e220776aca6d2bb77cf
-- Inventory strategy: repository
-- Included paths: .
-- Excluded paths: none
-- Runtime or test status: Source review plus targeted local test evidence from discovery workers; no code changes were made by the scan.
-- Artifacts reviewed: AGENTS.md repository instructions, Cargo.toml, 21 source-like files from deterministic rank_input.jsonl, targeted README, docs, tests, and examples as supporting evidence
-- Scan context: The scan used a generated repository threat model and a 100% deep-review worklist over deterministic source-like runtime files. Discovery, validation, and attack-path receipts were saved under artifacts/.
+## Remediated findings
 
-Limitations and exclusions:
-- Docs, examples, and tests were not treated as deployed runtime surfaces; selected files were read as supporting evidence.
-- No remediation was applied because no reportable findings survived validation and attack-path analysis.
-- Excluded tests/\*\*: Test code was not treated as a deployed runtime surface; targeted tests were read as supporting evidence for reviewed controls.
-- Excluded examples/\*\*: Examples were not treated as deployed runtime surfaces; selected examples were read as API guidance evidence.
-- Excluded docs/\*\*: Documentation was not treated as runtime code; selected docs were read to validate public API contract and policy boundaries.
+| Finding | Prior behavior | Remediation | Regression evidence |
+| --- | --- | --- | --- |
+| SD-CWT stack exhaustion | A chain of shallow disclosures could assemble unbounded recursive depth and abort the process. | `ProcessingLimits` bounds depth, visited items, disclosure count/bytes, and container size before recursion becomes unsafe. | `sd-cwt/tests/hardening.rs::disclosure_chain_hits_limit_without_overflowing_stack` |
+| Incorrect CWT tag placement | `Claims::to_vec` emitted `61(claims-map)` inside the COSE payload. | Claims Sets are untagged; every top-level message has `to_cwt_vec` for `61(COSE_Tagged(...))`; legacy storage has explicit compatibility methods. | `tests/context_cwt.rs`, `tests/hardening.rs::cwt_wrapper_is_outside_the_cose_message` |
+| Permissive CBOR coercion | Arrays of integers and tagged byte strings could be accepted as protocol `bstr` fields; nested duplicate keys survived. | A strict raw-CBOR layer validates exact wire types, semantic tags, recursive duplicate keys, depth, item count, and complete consumption. | `tests/hardening.rs::message_decoder_enforces_wire_types_and_semantic_tags`, `nested_duplicate_map_keys_are_rejected` |
+| Ignored `key_ops` | Built-in sign, verify, MAC, and AEAD providers ignored COSE_Key operation restrictions. | Providers retain `key_ops` and enforce the allowed direction on every operation; exported keys retain or narrow operations appropriately. | `tests/hardening.rs`, `tests/crypto_aws_lc_rs.rs::aws_lc_rs_enforces_key_ops` |
+| Protected-header state split | Public parsed headers could differ from the raw bytes used for cryptography while verification still succeeded. | A three-state operation lifecycle and semantic raw/header comparison reject changed protected headers while preserving non-preferred decoded bytes. | `tests/hardening.rs::changing_protected_header_invalidates_authenticated_state`, RFC non-canonical vector tests |
+| Missing fully specified signatures | SD-CWT examples and providers used generic EdDSA/ES identifiers and lacked current IANA identifiers. | Added all currently assigned numeric COSE algorithms, Ed25519/ESP256/ESP384 provider support, and fully specified SD-CWT examples. | `tests/core.rs::iana_constants_match_registry`, provider tests, live IANA CI check |
+| Incomplete SD-CWT validation | Indefinite CBOR, repeated salts, empty disclosure arrays, illegal map keys/tags, ignored `CWT_Claims`, missing claims, invalid time relationships, and unsafe AEAD metadata could pass helper APIs. | Added strict disclosure parsing, aggregate budgets, `CWT_Claims` restoration/cross-checking, `SdCwtValidator`, combined verify/validate/restore API, draft-required header/claim/time checks, profile content types, and AEAD allow-list/tag checks. | `sd-cwt/tests/hardening.rs` |
+| Incomplete recipient validation | Direct, KDF, and ECDH recipient parameter rules were incomplete; empty nested arrays were accepted and protected bytes were lost. | Algorithm classes now enforce zero-length fields, bounded nesting, and required KDF/ECDH parameters. Embedded ECDH sender keys must be valid public EC2/OKP keys without private material. Recipient and KDF structures retain exact protected bytes. | `tests/hardening.rs::recipient_enforces_algorithm_specific_shape_and_preserves_raw_header`, RFC vectors |
+| CWT claim type loss | Text keys such as `"exp"` were reinterpreted as integer claim 4; multi-audience, fractional, and pre-epoch dates were rejected. | A dedicated CBOR codec keeps text and integer labels distinct. `Audience` and `NumericDate` model the complete RFC forms without saturating time arithmetic. | `tests/hardening.rs::claims_keep_text_keys_distinct_and_support_full_value_domain`, `tests/context_cwt.rs` |
+| `kid` and `alg` routing | `alg` in the unprotected bucket was ignored; optional `kid` was treated as a hard multi-signature gate; automatic `kid` insertion could duplicate a protected value. | Header resolution is protected-first, algorithm values are always compared, and `kid` ranks candidates as a hint with cryptographic verification as the decision. | `tests/hardening.rs::algorithm_resolution_checks_unprotected_and_kid_uses_both_buckets`, multi-signature tests |
+| Critical headers not enforced | One-step verification/decryption could succeed with an unknown critical parameter. | Providers declare application critical labels through `understood_critical_headers`; high-level operations reject all others. | `tests/hardening.rs::high_level_verification_enforces_critical_headers` |
+| Ed25519 `x`/`d` mismatch | The dalek signer ignored an inconsistent optional public key. | Import recomputes and checks `x` whenever it is present. | `tests/hardening.rs::dalek_rejects_mismatched_private_and_public_key` |
+| KeySet behavior | Default decoding rejected a whole set for one malformed member, contrary to RFC 9052 independent processing. | Default decode keeps valid members; `from_slice_strict` preserves all-or-nothing behavior. | `tests/core.rs::keyset_decode_is_rfc_compliant_by_default_and_has_strict_option` |
 
-### Scan Summary
+## Performance and dependency hardening
 
-| Field               | Value                                                                                                          |
-| ------------------- | -------------------------------------------------------------------------------------------------------------- |
-| Reportable findings | 0                                                                                                              |
-| Severity mix        | none                                                                                                           |
-| Confidence mix      | none                                                                                                           |
-| Coverage            | complete                                                                                                       |
-| Validation mode     | Static source review with targeted existing-test evidence and candidate-level validation/attack-path analysis. |
+- Authenticated structures serialize borrowed byte slices rather than allocating
+  a dynamic `Value` tree and copying payload/AAD buffers.
+- Message encoders canonicalize small map-containing fragments, then stream
+  large payload and ciphertext byte strings into exactly sized output buffers.
+- Embedded decryption no longer copies the stored ciphertext; ring in-place
+  decryption returns its existing buffer after truncation.
+- Detached encrypt-and-encode transfers ciphertext ownership to the caller.
+- SD-CWT duplicate detection uses hash sets rather than repeated linear scans.
+- Crypto provider clones share retained secret material and cipher state.
+- AES-GCM disables unused default RNG support and enables zeroization for its
+  expanded cipher state. The default cose2 feature set remains crypto-free.
 
-Canonical artifacts: `scan-manifest.json`, `findings.json`, and `coverage.json`. This report is a deterministic projection of those files.
+On the review host, the supplied probes measured authenticated-structure
+encoding about 30% faster for a small payload and 55–65% faster for 64 KiB to
+1 MiB payloads. An 8,000-key SD-CWT restore fell from roughly 83 ms to roughly
+0.4 ms, with linear rather than quadratic growth. These are microbenchmarks and
+absolute timings are machine-dependent.
 
-## Threat Model
+## Remaining protocol boundary
 
-`cose2` is a Rust library for COSE and CWT wire structures. Its primary trust boundary is untrusted CBOR/COSE/CWT data entering parsing, validation, signing, verification, MAC, encryption, decryption, and optional `crypto-ring` provider construction APIs. The main risks are protocol-soundness failures around protected bytes, AAD, detached data, nonces, headers, claims, key material, and algorithm selection.
+`sd-cwt` validates disclosure mechanics and draft structure but still does not
+implement KBT signing, confirmation-key trust, certificate validation, nonce
+freshness storage, expected identity/audience policy, current-time policy, or
+application privacy policy. Those operations require application keys, trust
+anchors, and transaction state. The combined
+`verify_validate_and_restore_sd_cwt` API verifies the issuer signature and
+performs the draft structural and disclosure checks supported by its inputs.
 
-### Assets
+## Verification gates
 
-- COSE message authenticity, integrity, and confidentiality
-- CWT claim validity and custom claim preservation
-- Canonical protected header/key encoding for newly built messages
-- Raw decoded protected-header bytes used for verification/decryption structures
-- Optional `crypto-ring` algorithm and key-material correctness
-
-### Trust Boundaries
-
-- Untrusted encoded COSE/CWT/CBOR bytes versus the library APIs that decode and construct authenticated structures.
-- Application/operator-controlled key material and key-use policy versus this crate's structural key/provider validation.
-- Caller-controlled external AAD and detached bytes versus message creation and verification/decryption helpers.
-- Feature-gated optional `ring` crypto backend versus the crypto-free default build.
-
-### Attacker Capabilities
-
-- Supply untrusted COSE/CWT/CBOR bytes, including unusual encodings, headers, payloads, ciphertexts, signatures, tags, recipients, and claims.
-- Supply mismatched detached payloads, detached ciphertexts, or external AAD through an embedding application.
-- Attempt algorithm confusion, malformed `crit`, duplicate labels, unsupported algorithms, invalid key parameters, or nonce misuse patterns.
-
-### Security Objectives
-
-- Authenticate exactly the protected-header bytes and AAD required by RFC 9052 structures.
-- Fail closed on malformed message, header, key, recipient, CWT, map, label, and optional crypto provider inputs.
-- Keep the default build crypto-free and gate `ring` behind `crypto-ring`.
-- Expose explicit APIs for detached payload/ciphertext and nonce construction so callers do not silently skip security-critical bytes.
-
-### Assumptions
-
-- The crate does not decide whether a key is trusted for a business identity; key trust and key-use policy are application-owned.
-- The crate does not generate randomness or nonces; AEAD nonce uniqueness is an embedding application's responsibility.
-- Applications processing untrusted messages must enforce private critical-header understanding with `Header::ensure_crit_understood`.
-- Optional crypto providers must reject unsupported algorithm/key combinations rather than silently falling back.
-
-## Findings
-
-### No findings
-
-No reportable findings survived the canonical discovery, validation, and reportability gates.
-
-## Reviewed Surfaces
-
-| Surface                                     | Risk Area                                                                                         | Outcome        | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Signature messages and headers              | COSE signature integrity, protected header bytes, detached payloads, AAD, and algorithm selection | No issue found | Reviewed `Sign1Message`, `SignMessage`, `Header`, and shared structure helpers. Protected-header raw bytes are preserved for verification, detached payload APIs are explicit, `crit` is structurally validated, and `alg` selection uses protected headers. Evidence: artifacts/02_discovery/work_ledger.jsonl, artifacts/03_coverage/repository_coverage_ledger.md                                                                                                                                                                                                                                                                                                                                            |
-| MAC messages and recipients                 | MAC authenticity, external AAD, and recipient structure                                           | No issue found | Reviewed `Mac0Message`, `MacMessage`, `Recipient`, and `KdfContext`. MAC structures bind expected fields, recipients are structurally validated, and recipient cryptography is application-owned. Evidence: artifacts/02_discovery/work_ledger.jsonl, artifacts/03_coverage/repository_coverage_ledger.md                                                                                                                                                                                                                                                                                                                                                                                                       |
-| Encryption messages and nonce handling      | AEAD AAD, IV/Partial IV, detached ciphertext, and empty plaintext                                 | No issue found | Reviewed `Encrypt0Message`, `EncryptMessage`, `Encryptor`, tag helpers, and nonce helpers. AAD is bound, decoded protected bytes are reused, IV/PIV conflicts and malformed sizes fail closed, and detached ciphertext APIs are explicit. Evidence: artifacts/02_discovery/work_ledger.jsonl, artifacts/03_coverage/repository_coverage_ledger.md                                                                                                                                                                                                                                                                                                                                                               |
-| Optional `crypto-ring` providers and keys   | Feature gating, algorithm mapping, key material parsing, AEAD nonce size, and key-use metadata    | Rejected       | Reviewed feature gating, algorithm mapping, key parsing, AEAD nonce length, and `key_ops`. One candidate around `key_ops` enforcement was validated and rejected because key-use policy is application-owned under the current crate contract. Evidence: artifacts/02_discovery/work_ledger.jsonl, artifacts/02_discovery/raw_candidates.jsonl, artifacts/04_reconciliation/deduped_candidates.jsonl, artifacts/05_findings/cose2-crypto-key-ops-not-enforced/candidate_ledger.jsonl, artifacts/05_findings/cose2-crypto-key-ops-not-enforced/validation_report.md, artifacts/05_findings/cose2-crypto-key-ops-not-enforced/attack_path_analysis_report.md, artifacts/03_coverage/repository_coverage_ledger.md |
-| CWT claims and validation                   | Custom claims, temporal validation, issuer, and audience                                          | No issue found | Reviewed `Claims`, `ClaimsMap`, and `Validator`. Custom claims are preserved and expiration, not-before, issued-at, issuer, and audience checks fail closed under the documented validator semantics. Evidence: artifacts/02_discovery/work_ledger.jsonl, artifacts/03_coverage/repository_coverage_ledger.md                                                                                                                                                                                                                                                                                                                                                                                                   |
-| Core maps, labels, tags, and public exports | Duplicate labels, label type confusion, unsafe/default-safety guarantees, and public API guidance | No issue found | Reviewed `CoseMap`, `Label`, `Error`, `lib.rs`, tag helpers, and public guidance. Duplicate labels and label type confusion fail closed; unsafe is forbidden and default features are crypto-free. Evidence: artifacts/02_discovery/work_ledger.jsonl, artifacts/03_coverage/repository_coverage_ledger.md                                                                                                                                                                                                                                                                                                                                                                                                      |
+The repository requires formatting, clippy with warnings denied, full tests,
+rustdoc with warnings denied, the Rust 1.89 MSRV, aws-lc-rs-only checks,
+standalone backend checks, package construction, fuzz-target compilation,
+coverage, IANA registry comparison, and a RustSec dependency audit. CI now
+contains matching jobs and an 85% minimum line-coverage gate.

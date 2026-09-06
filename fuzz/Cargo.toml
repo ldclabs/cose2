@@ -1,0 +1,29 @@
+[package]
+name = "cose2-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cose2 = { path = "..", features = ["crypto-ring", "crypto-ed25519-dalek", "crypto-aes-gcm"] }
+sd-cwt = { path = "../sd-cwt" }
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sd_cwt"
+path = "fuzz_targets/sd_cwt.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

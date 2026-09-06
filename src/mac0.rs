@@ -4,19 +4,19 @@ use cbor2::Cbor;
 
 use crate::{
     header::{decode_protected, encode_protected, validate_header_buckets},
-    iana, tag, util, Error, Header, Label, Macer, Value,
+    iana, tag, util, Error, Header, Label, Macer,
 };
 
 /// The on-the-wire COSE_Mac0 array: `[protected, unprotected, payload, tag]`.
 #[derive(Clone, Debug, PartialEq, Cbor)]
 #[cbor(tag = 17, array)]
 struct Mac0Wire {
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::strict::bytes")]
     protected: Vec<u8>,
     unprotected: Header,
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::strict::optional_bytes")]
     payload: Option<Vec<u8>>,
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::strict::bytes")]
     tag: Vec<u8>,
 }
 
@@ -33,7 +33,7 @@ pub struct Mac0Message {
     pub payload: Option<Vec<u8>>,
     tag: Vec<u8>,
     protected_raw: Vec<u8>,
-    computed: bool,
+    state: util::OperationState,
 }
 
 impl Mac0Message {
@@ -56,12 +56,12 @@ impl Mac0Message {
         external_aad: &[u8],
         payload: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        util::encode_structure(vec![
-            Value::from("MAC0"),
-            Value::Bytes(protected_raw.to_vec()),
-            Value::Bytes(external_aad.to_vec()),
-            util::payload_value(payload),
-        ])
+        util::encode_structure(&(
+            "MAC0",
+            serde_bytes::Bytes::new(protected_raw),
+            serde_bytes::Bytes::new(external_aad),
+            serde_bytes::Bytes::new(payload),
+        ))
     }
 
     /// Prepares this embedded-payload message for an externally produced tag.
@@ -75,9 +75,9 @@ impl Mac0Message {
         kid: Option<&[u8]>,
         external_aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, Error> {
-        let payload =
-            util::require_embedded_payload(&self.payload, "Mac0Message::prepare_tag")?.to_vec();
-        self.prepare_tag_payload(alg, kid, &payload, external_aad.unwrap_or(&[]))
+        self.prepare_tag_headers(alg, kid)?;
+        let payload = util::require_embedded_payload(&self.payload, "Mac0Message::prepare_tag")?;
+        Self::to_be_maced(&self.protected_raw, external_aad.unwrap_or(&[]), payload)
     }
 
     /// Prepares this detached-payload message for an externally produced tag.
@@ -91,47 +91,46 @@ impl Mac0Message {
         detached_payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, Error> {
-        let tbm =
-            self.prepare_tag_payload(alg, kid, detached_payload, external_aad.unwrap_or(&[]))?;
+        self.prepare_tag_headers(alg, kid)?;
+        let tbm = Self::to_be_maced(
+            &self.protected_raw,
+            external_aad.unwrap_or(&[]),
+            detached_payload,
+        )?;
         self.payload = None;
         Ok(tbm)
     }
 
-    fn prepare_tag_payload(
-        &mut self,
-        alg: Option<Label>,
-        kid: Option<&[u8]>,
-        payload: &[u8],
-        external_aad: &[u8],
-    ) -> Result<Vec<u8>, Error> {
-        util::ensure_protected_alg(&mut self.protected, alg)?;
-        util::ensure_unprotected_kid(&mut self.unprotected, kid);
+    fn prepare_tag_headers(&mut self, alg: Option<Label>, kid: Option<&[u8]>) -> Result<(), Error> {
+        util::ensure_protected_alg(&mut self.protected, &mut self.unprotected, alg)?;
+        util::ensure_unprotected_kid(&self.protected, &mut self.unprotected, kid)?;
         validate_header_buckets(&self.protected, &self.unprotected)?;
-
         let protected_raw = encode_protected(&self.protected)?;
-        let tbm = Self::to_be_maced(&protected_raw, external_aad, payload)?;
         self.protected_raw = protected_raw;
+        self.state = util::OperationState::Prepared;
         self.tag.clear();
-        self.computed = false;
-        Ok(tbm)
+        Ok(())
     }
 
     /// Stores externally produced tag bytes on this message.
     pub fn set_tag(&mut self, tag: impl Into<Vec<u8>>) -> Result<(), Error> {
         validate_header_buckets(&self.protected, &self.unprotected)?;
-        if self.protected_raw.is_empty() && !self.protected.is_empty() {
+        if !self.state.initialized() {
             self.protected_raw = encode_protected(&self.protected)?;
         }
+        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
         self.tag = tag.into();
-        self.computed = true;
+        self.state = util::OperationState::Complete;
         Ok(())
     }
 
     /// Computes the authentication tag with `macer`.
     pub fn compute(&mut self, macer: &dyn Macer, external_aad: Option<&[u8]>) -> Result<(), Error> {
-        let payload =
-            util::require_embedded_payload(&self.payload, "Mac0Message::compute")?.to_vec();
-        self.compute_payload(macer, &payload, external_aad.unwrap_or(&[]))
+        self.prepare_tag_headers(macer.alg(), macer.kid())?;
+        let payload = util::require_embedded_payload(&self.payload, "Mac0Message::compute")?;
+        let tbm = Self::to_be_maced(&self.protected_raw, external_aad.unwrap_or(&[]), payload)?;
+        let tag = macer.mac_create(&tbm)?;
+        self.set_tag(tag)
     }
 
     /// Computes the authentication tag over a detached payload.
@@ -144,20 +143,16 @@ impl Mac0Message {
         detached_payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        self.compute_payload(macer, detached_payload, external_aad.unwrap_or(&[]))?;
+        self.prepare_tag_headers(macer.alg(), macer.kid())?;
+        let tbm = Self::to_be_maced(
+            &self.protected_raw,
+            external_aad.unwrap_or(&[]),
+            detached_payload,
+        )?;
+        let tag = macer.mac_create(&tbm)?;
+        self.set_tag(tag)?;
         self.payload = None;
         Ok(())
-    }
-
-    fn compute_payload(
-        &mut self,
-        macer: &dyn Macer,
-        payload: &[u8],
-        external_aad: &[u8],
-    ) -> Result<(), Error> {
-        let tbm = self.prepare_tag_payload(macer.alg(), macer.kid(), payload, external_aad)?;
-        let tag = macer.mac_create(&tbm)?;
-        self.set_tag(tag)
     }
 
     /// Computes the tag and encodes the message to tagged COSE_Mac0 bytes.
@@ -186,6 +181,11 @@ impl Mac0Message {
         self.encode(tag::MAC0_PREFIX)
     }
 
+    /// Encodes this tagged COSE_Mac0 as a CWT (`61(17(...))`).
+    pub fn to_cwt_vec(&self) -> Result<Vec<u8>, Error> {
+        self.encode(tag::CWT_MAC0_PREFIX)
+    }
+
     /// Encodes a computed message to canonical COSE_Mac0 bytes without the CBOR tag.
     pub fn to_untagged_vec(&self) -> Result<Vec<u8>, Error> {
         self.encode(&[])
@@ -193,17 +193,19 @@ impl Mac0Message {
 
     /// Serializes the wire array borrowing this message's buffers.
     fn encode(&self, prefix: &[u8]) -> Result<Vec<u8>, Error> {
-        if !self.computed {
-            return Err(Error::Custom(
+        if !self.state.complete() {
+            return Err(Error::InvalidState(
                 "Mac0Message must be computed before encoding".into(),
             ));
         }
         validate_header_buckets(&self.protected, &self.unprotected)?;
+        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        let unprotected = util::canonical_raw(&self.unprotected)?;
         util::encode_prefixed(
             prefix,
             &(
                 serde_bytes::Bytes::new(&self.protected_raw),
-                &self.unprotected,
+                &unprotected,
                 self.payload.as_deref().map(serde_bytes::Bytes::new),
                 serde_bytes::Bytes::new(&self.tag),
             ),
@@ -212,10 +214,7 @@ impl Mac0Message {
 
     /// Decodes a COSE_Mac0 message (tagged or untagged) without verifying it.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
-        let body = tag::strip_message_wrappers(data);
-        if !body.starts_with(tag::MAC0_PREFIX) && tag::starts_with_cbor_tag(body) {
-            return Err(Error::Custom("unexpected CBOR tag for COSE_Mac0".into()));
-        }
+        let body = tag::message_body(data, Self::TAG)?;
         let wire: Mac0Wire = cbor2::from_slice(body)?;
         let protected = decode_protected(&wire.protected)?;
         validate_header_buckets(&protected, &wire.unprotected)?;
@@ -225,14 +224,14 @@ impl Mac0Message {
             payload: wire.payload,
             tag: wire.tag,
             protected_raw: wire.protected,
-            computed: true,
+            state: util::OperationState::Complete,
         })
     }
 
     /// Verifies the authentication tag with `macer`.
     pub fn verify(&self, macer: &dyn Macer, external_aad: Option<&[u8]>) -> Result<(), Error> {
-        if !self.computed {
-            return Err(Error::Custom(
+        if !self.state.complete() {
+            return Err(Error::InvalidState(
                 "Mac0Message must be decoded before verifying".into(),
             ));
         }
@@ -247,8 +246,8 @@ impl Mac0Message {
         detached_payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        if !self.computed {
-            return Err(Error::Custom(
+        if !self.state.complete() {
+            return Err(Error::InvalidState(
                 "Mac0Message must be decoded before verifying".into(),
             ));
         }
@@ -266,7 +265,10 @@ impl Mac0Message {
         payload: &[u8],
         external_aad: &[u8],
     ) -> Result<(), Error> {
-        util::check_protected_alg(&self.protected, macer.alg())?;
+        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        self.protected
+            .ensure_crit_understood(macer.understood_critical_headers())?;
+        util::check_protected_alg(&self.protected, &self.unprotected, macer.alg())?;
         let tbm = Self::to_be_maced(&self.protected_raw, external_aad, payload)?;
         macer.mac_verify(&tbm, &self.tag)
     }

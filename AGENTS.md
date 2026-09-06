@@ -84,9 +84,9 @@ are load-bearing for cryptographic soundness:
    match on create and verify/decrypt.
 7. **Detached payload / detached ciphertext are explicit APIs** (`*_detached*`).
    Do not hand-encode `nil` and call the embedded helpers.
-8. **Keep tests green and coverage high.** The suite targets 100% of lines and
-   functions (`cargo llvm-cov`); the only uncovered arms are unreachable
-   serialization error paths. New code paths need tests in `tests/` or inline.
+8. **Keep tests green and coverage high.** CI enforces the line threshold in
+   `.github/workflows/ci.yml`; new protocol paths need positive and negative
+   tests in `tests/` or inline.
 9. **`clippy -D warnings`, `rustdoc -D warnings`, and `rustfmt` must all pass.**
 
 ## Adding a backend algorithm

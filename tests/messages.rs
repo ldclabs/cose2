@@ -2,8 +2,8 @@ mod common;
 
 use common::*;
 use cose2::{
-    iana, tag, Encrypt0Message, EncryptMessage, Header, Label, Mac0Message, MacMessage, Recipient,
-    RecipientAlgorithmClass, Sign1Message, SignMessage, Signature,
+    iana, tag, CounterSignature, Encrypt0Message, EncryptMessage, Header, Label, Mac0Message,
+    MacMessage, Recipient, RecipientAlgorithmClass, Sign1Message, SignMessage, Signature,
 };
 
 fn direct_recipient() -> Recipient {
@@ -55,6 +55,98 @@ fn sign1_round_trip_and_auto_headers() {
     assert!(Sign1Message::verify_and_decode(&verifier, &cwt_wrapped, None).is_ok());
     let self_and_cwt_wrapped = tag::with_tag(tag::CBOR_SELF_PREFIX, &cwt_wrapped);
     assert!(Sign1Message::verify_and_decode(&verifier, &self_and_cwt_wrapped, None).is_ok());
+}
+
+#[test]
+fn legacy_counter_signature_round_trips_and_verifies() {
+    let signer = MockSigner::new(iana::AlgorithmEdDSA, b"issuer");
+    let verifier = MockVerifier::new(iana::AlgorithmEdDSA, b"issuer");
+    let counter_signer = MockSigner::new(iana::AlgorithmES256, b"notary");
+    let counter_verifier = MockVerifier::new(iana::AlgorithmES256, b"notary");
+
+    let mut message = Sign1Message::new(Some(b"countersigned payload".to_vec()));
+    message.sign(&signer, None).unwrap();
+    let mut counter_signature = CounterSignature::new();
+    counter_signature
+        .sign(
+            &counter_signer,
+            message.protected_raw(),
+            message.payload.as_deref().unwrap(),
+            Some(b"counter aad"),
+        )
+        .unwrap();
+    let mut critical_header = Header::new();
+    critical_header
+        .set_counter_signatures(std::slice::from_ref(&counter_signature))
+        .unwrap()
+        .set_crit([iana::HeaderParameterCounterSignature]);
+    critical_header.ensure_crit_understood(&[]).unwrap();
+    message
+        .unprotected
+        .set_counter_signatures(std::slice::from_ref(&counter_signature))
+        .unwrap();
+
+    let encoded = message.to_vec().unwrap();
+    let decoded = Sign1Message::verify_and_decode(&verifier, &encoded, None).unwrap();
+    let parsed = decoded.unprotected.counter_signatures().unwrap().unwrap();
+    assert_eq!(parsed, vec![counter_signature]);
+    parsed[0]
+        .verify(
+            &counter_verifier,
+            decoded.protected_raw(),
+            decoded.payload.as_deref().unwrap(),
+            Some(b"counter aad"),
+        )
+        .unwrap();
+    assert!(parsed[0]
+        .verify(
+            &counter_verifier,
+            decoded.protected_raw(),
+            b"tampered",
+            Some(b"counter aad"),
+        )
+        .is_err());
+
+    // Verification must reuse a non-preferred protected-header encoding
+    // byte-for-byte instead of canonicalizing it first.
+    let nonpreferred_protected = vec![0xa1, 0x18, 0x01, 0x26]; // {1: -7}
+    let to_be_signed = CounterSignature::to_be_signed(
+        decoded.protected_raw(),
+        &nonpreferred_protected,
+        b"counter aad",
+        decoded.payload.as_deref().unwrap(),
+    )
+    .unwrap();
+    let value = cbor2::Value::Array(vec![
+        cbor2::Value::Bytes(nonpreferred_protected.clone()),
+        cbor2::Value::Map(vec![(
+            cbor2::Value::from(iana::HeaderParameterKid),
+            cbor2::Value::Bytes(b"notary".to_vec()),
+        )]),
+        cbor2::Value::Bytes(toy_tag(b"signer-secret", &to_be_signed)),
+    ]);
+    let parsed = CounterSignature::from_value(&value).unwrap();
+    assert_eq!(parsed.protected_raw(), nonpreferred_protected);
+    parsed
+        .verify(
+            &counter_verifier,
+            decoded.protected_raw(),
+            decoded.payload.as_deref().unwrap(),
+            Some(b"counter aad"),
+        )
+        .unwrap();
+}
+
+#[test]
+fn malformed_legacy_counter_signature_is_rejected() {
+    let mut header = Header::new();
+    header.insert(
+        iana::HeaderParameterCounterSignature,
+        cbor2::Value::Array(vec![cbor2::Value::Bytes(vec![])]),
+    );
+    assert!(header.counter_signatures().is_err());
+    header.set_crit([iana::HeaderParameterCounterSignature]);
+    assert!(header.ensure_crit_understood(&[]).is_err());
 }
 
 #[test]
@@ -174,11 +266,11 @@ fn sign1_rejects_malformed_header_buckets() {
         let protected_raw = if protected.is_empty() {
             Vec::new()
         } else {
-            protected.to_vec().unwrap()
+            protected.as_map().to_vec().unwrap()
         };
         let body = cbor2::to_vec(&(
             serde_bytes::Bytes::new(&protected_raw),
-            unprotected,
+            unprotected.into_map(),
             Some(serde_bytes::Bytes::new(b"payload")),
             serde_bytes::Bytes::new(b"sig"),
         ))
@@ -625,6 +717,15 @@ fn recipient_validates_registered_algorithm_classes() {
 
     let mut direct_ka = Recipient::new();
     direct_ka.protected.set_alg(iana::AlgorithmECDH_ES_HKDF_256);
+    let mut sender_key = cose2::Key::new();
+    sender_key.set_kty(iana::KeyTypeEC2);
+    sender_key.insert(iana::EC2KeyParameterCrv, iana::EllipticCurveP_256);
+    sender_key.insert(iana::EC2KeyParameterX, vec![1u8; 32]);
+    sender_key.insert(iana::EC2KeyParameterY, vec![2u8; 32]);
+    direct_ka.unprotected.insert(
+        iana::HeaderAlgorithmParameterEphemeralKey,
+        cbor2::from_slice::<cose2::Value>(&sender_key.to_vec().unwrap()).unwrap(),
+    );
     direct_ka.ciphertext = Some(vec![]);
     assert_eq!(
         direct_ka.algorithm_class().unwrap(),

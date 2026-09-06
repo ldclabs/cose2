@@ -5,7 +5,56 @@ use std::ops::{Deref, DerefMut};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{iana, CoseMap, Error, Label, Value};
+use crate::{iana, CoseMap, CounterSignature, Error, Label, Value};
+
+/// A COSE content type: a CoAP Content-Format number or media-type text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContentType {
+    /// An unsigned CoAP Content-Format number.
+    Uint(u16),
+    /// A media-type string.
+    Text(String),
+}
+
+impl From<u16> for ContentType {
+    fn from(value: u16) -> Self {
+        Self::Uint(value)
+    }
+}
+
+impl From<u8> for ContentType {
+    fn from(value: u8) -> Self {
+        Self::Uint(u16::from(value))
+    }
+}
+
+impl TryFrom<u32> for ContentType {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        u16::try_from(value).map(Self::Uint)
+    }
+}
+
+impl TryFrom<u64> for ContentType {
+    type Error = std::num::TryFromIntError;
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        u16::try_from(value).map(Self::Uint)
+    }
+}
+
+impl From<String> for ContentType {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<&str> for ContentType {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_owned())
+    }
+}
 
 /// A COSE `Headers` / `Generic_Headers` map (RFC 9052 §3).
 ///
@@ -23,11 +72,14 @@ impl Header {
 
     /// Decodes a header map from CBOR bytes.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
-        Ok(Header(CoseMap::from_slice(data)?))
+        let header = Header(CoseMap::from_slice(data)?);
+        header.validate_common()?;
+        Ok(header)
     }
 
     /// Encodes the header map to canonical CBOR bytes.
     pub fn to_vec(&self) -> Result<Vec<u8>, Error> {
+        self.validate_common()?;
         self.0.to_vec()
     }
 
@@ -80,17 +132,39 @@ impl Header {
     /// Returns the content type (`content type`, label 3), if present.
     ///
     /// The value is `tstr / uint` (RFC 9052 §3.1); this crate represents that
-    /// shape with [`Label`].
-    pub fn content_type(&self) -> Result<Option<Label>, Error> {
-        self.0.get_label(iana::HeaderParameterContentType)
+    /// shape with [`ContentType`].
+    pub fn content_type(&self) -> Result<Option<ContentType>, Error> {
+        match self.0.get(iana::HeaderParameterContentType) {
+            None => Ok(None),
+            Some(Value::Integer(value)) => u16::try_from(*value)
+                .map(ContentType::Uint)
+                .map(Some)
+                .map_err(|_| {
+                    Error::UnexpectedType(
+                        "content type integer must be an unsigned 16-bit CoAP Content-Format"
+                            .into(),
+                    )
+                }),
+            Some(Value::Text(value)) if valid_content_type_text(value) => {
+                Ok(Some(ContentType::Text(value.clone())))
+            }
+            Some(Value::Text(_)) => Err(Error::UnexpectedType(
+                "content type text must contain a valid type/subtype without surrounding whitespace"
+                    .into(),
+            )),
+            Some(_) => Err(Error::UnexpectedType(
+                "content type must be an unsigned integer or text string".into(),
+            )),
+        }
     }
 
     /// Sets the content type (`content type`, label 3).
-    pub fn set_content_type(&mut self, content_type: impl Into<Label>) -> &mut Self {
-        self.0.insert(
-            iana::HeaderParameterContentType,
-            Value::from(content_type.into()),
-        );
+    pub fn set_content_type(&mut self, content_type: impl Into<ContentType>) -> &mut Self {
+        let value = match content_type.into() {
+            ContentType::Uint(value) => Value::from(value),
+            ContentType::Text(value) => Value::Text(value),
+        };
+        self.0.insert(iana::HeaderParameterContentType, value);
         self
     }
 
@@ -136,6 +210,39 @@ impl Header {
         self
     }
 
+    /// Returns the full legacy RFC 8152 countersignatures (label 7), if any.
+    ///
+    /// Parsing does not verify them. Call [`CounterSignature::verify`] for
+    /// each returned value with the target structure's exact wire inputs.
+    pub fn counter_signatures(&self) -> Result<Option<Vec<CounterSignature>>, Error> {
+        self.0
+            .get(iana::HeaderParameterCounterSignature)
+            .map(crate::countersign::counter_signatures_from_value)
+            .transpose()
+    }
+
+    /// Sets or removes full legacy RFC 8152 countersignatures (label 7).
+    pub fn set_counter_signatures(
+        &mut self,
+        signatures: &[CounterSignature],
+    ) -> Result<&mut Self, Error> {
+        if signatures.is_empty() {
+            self.0.remove(iana::HeaderParameterCounterSignature);
+            return Ok(self);
+        }
+        let mut values = signatures
+            .iter()
+            .map(CounterSignature::to_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        let value = if values.len() == 1 {
+            values.pop().expect("one countersignature value")
+        } else {
+            Value::Array(values)
+        };
+        self.0.insert(iana::HeaderParameterCounterSignature, value);
+        Ok(self)
+    }
+
     /// Enforces RFC 9052 §3.1 critical-header processing: every label listed in
     /// `crit` must be understood, otherwise processing the message is a fatal
     /// error.
@@ -150,10 +257,15 @@ impl Header {
     /// Returns `Ok(())` when there is no `crit` parameter or when every listed
     /// label is understood.
     pub fn ensure_crit_understood(&self, understood: &[Label]) -> Result<(), Error> {
+        self.validate_common()?;
         let Some(crit) = self.crit()? else {
             return Ok(());
         };
         for label in crit {
+            if label == Label::Int(iana::HeaderParameterCounterSignature) {
+                let _ = self.counter_signatures()?;
+                continue;
+            }
             if is_understood_header(&label) || understood.contains(&label) {
                 continue;
             }
@@ -163,15 +275,71 @@ impl Header {
         }
         Ok(())
     }
+
+    fn validate_common(&self) -> Result<(), Error> {
+        let _ = self.alg()?;
+        let _ = self.content_type()?;
+        let _ = self.kid()?;
+        let iv = self.iv()?;
+        let partial_iv = self.partial_iv()?;
+        if iv.is_some() && partial_iv.is_some() {
+            return Err(Error::Custom(
+                "IV and Partial IV must not both be present in one header bucket".into(),
+            ));
+        }
+        if let Some(crit) = self.crit()? {
+            if crit.is_empty() {
+                return Err(Error::Custom(
+                    "crit header parameter must not be empty".into(),
+                ));
+            }
+            let mut unique = std::collections::HashSet::with_capacity(crit.len());
+            for label in crit {
+                if !unique.insert(label.clone()) {
+                    return Err(Error::Custom(format!(
+                        "crit contains duplicate header label {label}"
+                    )));
+                }
+                if !self.contains_key(label.clone()) {
+                    return Err(Error::Custom(format!(
+                        "crit references absent protected header label {label}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_content_type_text(value: &str) -> bool {
+    if value.trim() != value {
+        return false;
+    }
+    let media_type = value
+        .split_once(';')
+        .map_or(value, |(media_type, _)| media_type);
+    let Some((type_name, subtype)) = media_type.split_once('/') else {
+        return false;
+    };
+    is_media_type_token(type_name) && is_media_type_token(subtype)
+}
+
+fn is_media_type_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-'
+                )
+        })
 }
 
 /// Returns `true` when `label` is a common header parameter this crate models
 /// natively and therefore always understands (RFC 9052 §3.1: "Header
 /// parameters defined in [RFC 9052] do not need to be included [in `crit`]").
-///
-/// The RFC 8152 "counter signature" parameter (label 7) is included because
-/// RFC 9052 §3.1 requires new implementations to understand it for
-/// compatibility with senders that adhere to RFC 8152.
+/// The legacy RFC 8152 countersignature parameter is included as required by
+/// RFC 9052 §3.1 for compatibility with RFC 8152 senders.
 pub fn is_understood_header(label: &Label) -> bool {
     matches!(
         label,
@@ -224,6 +392,7 @@ impl Serialize for Header {
     where
         S: Serializer,
     {
+        self.validate_common().map_err(serde::ser::Error::custom)?;
         self.0.serialize(serializer)
     }
 }
@@ -233,7 +402,9 @@ impl<'de> Deserialize<'de> for Header {
     where
         D: Deserializer<'de>,
     {
-        CoseMap::deserialize(deserializer).map(Header)
+        let header = Header(CoseMap::deserialize(deserializer)?);
+        header.validate_common().map_err(serde::de::Error::custom)?;
+        Ok(header)
     }
 }
 
@@ -265,6 +436,13 @@ pub(crate) fn validate_header_buckets(
     protected: &Header,
     unprotected: &Header,
 ) -> Result<(), Error> {
+    protected.validate_common()?;
+    if unprotected.contains_key(iana::HeaderParameterCrit) {
+        return Err(Error::Custom(
+            "crit header parameter must be protected".into(),
+        ));
+    }
+    unprotected.validate_common()?;
     for (label, _) in protected.iter() {
         if unprotected.contains_key(label.clone()) {
             return Err(Error::Custom(format!(
@@ -273,27 +451,31 @@ pub(crate) fn validate_header_buckets(
         }
     }
 
-    if unprotected.contains_key(iana::HeaderParameterCrit) {
+    let has_iv = protected.contains_key(iana::HeaderParameterIV)
+        || unprotected.contains_key(iana::HeaderParameterIV);
+    let has_partial_iv = protected.contains_key(iana::HeaderParameterPartialIV)
+        || unprotected.contains_key(iana::HeaderParameterPartialIV);
+    if has_iv && has_partial_iv {
         return Err(Error::Custom(
-            "crit header parameter must be protected".into(),
+            "IV and Partial IV must not both be present in one security layer".into(),
         ));
     }
 
-    if let Some(crit) = protected.crit()? {
-        if crit.is_empty() {
-            return Err(Error::Custom(
-                "crit header parameter must not be empty".into(),
-            ));
-        }
-        for label in crit {
-            if !protected.contains_key(label.clone()) {
-                return Err(Error::Custom(format!(
-                    "crit references absent protected header label {label}"
-                )));
-            }
-        }
-    }
+    Ok(())
+}
 
+/// Ensures that a public protected-header view still denotes the exact raw
+/// header map used by a cryptographic operation.
+pub(crate) fn validate_protected_state(
+    protected: &Header,
+    protected_raw: &[u8],
+) -> Result<(), Error> {
+    let decoded = decode_protected(protected_raw)?;
+    if encode_protected(&decoded)? != encode_protected(protected)? {
+        return Err(Error::InvalidState(
+            "protected header changed after its authenticated bytes were prepared".into(),
+        ));
+    }
     Ok(())
 }
 

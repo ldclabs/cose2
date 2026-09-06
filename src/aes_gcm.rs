@@ -7,7 +7,7 @@
 //! The 96-bit GCM nonce is supplied by the message as a full `IV`, or derived
 //! from a `Partial IV` and the configured Base IV.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 // `aes_gcm` is also the name of this module, so reach the crate through `::`.
 use ::aes_gcm::{
@@ -26,17 +26,17 @@ const NONCE_LEN: usize = 12;
 pub struct AesGcmEncryptor {
     alg: i64,
     kid: Option<Vec<u8>>,
-    cipher: AesGcmCipher,
+    cipher: Arc<AesGcmCipher>,
     // Retained so the symmetric `k` can be re-exported by `to_cose_key`; the
-    // cipher does not expose its raw bytes. Zeroized on drop (every clone
-    // wipes its own copy).
-    raw_key: Zeroizing<Vec<u8>>,
+    // cipher does not expose its raw bytes. The shared allocation is zeroized
+    // when the final clone is dropped.
+    raw_key: Arc<Zeroizing<Vec<u8>>>,
     base_iv: Option<Vec<u8>>,
+    key_ops: Option<Vec<Label>>,
 }
 
 // The variants are boxed because AES-256's key schedule is markedly larger
 // than AES-128's, which would otherwise bloat every `AesGcmEncryptor`.
-#[derive(Clone)]
 enum AesGcmCipher {
     Aes128(Box<Aes128Gcm>),
     Aes256(Box<Aes256Gcm>),
@@ -59,9 +59,10 @@ impl AesGcmEncryptor {
         Ok(Self {
             alg,
             kid,
-            cipher,
-            raw_key: Zeroizing::new(key.to_vec()),
+            cipher: Arc::new(cipher),
+            raw_key: Arc::new(Zeroizing::new(key.to_vec())),
             base_iv: None,
+            key_ops: None,
         })
     }
 
@@ -70,14 +71,23 @@ impl AesGcmEncryptor {
     /// A Base IV (`Base IV`, label 5) on the key is preserved for use with
     /// COSE `Partial IV`.
     pub fn from_cose_key(key: &Key) -> Result<Self, Error> {
-        require_kty(key, iana::KeyTypeSymmetric)?;
-        let alg = required_alg(key)?;
+        key.require_integer_kty(iana::KeyTypeSymmetric)?;
+        let alg = key.required_integer_alg("AES-GCM backend")?;
         let mut encryptor = Self::new(
             alg,
-            required_bytes(key, iana::SymmetricKeyParameterK, "k")?,
-            key_kid(key)?,
+            key.required_bytes(iana::SymmetricKeyParameterK, "k")?,
+            key.kid_owned()?,
         )?;
         encryptor.base_iv = key.base_iv()?.map(ToOwned::to_owned);
+        encryptor.key_ops = key.ops()?;
+        if !crate::util::key_ops_allow(
+            &encryptor.key_ops,
+            &[iana::KeyOperationEncrypt, iana::KeyOperationDecrypt],
+        ) {
+            return Err(Error::custom(
+                "COSE_Key key_ops permits neither encryption nor decryption",
+            ));
+        }
         Ok(encryptor)
     }
 
@@ -99,10 +109,14 @@ impl AesGcmEncryptor {
         if let Some(kid) = &self.kid {
             key.set_kid(kid.clone());
         }
-        key.insert(iana::SymmetricKeyParameterK, self.raw_key.to_vec());
+        key.insert(
+            iana::SymmetricKeyParameterK,
+            self.raw_key.as_slice().to_vec(),
+        );
         if let Some(base_iv) = &self.base_iv {
             key.insert(iana::KeyParameterBaseIV, base_iv.clone());
         }
+        crate::util::set_key_ops(&mut key, &self.key_ops);
         Ok(key)
     }
 
@@ -141,22 +155,24 @@ impl Encryptor for AesGcmEncryptor {
     }
 
     fn encrypt(&self, nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, Error> {
+        crate::util::require_key_ops(&self.key_ops, &[iana::KeyOperationEncrypt], "encryption")?;
         let payload = Payload {
             msg: plaintext,
             aad,
         };
-        match &self.cipher {
+        match self.cipher.as_ref() {
             AesGcmCipher::Aes128(c) => aead_seal(c.as_ref(), nonce, payload),
             AesGcmCipher::Aes256(c) => aead_seal(c.as_ref(), nonce, payload),
         }
     }
 
     fn decrypt(&self, nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, Error> {
+        crate::util::require_key_ops(&self.key_ops, &[iana::KeyOperationDecrypt], "decryption")?;
         let payload = Payload {
             msg: ciphertext,
             aad,
         };
-        match &self.cipher {
+        match self.cipher.as_ref() {
             AesGcmCipher::Aes128(c) => aead_open(c.as_ref(), nonce, payload),
             AesGcmCipher::Aes256(c) => aead_open(c.as_ref(), nonce, payload),
         }
@@ -179,37 +195,6 @@ fn aead_open<C: Aead>(cipher: &C, nonce: &[u8], payload: Payload) -> Result<Vec<
     cipher
         .decrypt(&nonce, payload)
         .map_err(|_| Error::verify("AEAD authentication failed"))
-}
-
-fn required_alg(key: &Key) -> Result<i64, Error> {
-    match key.alg()? {
-        Some(Label::Int(alg)) => Ok(alg),
-        Some(Label::Text(_)) => Err(Error::custom(
-            "the built-in AES-GCM backend does not support text-string algorithms",
-        )),
-        None => Err(Error::custom("COSE_Key is missing alg")),
-    }
-}
-
-fn require_kty(key: &Key, expected: i64) -> Result<(), Error> {
-    match key.kty()? {
-        Some(Label::Int(kty)) if kty == expected => Ok(()),
-        Some(other) => Err(Error::custom(format!(
-            "COSE_Key kty mismatch, expected {}, got {}",
-            Label::from(expected),
-            other
-        ))),
-        None => Err(Error::custom("COSE_Key is missing kty")),
-    }
-}
-
-fn required_bytes<'a>(key: &'a Key, label: i64, name: &str) -> Result<&'a [u8], Error> {
-    key.get_bytes(label)?
-        .ok_or_else(|| Error::custom(format!("COSE_Key is missing {name}")))
-}
-
-fn key_kid(key: &Key) -> Result<Option<Vec<u8>>, Error> {
-    Ok(key.kid()?.map(ToOwned::to_owned))
 }
 
 fn unsupported_alg(alg: i64) -> Error {

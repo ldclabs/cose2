@@ -1,9 +1,9 @@
 use cbor2::Value;
 use cose2::{iana, Error, Label, Sign1Message, Signer, Verifier};
 use sd_cwt::{
-    issue_from_preissuance, restore_payload_from_message, set_disclosures, set_sd_alg,
-    set_sd_cwt_typ, RedactionHasher, RestoreMode, Sha256RedactionHasher, TO_BE_DECOY_TAG,
-    TO_BE_REDACTED_TAG,
+    issue_from_preissuance, set_disclosures, set_sd_alg, set_sd_cwt_typ,
+    verify_validate_and_restore_sd_cwt, RedactionHasher, RestoreMode, SdCwtValidationOptions,
+    Sha256RedactionHasher, TO_BE_DECOY_TAG, TO_BE_REDACTED_TAG,
 };
 
 fn toy_tag(secret: &[u8], data: &[u8]) -> Vec<u8> {
@@ -18,7 +18,7 @@ struct Issuer;
 
 impl Signer for Issuer {
     fn alg(&self) -> Option<Label> {
-        Some(iana::AlgorithmEdDSA.into())
+        Some(iana::AlgorithmEd25519.into())
     }
 
     fn kid(&self) -> Option<&[u8]> {
@@ -34,7 +34,7 @@ struct IssuerVerifier;
 
 impl Verifier for IssuerVerifier {
     fn alg(&self) -> Option<Label> {
-        Some(iana::AlgorithmEdDSA.into())
+        Some(iana::AlgorithmEd25519.into())
     }
 
     fn verify(&self, data: &[u8], signature: &[u8]) -> Result<(), Error> {
@@ -60,6 +60,7 @@ fn main() -> Result<(), Error> {
     // map key/value pair or an array element. Tag 62 asks for a decoy digest.
     let preissued_claims = Value::Map(vec![
         (Value::from(1), Value::from("https://issuer.example")),
+        (Value::from(2), Value::from("https://holder.example")),
         (Value::from(8), Value::Map(vec![])), // cnf; fill with a real COSE key in production.
         (
             Value::Tag(TO_BE_REDACTED_TAG, Box::new(Value::from("name"))),
@@ -93,8 +94,13 @@ fn main() -> Result<(), Error> {
 
     // Holder receives every disclosure at issuance, so Holder validation uses
     // the strict one-to-one rule: every redaction must have a disclosure.
-    let holder_sd_cwt = Sign1Message::verify_and_decode(&IssuerVerifier, &encoded, None)?;
-    let holder_claims = restore_payload_from_message(&holder_sd_cwt, RestoreMode::Holder)?;
+    let (holder_sd_cwt, holder_claims) = verify_validate_and_restore_sd_cwt(
+        &IssuerVerifier,
+        &encoded,
+        None,
+        RestoreMode::Holder,
+        SdCwtValidationOptions::default(),
+    )?;
     println!("holder disclosed claims: {}", holder_claims.disclosed);
 
     // During presentation, the Holder can disclose a subset.
@@ -113,8 +119,13 @@ fn main() -> Result<(), Error> {
     //    captured presentation can be replayed by anyone. The sd-cwt crate
     //    does not implement KBT verification; production verifiers must do it
     //    (this toy example skips it).
-    let verified = Sign1Message::verify_and_decode(&IssuerVerifier, &presented_bytes, None)?;
-    let verifier_claims = restore_payload_from_message(&verified, RestoreMode::Verifier)?;
+    let (_verified, verifier_claims) = verify_validate_and_restore_sd_cwt(
+        &IssuerVerifier,
+        &presented_bytes,
+        None,
+        RestoreMode::Verifier,
+        SdCwtValidationOptions::default(),
+    )?;
     println!(
         "verifier disclosed claims: {}, removed redactions: {}",
         verifier_claims.disclosed, verifier_claims.removed_redactions

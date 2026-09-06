@@ -1,5 +1,5 @@
 use cose2::{
-    cwt::{Claims, Validator, ValidatorOptions},
+    cwt::{Claims, NumericDate, Validator, ValidatorOptions},
     iana, Error, Label, Sign1Message, Signer, Verifier,
 };
 
@@ -48,15 +48,16 @@ fn main() -> Result<(), Error> {
         issuer: Some("issuer.example".into()),
         subject: Some("device-123".into()),
         audience: Some("api.example".into()),
-        expiration: Some(1_700_000_600),
-        not_before: Some(1_700_000_000),
-        issued_at: Some(1_700_000_000),
+        expiration: Some(NumericDate::from(1_700_000_600i64)),
+        not_before: Some(NumericDate::from(1_700_000_000i64)),
+        issued_at: Some(NumericDate::from(1_700_000_000i64)),
         cwt_id: Some(b"token-1".to_vec()),
         ..Default::default()
     };
 
     let mut msg = Sign1Message::new(Some(claims.to_vec()?));
-    let encoded = msg.sign_and_encode(&Issuer, None)?;
+    msg.sign(&Issuer, None)?;
+    let encoded = msg.to_cwt_vec()?;
 
     let verified = Sign1Message::verify_and_decode(&AudienceVerifier, &encoded, None)?;
     let decoded = Claims::from_slice(verified.payload.as_deref().expect("embedded CWT claims"))?;

@@ -3,7 +3,7 @@ mod common;
 use cbor2::Cbor;
 use common::*;
 use cose2::{
-    cwt::{Claims, ClaimsMap, Validator, ValidatorOptions},
+    cwt::{Claims, ClaimsMap, NumericDate, Validator, ValidatorOptions},
     iana, tag, KdfContext, Label, PartyInfo, PartyNonce, Sign1Message, SuppPubInfo, Value,
 };
 
@@ -66,6 +66,13 @@ fn party_info_supports_integer_nonce() {
     ))
     .unwrap();
     assert!(cbor2::from_slice::<PartyInfo>(&bad).is_err());
+
+    let out_of_range = PartyInfo {
+        identity: None,
+        nonce: Some(PartyNonce::Int(i128::MAX)),
+        other: None,
+    };
+    assert!(cbor2::to_canonical_vec(&out_of_range).is_err());
 }
 
 #[test]
@@ -158,26 +165,28 @@ fn claims_round_trip_integer_keys() {
         issuer: Some("ldc:ca".into()),
         subject: Some("ldc:chain".into()),
         audience: Some("ldc:txpool".into()),
-        expiration: Some(1_700_000_300),
-        not_before: Some(1_700_000_000),
-        issued_at: Some(1_700_000_000),
+        expiration: Some(NumericDate::from(1_700_000_300i64)),
+        not_before: Some(NumericDate::from(1_700_000_000i64)),
+        issued_at: Some(NumericDate::from(1_700_000_000i64)),
         cwt_id: Some(vec![0xa, 0xb, 0xc]),
         ..Default::default()
     };
     let bytes = claims.to_vec().unwrap();
-    assert_eq!(Claims::TAG, Some(iana::CBORTagCWT));
-    assert_eq!(&bytes[..2], tag::CWT_PREFIX);
-    // Tagged map keyed by integers 1..=7.
-    assert_eq!(bytes[2], 0xa7);
+    assert_eq!(Claims::TAG, None);
+    assert_eq!(bytes[0], 0xa7);
     let untagged = claims.to_untagged_vec().unwrap();
-    assert_eq!(untagged.as_slice(), tag::skip_tag(tag::CWT_PREFIX, &bytes));
+    assert_eq!(untagged, bytes);
     assert_eq!(untagged[0], 0xa7);
     let back = Claims::from_slice(&bytes).unwrap();
     assert_eq!(back, claims);
 
-    // The cbor2 tag derive accepts untagged claim maps for compatibility.
     assert_eq!(cbor2::from_slice::<Claims>(&untagged).unwrap(), claims);
     assert_eq!(Claims::from_slice(&untagged).unwrap(), claims);
+
+    let legacy = claims.to_legacy_tagged_vec().unwrap();
+    assert_eq!(&legacy[..2], tag::CWT_PREFIX);
+    assert_eq!(Claims::from_slice_legacy_tagged(&legacy).unwrap(), claims);
+    assert!(Claims::from_slice(&legacy).is_err());
 
     let wrong_tagged = tag::with_tag(tag::SIGN1_PREFIX, &untagged);
     assert!(Claims::from_slice(&wrong_tagged).is_err());
@@ -190,16 +199,14 @@ fn claims_omit_absent_fields_and_json() {
         ..Default::default()
     };
     let bytes = claims.to_vec().unwrap();
-    // tagged single-entry map {1: "iss"}
-    assert_eq!(&bytes[..2], tag::CWT_PREFIX);
-    assert_eq!(bytes[2], 0xa1);
+    assert_eq!(bytes[0], 0xa1);
 
     // JSON keeps the original (renamed) field names — the cbor2 derive leaves
     // serde names intact for other formats.
     // (We don't depend on serde_json here; check the empty-claims default.)
     let empty = Claims::new();
     assert_eq!(empty, Claims::default());
-    assert_eq!(empty.to_vec().unwrap(), vec![0xd8, 0x3d, 0xa0]);
+    assert_eq!(empty.to_vec().unwrap(), vec![0xa0]);
     assert_eq!(empty.to_untagged_vec().unwrap(), vec![0xa0]);
 }
 
@@ -221,8 +228,7 @@ fn claims_preserve_extra_claims() {
     assert_eq!(direct, claims);
 
     let encoded = claims.to_vec().unwrap();
-    assert_eq!(&encoded[..2], tag::CWT_PREFIX);
-    assert_eq!(encoded[2], 0xa3);
+    assert_eq!(encoded[0], 0xa3);
     let round_trip = Claims::from_slice(&encoded).unwrap();
     assert_eq!(round_trip, claims);
 
@@ -241,9 +247,9 @@ fn claims_accept_integral_float_numeric_dates() {
     let bytes = map.to_vec().unwrap();
 
     let claims = Claims::from_slice(&bytes).unwrap();
-    assert_eq!(claims.expiration, Some(1_700_000_300));
-    assert_eq!(claims.not_before, Some(1_700_000_000));
-    assert_eq!(claims.issued_at, Some(1_700_000_000));
+    assert_eq!(claims.expiration, Some(NumericDate::Float(1_700_000_300.0)));
+    assert_eq!(claims.not_before, Some(NumericDate::Float(1_700_000_000.0)));
+    assert_eq!(claims.issued_at, Some(NumericDate::Float(1_700_000_000.0)));
 
     // validate_map tolerates the float encodings too.
     let v = validator(ValidatorOptions {
@@ -255,37 +261,31 @@ fn claims_accept_integral_float_numeric_dates() {
 }
 
 #[test]
-fn claims_reject_fractional_or_pre_epoch_numeric_dates() {
-    // Fractional seconds are not representable as whole-second timestamps.
+fn claims_accept_fractional_and_pre_epoch_numeric_dates() {
     let mut fractional = ClaimsMap::new();
     fractional.insert(iana::CWTClaimExp, Value::Float(1_700_000_300.5));
     let bytes = fractional.to_vec().unwrap();
-    let err = Claims::from_slice(&bytes).unwrap_err();
-    assert!(format!("{err}").contains("fractional-second NumericDate"));
-    let err = validator(ValidatorOptions::default())
-        .validate_map(&fractional)
-        .unwrap_err();
-    assert!(format!("{err}").contains("fractional-second NumericDate"));
+    let claims = Claims::from_slice(&bytes).unwrap();
+    assert_eq!(claims.expiration, Some(NumericDate::Float(1_700_000_300.5)));
+    assert!(validator(ValidatorOptions {
+        fixed_now: Some(1_700_000_000),
+        ..Default::default()
+    })
+    .validate_map(&fractional)
+    .is_ok());
 
-    // Pre-epoch (negative) dates are rejected.
     let mut negative = ClaimsMap::new();
-    negative.insert(iana::CWTClaimExp, -5i64);
+    negative.insert(iana::CWTClaimExp, 5i64);
+    negative.insert(iana::CWTClaimNbf, -5i64);
     let bytes = negative.to_vec().unwrap();
-    let err = Claims::from_slice(&bytes).unwrap_err();
-    assert!(format!("{err}").contains("pre-epoch NumericDate"));
-
-    // validate_map rejects pre-epoch integers too — including `nbf`, which a
-    // plain range check would otherwise accept as "already valid".
-    let err = validator(ValidatorOptions::default())
-        .validate_map(&negative)
-        .unwrap_err();
-    assert!(format!("{err}").contains("pre-epoch NumericDate"));
-    let mut negative_nbf = ClaimsMap::new();
-    negative_nbf.insert(iana::CWTClaimNbf, -5i64);
-    let err = validator(ValidatorOptions::default())
-        .validate_map(&negative_nbf)
-        .unwrap_err();
-    assert!(format!("{err}").contains("pre-epoch NumericDate"));
+    let claims = Claims::from_slice(&bytes).unwrap();
+    assert_eq!(claims.not_before, Some(NumericDate::from(-5i64)));
+    assert!(validator(ValidatorOptions {
+        fixed_now: Some(0),
+        ..Default::default()
+    })
+    .validate_map(&negative)
+    .is_ok());
 
     // Non-numeric dates remain type errors.
     let mut text = ClaimsMap::new();
@@ -302,11 +302,13 @@ fn cwt_in_sign1_round_trip() {
     let claims = Claims {
         issuer: Some("ldc:ca".into()),
         audience: Some("ldc:txpool".into()),
-        expiration: Some(4_000_000_000),
+        expiration: Some(NumericDate::from(4_000_000_000u64)),
         ..Default::default()
     };
     let mut msg = Sign1Message::new(Some(claims.to_vec().unwrap()));
-    let encoded = msg.sign_and_encode(&signer, None).unwrap();
+    msg.sign(&signer, None).unwrap();
+    let encoded = msg.to_cwt_vec().unwrap();
+    assert_eq!(&encoded[..2], tag::CWT_PREFIX);
 
     let verified = Sign1Message::verify_and_decode(&verifier, &encoded, None).unwrap();
     let decoded = Claims::from_slice(verified.payload.as_deref().unwrap()).unwrap();
@@ -343,9 +345,9 @@ fn validator_validates_typed_claims() {
     let claims = Claims {
         issuer: Some("iss".into()),
         audience: Some("aud".into()),
-        expiration: Some(2_000),
-        not_before: Some(500),
-        issued_at: Some(500),
+        expiration: Some(NumericDate::from(2_000i64)),
+        not_before: Some(NumericDate::from(500i64)),
+        issued_at: Some(NumericDate::from(500i64)),
         ..Default::default()
     };
     assert!(v.validate(&claims).is_ok());
@@ -373,23 +375,23 @@ fn validator_time_failures() {
 
     // Expired.
     let expired = Claims {
-        expiration: Some(500),
+        expiration: Some(NumericDate::from(500i64)),
         ..Default::default()
     };
     assert!(validator(base.clone()).validate(&expired).is_err());
 
     // Not yet valid (nbf in the future).
     let future = Claims {
-        expiration: Some(2_000),
-        not_before: Some(1_500),
+        expiration: Some(NumericDate::from(2_000i64)),
+        not_before: Some(NumericDate::from(1_500i64)),
         ..Default::default()
     };
     assert!(validator(base.clone()).validate(&future).is_err());
 
     // iat in the future, when checked.
     let iat_future = Claims {
-        expiration: Some(2_000),
-        issued_at: Some(1_500),
+        expiration: Some(NumericDate::from(2_000i64)),
+        issued_at: Some(NumericDate::from(1_500i64)),
         ..Default::default()
     };
     let check_iat = validator(ValidatorOptions {
@@ -471,8 +473,8 @@ fn validator_uses_system_clock_when_now_unset() {
         ..Default::default()
     });
     let claims = Claims {
-        expiration: Some(u64::MAX), // saturates to i64::MAX → far future
-        not_before: Some(0),
+        expiration: Some(NumericDate::from(u64::MAX)),
+        not_before: Some(NumericDate::from(0i64)),
         ..Default::default()
     };
     assert!(v.validate(&claims).is_ok());

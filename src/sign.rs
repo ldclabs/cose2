@@ -4,17 +4,17 @@ use cbor2::Cbor;
 
 use crate::{
     header::{decode_protected, encode_protected, validate_header_buckets},
-    iana, tag, util, Error, Header, Label, Signer, Value, Verifier,
+    iana, tag, util, Error, Header, Label, Signer, Verifier,
 };
 
 /// The on-the-wire COSE_Signature array: `[protected, unprotected, signature]`.
 #[derive(Clone, Debug, PartialEq, Cbor)]
 #[cbor(array)]
 struct SignatureWire {
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::strict::bytes")]
     protected: Vec<u8>,
     unprotected: Header,
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::strict::bytes")]
     signature: Vec<u8>,
 }
 
@@ -22,10 +22,10 @@ struct SignatureWire {
 #[derive(Clone, Debug, PartialEq, Cbor)]
 #[cbor(tag = 98, array)]
 struct SignWire {
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::strict::bytes")]
     protected: Vec<u8>,
     unprotected: Header,
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::strict::optional_bytes")]
     payload: Option<Vec<u8>>,
     signatures: Vec<SignatureWire>,
 }
@@ -44,6 +44,19 @@ impl serde::Serialize for SignatureRef<'_> {
     }
 }
 
+struct SignaturesRef<'a>(&'a [Signature]);
+
+impl serde::Serialize for SignaturesRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for signature in self.0 {
+            sequence.serialize_element(&SignatureRef(signature))?;
+        }
+        sequence.end()
+    }
+}
+
 /// A COSE_Signature inside a [`SignMessage`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Signature {
@@ -53,6 +66,7 @@ pub struct Signature {
     pub unprotected: Header,
     signature: Vec<u8>,
     protected_raw: Vec<u8>,
+    state: util::OperationState,
 }
 
 impl Signature {
@@ -99,10 +113,12 @@ impl Signature {
     /// signatures.
     pub fn set_signature(&mut self, signature: impl Into<Vec<u8>>) -> Result<(), Error> {
         validate_header_buckets(&self.protected, &self.unprotected)?;
-        if self.protected_raw.is_empty() && !self.protected.is_empty() {
+        if !self.state.initialized() {
             self.protected_raw = encode_protected(&self.protected)?;
         }
+        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
         self.signature = signature.into();
+        self.state = util::OperationState::Complete;
         Ok(())
     }
 }
@@ -121,7 +137,7 @@ pub struct SignMessage {
     /// The signatures.
     pub signatures: Vec<Signature>,
     protected_raw: Vec<u8>,
-    signed: bool,
+    state: util::OperationState,
 }
 
 impl SignMessage {
@@ -146,13 +162,13 @@ impl SignMessage {
         external_aad: &[u8],
         payload: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        util::encode_structure(vec![
-            Value::from("Signature"),
-            Value::Bytes(body_protected.to_vec()),
-            Value::Bytes(sign_protected.to_vec()),
-            Value::Bytes(external_aad.to_vec()),
-            util::payload_value(payload),
-        ])
+        util::encode_structure(&(
+            "Signature",
+            serde_bytes::Bytes::new(body_protected),
+            serde_bytes::Bytes::new(sign_protected),
+            serde_bytes::Bytes::new(external_aad),
+            serde_bytes::Bytes::new(payload),
+        ))
     }
 
     /// Prepares this embedded-payload message for external signatures.
@@ -167,10 +183,10 @@ impl SignMessage {
         signatures: Vec<Signature>,
         external_aad: Option<&[u8]>,
     ) -> Result<Vec<Vec<u8>>, Error> {
+        self.prepare_signature_headers(signatures)?;
         let payload =
-            util::require_embedded_payload(&self.payload, "SignMessage::prepare_signatures")?
-                .to_vec();
-        self.prepare_signature_payload(signatures, &payload, external_aad.unwrap_or(&[]))
+            util::require_embedded_payload(&self.payload, "SignMessage::prepare_signatures")?;
+        self.signature_inputs(payload, external_aad.unwrap_or(&[]))
     }
 
     /// Prepares this detached-payload message for external signatures.
@@ -183,21 +199,13 @@ impl SignMessage {
         detached_payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<Vec<Vec<u8>>, Error> {
-        let to_be_signed = self.prepare_signature_payload(
-            signatures,
-            detached_payload,
-            external_aad.unwrap_or(&[]),
-        )?;
+        self.prepare_signature_headers(signatures)?;
+        let to_be_signed = self.signature_inputs(detached_payload, external_aad.unwrap_or(&[]))?;
         self.payload = None;
         Ok(to_be_signed)
     }
 
-    fn prepare_signature_payload(
-        &mut self,
-        mut signatures: Vec<Signature>,
-        payload: &[u8],
-        external_aad: &[u8],
-    ) -> Result<Vec<Vec<u8>>, Error> {
+    fn prepare_signature_headers(&mut self, mut signatures: Vec<Signature>) -> Result<(), Error> {
         if signatures.is_empty() {
             return Err(Error::Custom(
                 "SignMessage requires at least one signature".into(),
@@ -205,22 +213,32 @@ impl SignMessage {
         }
         validate_header_buckets(&self.protected, &self.unprotected)?;
         let protected_raw = encode_protected(&self.protected)?;
-        let mut to_be_signed = Vec::with_capacity(signatures.len());
-
         for signature in &mut signatures {
             validate_header_buckets(&signature.protected, &signature.unprotected)?;
             let sign_protected_raw = encode_protected(&signature.protected)?;
-            let tbs =
-                Self::to_be_signed(&protected_raw, &sign_protected_raw, external_aad, payload)?;
             signature.protected_raw = sign_protected_raw;
+            signature.state = util::OperationState::Prepared;
             signature.signature.clear();
-            to_be_signed.push(tbs);
         }
 
         self.protected_raw = protected_raw;
+        self.state = util::OperationState::Prepared;
         self.signatures = signatures;
-        self.signed = false;
-        Ok(to_be_signed)
+        Ok(())
+    }
+
+    fn signature_inputs(&self, payload: &[u8], external_aad: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+        self.signatures
+            .iter()
+            .map(|signature| {
+                Self::to_be_signed(
+                    &self.protected_raw,
+                    &signature.protected_raw,
+                    external_aad,
+                    payload,
+                )
+            })
+            .collect()
     }
 
     /// Stores externally produced signature bytes on this message.
@@ -247,13 +265,14 @@ impl SignMessage {
             )));
         }
         validate_header_buckets(&self.protected, &self.unprotected)?;
-        if self.protected_raw.is_empty() && !self.protected.is_empty() {
+        if !self.state.initialized() {
             self.protected_raw = encode_protected(&self.protected)?;
         }
+        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
         for (slot, signature) in self.signatures.iter_mut().zip(signatures) {
             slot.set_signature(signature)?;
         }
-        self.signed = true;
+        self.state = util::OperationState::Complete;
         Ok(())
     }
 
@@ -263,8 +282,7 @@ impl SignMessage {
         signers: &[&dyn Signer],
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        let payload = util::require_embedded_payload(&self.payload, "SignMessage::sign")?.to_vec();
-        self.sign_payload(signers, &payload, external_aad.unwrap_or(&[]))
+        self.sign_with_payload(signers, None, external_aad.unwrap_or(&[]))
     }
 
     /// Signs a detached payload with each signer.
@@ -277,15 +295,15 @@ impl SignMessage {
         detached_payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        self.sign_payload(signers, detached_payload, external_aad.unwrap_or(&[]))?;
+        self.sign_with_payload(signers, Some(detached_payload), external_aad.unwrap_or(&[]))?;
         self.payload = None;
         Ok(())
     }
 
-    fn sign_payload(
+    fn sign_with_payload(
         &mut self,
         signers: &[&dyn Signer],
-        payload: &[u8],
+        detached_payload: Option<&[u8]>,
         external_aad: &[u8],
     ) -> Result<(), Error> {
         if signers.is_empty() {
@@ -297,12 +315,23 @@ impl SignMessage {
             .iter()
             .map(|signer| Signature::with_alg_kid(signer.alg(), signer.kid()))
             .collect::<Vec<_>>();
-        let to_be_signed =
-            self.prepare_signature_payload(signature_headers, payload, external_aad)?;
+        self.prepare_signature_headers(signature_headers)?;
+        let payload = match detached_payload {
+            Some(payload) => payload,
+            None => util::require_embedded_payload(&self.payload, "SignMessage::sign")?,
+        };
         let signatures = signers
             .iter()
-            .zip(&to_be_signed)
-            .map(|(signer, tbs)| signer.sign(tbs))
+            .zip(&self.signatures)
+            .map(|(signer, signature)| {
+                let tbs = Self::to_be_signed(
+                    &self.protected_raw,
+                    &signature.protected_raw,
+                    external_aad,
+                    payload,
+                )?;
+                signer.sign(&tbs)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         self.set_signatures(signatures)
     }
@@ -333,6 +362,11 @@ impl SignMessage {
         self.encode(tag::SIGN_PREFIX)
     }
 
+    /// Encodes this tagged COSE_Sign as a CWT (`61(98(...))`).
+    pub fn to_cwt_vec(&self) -> Result<Vec<u8>, Error> {
+        self.encode(tag::CWT_SIGN_PREFIX)
+    }
+
     /// Encodes a signed message to canonical COSE_Sign bytes without the CBOR tag.
     pub fn to_untagged_vec(&self) -> Result<Vec<u8>, Error> {
         self.encode(&[])
@@ -340,8 +374,8 @@ impl SignMessage {
 
     /// Serializes the wire array borrowing this message's buffers.
     fn encode(&self, prefix: &[u8]) -> Result<Vec<u8>, Error> {
-        if !self.signed {
-            return Err(Error::Custom(
+        if !self.state.complete() {
+            return Err(Error::InvalidState(
                 "SignMessage must be signed before encoding".into(),
             ));
         }
@@ -349,27 +383,27 @@ impl SignMessage {
             return Err(Error::Custom("SignMessage has no signatures".into()));
         }
         validate_header_buckets(&self.protected, &self.unprotected)?;
+        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
         for sig in &self.signatures {
             validate_header_buckets(&sig.protected, &sig.unprotected)?;
+            crate::header::validate_protected_state(&sig.protected, &sig.protected_raw)?;
         }
-        let signatures: Vec<SignatureRef<'_>> = self.signatures.iter().map(SignatureRef).collect();
+        let unprotected = util::canonical_raw(&self.unprotected)?;
+        let signatures = util::canonical_raw(&SignaturesRef(&self.signatures))?;
         util::encode_prefixed(
             prefix,
             &(
                 serde_bytes::Bytes::new(&self.protected_raw),
-                &self.unprotected,
+                &unprotected,
                 self.payload.as_deref().map(serde_bytes::Bytes::new),
-                signatures,
+                &signatures,
             ),
         )
     }
 
     /// Decodes a COSE_Sign message (tagged or untagged) without verifying it.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
-        let body = tag::strip_message_wrappers(data);
-        if !body.starts_with(tag::SIGN_PREFIX) && tag::starts_with_cbor_tag(body) {
-            return Err(Error::Custom("unexpected CBOR tag for COSE_Sign".into()));
-        }
+        let body = tag::message_body(data, Self::TAG)?;
         let wire: SignWire = cbor2::from_slice(body)?;
         if wire.signatures.is_empty() {
             return Err(Error::Custom("SignMessage has no signatures".into()));
@@ -385,6 +419,7 @@ impl SignMessage {
                 unprotected: sw.unprotected,
                 signature: sw.signature,
                 protected_raw: sw.protected,
+                state: util::OperationState::Complete,
             });
         }
         Ok(SignMessage {
@@ -393,12 +428,13 @@ impl SignMessage {
             payload: wire.payload,
             signatures,
             protected_raw: wire.protected,
-            signed: true,
+            state: util::OperationState::Complete,
         })
     }
 
-    /// Verifies every signature: each must match exactly one of the
-    /// `verifiers` (by `kid`) and validate.
+    /// Verifies every signature: each must validate with at least one
+    /// candidate verifier. A matching `kid` ranks a candidate first but is not
+    /// treated as a unique identity.
     pub fn verify(
         &self,
         verifiers: &[&dyn Verifier],
@@ -429,8 +465,8 @@ impl SignMessage {
         payload: &[u8],
         external_aad: &[u8],
     ) -> Result<(), Error> {
-        if !self.signed {
-            return Err(Error::Custom(
+        if !self.state.complete() {
+            return Err(Error::InvalidState(
                 "SignMessage must be decoded before verifying".into(),
             ));
         }
@@ -442,8 +478,10 @@ impl SignMessage {
         if self.signatures.is_empty() {
             return Err(Error::Custom("SignMessage has no signatures".into()));
         }
+        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
 
         for sig in &self.signatures {
+            crate::header::validate_protected_state(&sig.protected, &sig.protected_raw)?;
             let kid = sig.kid()?;
             let tbs = Self::to_be_signed(
                 &self.protected_raw,
@@ -453,25 +491,44 @@ impl SignMessage {
             )?;
             let mut matched_kid = false;
             let mut last_error = None;
-            for verifier in verifiers.iter().filter(|v| util::kid_matches(kid, v.kid())) {
-                matched_kid = true;
-                if let Err(err) = util::check_protected_alg(&sig.protected, verifier.alg()) {
-                    last_error = Some(err);
-                    continue;
-                }
-                match verifier.verify(&tbs, &sig.signature) {
-                    Ok(()) => {
-                        last_error = None;
-                        break;
+            let mut verified = false;
+            'candidates: for rank in 0..=1 {
+                for verifier in verifiers
+                    .iter()
+                    .filter(|verifier| util::kid_match_rank(kid, verifier.kid()) == Some(rank))
+                {
+                    matched_kid = true;
+                    if let Err(err) = self
+                        .protected
+                        .ensure_crit_understood(verifier.understood_critical_headers())
+                        .and_then(|_| {
+                            sig.protected
+                                .ensure_crit_understood(verifier.understood_critical_headers())
+                        })
+                    {
+                        last_error = Some(err);
+                        continue;
                     }
-                    Err(err) => last_error = Some(err),
+                    if let Err(err) =
+                        util::check_protected_alg(&sig.protected, &sig.unprotected, verifier.alg())
+                    {
+                        last_error = Some(err);
+                        continue;
+                    }
+                    match verifier.verify(&tbs, &sig.signature) {
+                        Ok(()) => {
+                            verified = true;
+                            break 'candidates;
+                        }
+                        Err(err) => last_error = Some(err),
+                    }
                 }
-            }
-            if let Some(err) = last_error {
-                return Err(err);
             }
             if !matched_kid {
                 return Err(Error::verify("no verifier for signature kid"));
+            }
+            if !verified {
+                return Err(last_error.unwrap_or_else(|| Error::verify("signature mismatch")));
             }
         }
         Ok(())

@@ -5,7 +5,9 @@
 //! `cose2` for COSE signing, verification and header storage; the APIs here
 //! cover SD-CWT-specific header parameters, salted disclosures, redacted claim
 //! markers, AEAD-encrypted disclosure wire structures, and restoration of a
-//! presented claims set.
+//! presented claims set. [`SdCwtValidator`] and
+//! [`verify_validate_and_restore_sd_cwt`] enforce draft-08 structure and
+//! configurable resource limits.
 //!
 //! # Security
 //!
@@ -109,7 +111,7 @@ where
 /// Redaction hash algorithm used for Salted Disclosed Claims.
 pub trait RedactionHasher {
     /// Returns the COSE algorithm identifier advertised in `sd_alg`.
-    fn algorithm(&self) -> Label;
+    fn algorithm(&self) -> i64;
 
     /// Computes the digest of one bstr-encoded Salted Disclosed Claim.
     fn digest(&self, data: &[u8]) -> Vec<u8>;
@@ -120,8 +122,8 @@ pub trait RedactionHasher {
 pub struct Sha256RedactionHasher;
 
 impl RedactionHasher for Sha256RedactionHasher {
-    fn algorithm(&self) -> Label {
-        Label::Int(ALG_SHA_256)
+    fn algorithm(&self) -> i64 {
+        ALG_SHA_256
     }
 
     fn digest(&self, data: &[u8]) -> Vec<u8> {
@@ -130,9 +132,9 @@ impl RedactionHasher for Sha256RedactionHasher {
 }
 
 /// Returns the built-in SHA-256 hasher for `sd_alg = -16` or an omitted `sd_alg`.
-pub fn default_hasher_for_sd_alg(alg: Option<Label>) -> Result<Sha256RedactionHasher, Error> {
+pub fn default_hasher_for_sd_alg(alg: Option<i64>) -> Result<Sha256RedactionHasher, Error> {
     match alg {
-        None | Some(Label::Int(ALG_SHA_256)) => Ok(Sha256RedactionHasher),
+        None | Some(ALG_SHA_256) => Ok(Sha256RedactionHasher),
         Some(other) => Err(Error::custom(format!(
             "unsupported SD-CWT hash algorithm {other}"
         ))),
@@ -140,13 +142,13 @@ pub fn default_hasher_for_sd_alg(alg: Option<Label>) -> Result<Sha256RedactionHa
 }
 
 /// Reads the `sd_alg` protected header parameter.
-pub fn sd_alg(protected: &Header) -> Result<Option<Label>, Error> {
-    protected.get_label(HEADER_SD_ALG)
+pub fn sd_alg(protected: &Header) -> Result<Option<i64>, Error> {
+    protected.get_i64(HEADER_SD_ALG)
 }
 
 /// Sets the `sd_alg` protected header parameter.
-pub fn set_sd_alg(protected: &mut Header, alg: impl Into<Label>) -> &mut Header {
-    protected.insert(HEADER_SD_ALG, Value::from(alg.into()));
+pub fn set_sd_alg(protected: &mut Header, alg: i64) -> &mut Header {
+    protected.insert(HEADER_SD_ALG, alg);
     protected
 }
 
@@ -240,10 +242,33 @@ impl Disclosure {
 
     /// Decodes and validates one bstr-encoded Salted Disclosed Claim.
     pub fn from_encoded(encoded: impl Into<Vec<u8>>) -> Result<Self, Error> {
+        Self::from_encoded_with_limits(encoded, ProcessingLimits::default())
+    }
+
+    /// Decodes one disclosure with explicit resource limits.
+    pub fn from_encoded_with_limits(
+        encoded: impl Into<Vec<u8>>,
+        limits: ProcessingLimits,
+    ) -> Result<Self, Error> {
         let encoded = encoded.into();
+        if encoded.len() > limits.max_disclosure_bytes {
+            return Err(Error::limit(
+                "SD-CWT disclosure bytes",
+                limits.max_disclosure_bytes,
+            ));
+        }
+        cose2::validate_cbor(
+            &encoded,
+            cose2::CborLimits {
+                max_depth: limits.max_depth,
+                max_items: limits.max_items,
+                require_definite: true,
+            },
+        )?;
         let value: Value = cbor2::from_slice(&encoded)?;
         let kind = decode_disclosure_value(value)?;
         validate_disclosure_kind(&kind)?;
+        validate_disclosure_value(&kind, limits)?;
         Ok(Self { kind, encoded })
     }
 
@@ -269,23 +294,33 @@ impl Disclosure {
 
     /// Converts this disclosure to its decoded CBOR value.
     pub fn to_value(&self) -> Value {
-        match &self.kind {
-            DisclosureKind::Claim { salt, key, value } => Value::Array(vec![
-                Value::Bytes(salt.clone()),
-                value.clone(),
-                Value::from(key.clone()),
-            ]),
-            DisclosureKind::Element { salt, value } => {
-                Value::Array(vec![Value::Bytes(salt.clone()), value.clone()])
-            }
-            DisclosureKind::Decoy { salt } => Value::Array(vec![Value::Bytes(salt.clone())]),
-        }
+        kind_to_value(&self.kind)
     }
 
     fn from_kind(kind: DisclosureKind) -> Result<Self, Error> {
         validate_disclosure_kind(&kind)?;
+        validate_disclosure_value(&kind, ProcessingLimits::default())?;
         let encoded = cbor2::to_canonical_vec(&kind_to_value(&kind))?;
         Ok(Self { kind, encoded })
+    }
+
+    fn item_count(&self) -> Result<usize, Error> {
+        let fixed = match &self.kind {
+            DisclosureKind::Decoy { .. } => 2,
+            DisclosureKind::Element { .. } => 2,
+            DisclosureKind::Claim { .. } => 3,
+        };
+        let value = match &self.kind {
+            DisclosureKind::Claim { value, .. } | DisclosureKind::Element { value, .. } => {
+                Some(value)
+            }
+            DisclosureKind::Decoy { .. } => None,
+        };
+        value.map_or(Ok(fixed), |value| {
+            fixed
+                .checked_add(value_item_count(value)?)
+                .ok_or_else(|| Error::custom("SD-CWT item count overflow"))
+        })
     }
 }
 
@@ -364,21 +399,70 @@ impl<'a> IntoIterator for &'a DisclosureSet {
 
 /// Reads `sd_claims` from an unprotected header.
 pub fn disclosures_from_unprotected(header: &Header) -> Result<Vec<Disclosure>, Error> {
+    disclosures_from_unprotected_with_limits(header, ProcessingLimits::default())
+}
+
+/// Reads `sd_claims` while enforcing explicit resource limits.
+pub fn disclosures_from_unprotected_with_limits(
+    header: &Header,
+    limits: ProcessingLimits,
+) -> Result<Vec<Disclosure>, Error> {
     let Some(value) = header.get(HEADER_SD_CLAIMS) else {
         return Ok(Vec::new());
     };
     let Value::Array(items) = value else {
         return Err(Error::UnexpectedType("sd_claims must be an array".into()));
     };
+    if items.is_empty() {
+        return Err(Error::custom(
+            "sd_claims must be omitted instead of containing an empty array",
+        ));
+    }
+    if items.len() > limits.max_disclosures {
+        return Err(Error::limit("SD-CWT disclosure", limits.max_disclosures));
+    }
+    let envelope_items = items
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| Error::custom("SD-CWT item count overflow"))?;
+    if envelope_items > limits.max_items {
+        return Err(Error::limit("SD-CWT disclosure values", limits.max_items));
+    }
 
     let mut disclosures = Vec::with_capacity(items.len());
+    let mut salts = HashSet::with_capacity(items.len());
+    let mut total_bytes = 0usize;
+    let mut remaining_items = limits.max_items - envelope_items;
     for item in items {
         let Value::Bytes(encoded) = item else {
             return Err(Error::UnexpectedType(
                 "sd_claims entries must be byte strings".into(),
             ));
         };
-        disclosures.push(Disclosure::from_encoded(encoded.clone())?);
+        total_bytes = total_bytes
+            .checked_add(encoded.len())
+            .ok_or_else(|| Error::custom("SD-CWT disclosure size overflow"))?;
+        if total_bytes > limits.max_disclosure_bytes {
+            return Err(Error::limit(
+                "SD-CWT disclosure bytes",
+                limits.max_disclosure_bytes,
+            ));
+        }
+        let mut disclosure_limits = limits;
+        disclosure_limits.max_items = remaining_items;
+        let disclosure = Disclosure::from_encoded_with_limits(encoded.clone(), disclosure_limits)?;
+        let salt = match disclosure.kind() {
+            DisclosureKind::Claim { salt, .. }
+            | DisclosureKind::Element { salt, .. }
+            | DisclosureKind::Decoy { salt } => salt,
+        };
+        if !salts.insert(salt.clone()) {
+            return Err(Error::verify("duplicate SD-CWT disclosure salt"));
+        }
+        remaining_items = remaining_items
+            .checked_sub(disclosure.item_count()?)
+            .ok_or_else(|| Error::limit("SD-CWT disclosure values", limits.max_items))?;
+        disclosures.push(disclosure);
     }
     Ok(disclosures)
 }
@@ -455,6 +539,19 @@ impl AeadEncryptedDisclosure {
         let nonce = expect_bytes(&items[0], "AEAD nonce")?.to_vec();
         let ciphertext = expect_bytes(&items[1], "AEAD ciphertext")?.to_vec();
         let tag = expect_bytes(&items[2], "AEAD tag")?.to_vec();
+        if nonce.is_empty() {
+            return Err(Error::custom("AEAD disclosure nonce must not be empty"));
+        }
+        if ciphertext.is_empty() {
+            return Err(Error::custom(
+                "AEAD disclosure ciphertext must not be empty",
+            ));
+        }
+        if tag.len() < 16 {
+            return Err(Error::custom(
+                "AEAD disclosure authentication tag must be at least 16 bytes",
+            ));
+        }
         let key_context = if items.len() == 4 {
             Some(match &items[3] {
                 Value::Integer(value) => {
@@ -488,6 +585,14 @@ impl AeadEncryptedDisclosure {
 pub fn aead_encrypted_disclosures_from_unprotected(
     header: &Header,
 ) -> Result<Vec<AeadEncryptedDisclosure>, Error> {
+    aead_encrypted_disclosures_from_unprotected_with_limits(header, ProcessingLimits::default())
+}
+
+/// Reads encrypted disclosures while enforcing explicit resource limits.
+pub fn aead_encrypted_disclosures_from_unprotected_with_limits(
+    header: &Header,
+    limits: ProcessingLimits,
+) -> Result<Vec<AeadEncryptedDisclosure>, Error> {
     let Some(value) = header.get(HEADER_SD_AEAD_ENCRYPTED_CLAIMS) else {
         return Ok(Vec::new());
     };
@@ -496,10 +601,69 @@ pub fn aead_encrypted_disclosures_from_unprotected(
             "sd_aead_encrypted_claims must be an array".into(),
         ));
     };
-    items
+    if items.is_empty() {
+        return Err(Error::custom(
+            "sd_aead_encrypted_claims must be omitted instead of containing an empty array",
+        ));
+    }
+    if items.len() > limits.max_disclosures {
+        return Err(Error::limit(
+            "SD-CWT encrypted disclosure",
+            limits.max_disclosures,
+        ));
+    }
+    if items.len() > limits.max_container_entries {
+        return Err(Error::limit(
+            "SD-CWT encrypted disclosure container entry",
+            limits.max_container_entries,
+        ));
+    }
+    let item_count = items.iter().try_fold(1usize, |count, value| {
+        count
+            .checked_add(value_item_count(value)?)
+            .ok_or_else(|| Error::custom("encrypted disclosure item count overflow"))
+    })?;
+    if item_count > limits.max_items {
+        return Err(Error::limit(
+            "SD-CWT encrypted disclosure item",
+            limits.max_items,
+        ));
+    }
+    let disclosures = items
         .iter()
         .map(AeadEncryptedDisclosure::from_value)
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut nonces = HashSet::with_capacity(disclosures.len());
+    if disclosures
+        .iter()
+        .any(|disclosure| !nonces.insert(disclosure.nonce.clone()))
+    {
+        return Err(Error::verify(
+            "duplicate nonce in SD-CWT encrypted disclosures",
+        ));
+    }
+    let total_bytes = disclosures.iter().try_fold(0usize, |total, disclosure| {
+        total
+            .checked_add(disclosure.nonce.len())
+            .and_then(|total| total.checked_add(disclosure.ciphertext.len()))
+            .and_then(|total| total.checked_add(disclosure.tag.len()))
+            .and_then(|total| {
+                let context_len = match &disclosure.key_context {
+                    Some(AeadKeyContext::Text(value)) => value.len(),
+                    Some(AeadKeyContext::Thumbprint(value)) => value.len(),
+                    Some(AeadKeyContext::Uint(_)) | None => 0,
+                };
+                total.checked_add(context_len)
+            })
+            .ok_or_else(|| Error::custom("encrypted disclosure size overflow"))
+    })?;
+    if total_bytes > limits.max_disclosure_bytes {
+        return Err(Error::limit(
+            "SD-CWT encrypted disclosure bytes",
+            limits.max_disclosure_bytes,
+        ));
+    }
+    Ok(disclosures)
 }
 
 /// Writes `sd_aead_encrypted_claims` to an unprotected header.
@@ -532,6 +696,76 @@ pub struct IssueResult {
     pub disclosures: DisclosureSet,
 }
 
+/// Resource limits applied while issuing or restoring SD-CWT claims.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessingLimits {
+    /// Maximum nesting assembled across the payload and disclosures.
+    pub max_depth: usize,
+    /// Maximum number of values visited during one operation.
+    pub max_items: usize,
+    /// Maximum number of disclosures accepted in one operation.
+    pub max_disclosures: usize,
+    /// Maximum combined encoded disclosure size.
+    pub max_disclosure_bytes: usize,
+    /// Maximum entries in any one map or array.
+    pub max_container_entries: usize,
+    /// Maximum encoded SD-CWT or payload size accepted by high-level APIs.
+    pub max_input_bytes: usize,
+}
+
+impl Default for ProcessingLimits {
+    fn default() -> Self {
+        Self {
+            max_depth: 64,
+            max_items: 100_000,
+            max_disclosures: 4_096,
+            max_disclosure_bytes: 4 * 1024 * 1024,
+            max_container_entries: 16_384,
+            max_input_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
+struct TraversalBudget {
+    limits: ProcessingLimits,
+    visited: usize,
+}
+
+impl TraversalBudget {
+    fn new(limits: ProcessingLimits) -> Self {
+        Self { limits, visited: 0 }
+    }
+
+    fn enter(&mut self, depth: usize) -> Result<(), Error> {
+        if depth > self.limits.max_depth {
+            return Err(Error::limit("SD-CWT nesting", self.limits.max_depth));
+        }
+        self.consume(1)
+    }
+
+    fn consume(&mut self, count: usize) -> Result<(), Error> {
+        self.visited = self
+            .visited
+            .checked_add(count)
+            .ok_or_else(|| Error::custom("SD-CWT item count overflow"))?;
+        if self.visited > self.limits.max_items {
+            return Err(Error::limit("SD-CWT item", self.limits.max_items));
+        }
+        Ok(())
+    }
+
+    fn container(&self, len: usize) -> Result<(), Error> {
+        if len > self.limits.max_container_entries {
+            Err(Error::limit(
+                "SD-CWT container entry",
+                self.limits.max_container_entries,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Converts a pre-issued claims value containing tag 58/62 requests into an issued value.
 ///
 /// Tag 58 around a map key redacts that key/value pair. Tag 58 around an
@@ -543,13 +777,32 @@ pub fn issue_from_preissuance(
     salts: &mut dyn SaltGenerator,
     hasher: &dyn RedactionHasher,
 ) -> Result<IssueResult, Error> {
+    issue_from_preissuance_with_limits(value, salts, hasher, ProcessingLimits::default())
+}
+
+/// Converts pre-issuance claims while enforcing caller-selected limits.
+pub fn issue_from_preissuance_with_limits(
+    value: Value,
+    salts: &mut dyn SaltGenerator,
+    hasher: &dyn RedactionHasher,
+    limits: ProcessingLimits,
+) -> Result<IssueResult, Error> {
+    if !matches!(value, Value::Map(_)) {
+        return Err(Error::UnexpectedType(
+            "pre-issuance SD-CWT claims must be a map".into(),
+        ));
+    }
     let mut context = IssueContext {
         salts,
         hasher,
         decoy_ids: HashSet::new(),
+        salts_used: HashSet::new(),
+        digests_used: HashSet::new(),
         disclosures: Vec::new(),
+        disclosure_bytes: 0,
+        budget: TraversalBudget::new(limits),
     };
-    let value = issue_value(value, &mut context)?;
+    let value = issue_value(value, &mut context, 0)?;
     Ok(IssueResult {
         value,
         disclosures: DisclosureSet::from_disclosures(context.disclosures),
@@ -568,8 +821,10 @@ pub enum RestoreMode {
 /// Result of restoring disclosed SD-CWT claims.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RestoreReport {
-    /// The restored claims value.
+    /// The restored payload claims value.
     pub value: Value,
+    /// Restored claims from the protected `CWT_Claims` header, when present.
+    pub protected_claims: Option<Value>,
     /// Number of map claims or array elements restored from disclosures.
     pub disclosed: usize,
     /// Number of matching decoy redactions removed.
@@ -619,9 +874,47 @@ pub fn restore<I>(
 where
     I: IntoIterator<Item = Disclosure>,
 {
-    let mut pending = DisclosureMap::new(disclosures, hasher)?;
+    restore_with_limits(
+        value,
+        disclosures,
+        hasher,
+        mode,
+        ProcessingLimits::default(),
+    )
+}
+
+/// Restores claims while enforcing caller-selected resource limits.
+pub fn restore_with_limits<I>(
+    value: Value,
+    disclosures: I,
+    hasher: &dyn RedactionHasher,
+    mode: RestoreMode,
+    limits: ProcessingLimits,
+) -> Result<RestoreReport, Error>
+where
+    I: IntoIterator<Item = Disclosure>,
+{
+    restore_with_protected_claims(value, None, disclosures, hasher, mode, limits)
+}
+
+fn restore_with_protected_claims<I>(
+    value: Value,
+    protected_claims: Option<Value>,
+    disclosures: I,
+    hasher: &dyn RedactionHasher,
+    mode: RestoreMode,
+    limits: ProcessingLimits,
+) -> Result<RestoreReport, Error>
+where
+    I: IntoIterator<Item = Disclosure>,
+{
     let mut stats = RestoreStats::default();
-    let value = restore_value(value, &mut pending, mode, &mut stats)?;
+    let mut budget = TraversalBudget::new(limits);
+    let mut pending = DisclosureMap::new(disclosures, hasher, &mut budget)?;
+    let protected_claims = protected_claims
+        .map(|claims| restore_value(claims, &mut pending, mode, &mut stats, &mut budget, 0))
+        .transpose()?;
+    let value = restore_value(value, &mut pending, mode, &mut stats, &mut budget, 0)?;
     if !pending.is_empty() {
         return Err(Error::verify(
             "sd_claims contains a disclosure without a matching redacted claim",
@@ -629,6 +922,7 @@ where
     }
     Ok(RestoreReport {
         value,
+        protected_claims,
         disclosed: stats.disclosed,
         decoys: stats.decoys,
         removed_redactions: stats.removed_redactions,
@@ -670,12 +964,871 @@ pub fn restore_payload_with_disclosures<I>(
 where
     I: IntoIterator<Item = Disclosure>,
 {
+    restore_payload_with_disclosures_and_limits(
+        message,
+        disclosures,
+        hasher,
+        mode,
+        ProcessingLimits::default(),
+    )
+}
+
+/// Decodes and restores an SD-CWT payload and protected `CWT_Claims` map with
+/// explicit resource limits.
+pub fn restore_payload_with_disclosures_and_limits<I>(
+    message: &cose2::Sign1Message,
+    disclosures: I,
+    hasher: &dyn RedactionHasher,
+    mode: RestoreMode,
+    limits: ProcessingLimits,
+) -> Result<RestoreReport, Error>
+where
+    I: IntoIterator<Item = Disclosure>,
+{
+    ensure_message_protected_state(message)?;
     let payload = message
         .payload
         .as_deref()
         .ok_or_else(|| Error::custom("SD-CWT message must carry an embedded payload"))?;
+    if payload.len() > limits.max_input_bytes {
+        return Err(Error::limit("SD-CWT payload bytes", limits.max_input_bytes));
+    }
+    cose2::validate_cbor(
+        payload,
+        cose2::CborLimits {
+            max_depth: limits.max_depth,
+            max_items: limits.max_items,
+            require_definite: true,
+        },
+    )?;
     let value: Value = cbor2::from_slice(payload)?;
-    restore(value, disclosures, hasher, mode)
+    if !matches!(value, Value::Map(_)) {
+        return Err(Error::UnexpectedType(
+            "SD-CWT payload must be a claims map".into(),
+        ));
+    }
+    restore_with_protected_claims(
+        value,
+        protected_cwt_claims(message)?,
+        disclosures,
+        hasher,
+        mode,
+        limits,
+    )
+}
+
+/// Verifies a definite-length SD-CWT COSE_Sign1, validates its protected
+/// envelope headers, and returns the decoded message.
+pub fn verify_and_decode_sd_cwt(
+    verifier: &dyn cose2::Verifier,
+    data: &[u8],
+    external_aad: Option<&[u8]>,
+    limits: ProcessingLimits,
+) -> Result<cose2::Sign1Message, Error> {
+    if data.len() > limits.max_input_bytes {
+        return Err(Error::limit("SD-CWT input bytes", limits.max_input_bytes));
+    }
+    cose2::validate_cbor(
+        data,
+        cose2::CborLimits {
+            max_depth: limits.max_depth,
+            max_items: limits.max_items,
+            require_definite: true,
+        },
+    )?;
+    let message = cose2::Sign1Message::from_slice(data)?;
+    validate_sd_headers(&message, limits)?;
+    let verifier = SdCriticalVerifier::new(verifier);
+    message.verify(&verifier, external_aad)?;
+    Ok(message)
+}
+
+struct SdCriticalVerifier<'a> {
+    inner: &'a dyn cose2::Verifier,
+    understood: Vec<Label>,
+}
+
+impl<'a> SdCriticalVerifier<'a> {
+    fn new(inner: &'a dyn cose2::Verifier) -> Self {
+        let mut understood = inner.understood_critical_headers().to_vec();
+        for label in [HEADER_CWT_CLAIMS, HEADER_TYP, HEADER_SD_ALG, HEADER_SD_AEAD] {
+            let label = Label::from(label);
+            if !understood.contains(&label) {
+                understood.push(label);
+            }
+        }
+        Self { inner, understood }
+    }
+}
+
+impl cose2::Verifier for SdCriticalVerifier<'_> {
+    fn alg(&self) -> Option<Label> {
+        self.inner.alg()
+    }
+
+    fn kid(&self) -> Option<&[u8]> {
+        self.inner.kid()
+    }
+
+    fn understood_critical_headers(&self) -> &[Label] {
+        &self.understood
+    }
+
+    fn verify(&self, data: &[u8], signature: &[u8]) -> Result<(), Error> {
+        self.inner.verify(data, signature)
+    }
+}
+
+/// Options for full SD-CWT structural validation and restoration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SdCwtValidationOptions {
+    /// Allow a protected certificate header to identify the issuer when `iss`
+    /// is absent. The caller is responsible for validating that certificate.
+    pub issuer_identified_by_protected_header: bool,
+    /// Optional profile nonce-size constraint, applied in addition to the
+    /// selected AEAD algorithm's required `N_MIN` size.
+    pub aead_nonce_size: Option<usize>,
+    /// Resource limits for parsing and restoration.
+    pub limits: ProcessingLimits,
+}
+
+/// Validates the draft-08 SD-CWT structure and restores its disclosed claims.
+#[derive(Clone, Copy, Debug)]
+pub struct SdCwtValidator {
+    options: SdCwtValidationOptions,
+}
+
+impl SdCwtValidator {
+    /// Creates an SD-CWT validator.
+    pub fn new(options: SdCwtValidationOptions) -> Self {
+        Self { options }
+    }
+
+    /// Validates headers, required claims, dates and disclosure rules, then restores.
+    ///
+    /// `message` must be the result of verifying the received wire bytes. Use
+    /// [`verify_validate_and_restore_sd_cwt`] for the combined safe path.
+    pub fn validate_and_restore(
+        &self,
+        message: &cose2::Sign1Message,
+        mode: RestoreMode,
+    ) -> Result<RestoreReport, Error> {
+        ensure_message_protected_state(message)?;
+        validate_sd_headers(message, self.options.limits)?;
+        let protected_claims = protected_cwt_claims(message)?;
+        let disclosures =
+            disclosures_from_unprotected_with_limits(&message.unprotected, self.options.limits)?;
+        let encrypted = aead_encrypted_disclosures_from_unprotected_with_limits(
+            &message.unprotected,
+            self.options.limits,
+        )?;
+        let aead_algorithm = sd_aead(&message.protected)?.unwrap_or(1);
+        validate_aead_disclosure_dimensions(
+            &encrypted,
+            aead_algorithm,
+            self.options.aead_nonce_size,
+        )?;
+
+        let payload = message
+            .payload
+            .as_deref()
+            .ok_or_else(|| Error::custom("SD-CWT message must carry an embedded payload"))?;
+        if payload.len() > self.options.limits.max_input_bytes {
+            return Err(Error::limit(
+                "SD-CWT payload bytes",
+                self.options.limits.max_input_bytes,
+            ));
+        }
+        cose2::validate_cbor(
+            payload,
+            cose2::CborLimits {
+                max_depth: self.options.limits.max_depth,
+                max_items: self.options.limits.max_items,
+                require_definite: true,
+            },
+        )?;
+        let value: Value = cbor2::from_slice(payload)?;
+        let Value::Map(entries) = &value else {
+            return Err(Error::UnexpectedType(
+                "SD-CWT payload must be a claims map".into(),
+            ));
+        };
+        let maps = claim_maps(entries, protected_claims.as_ref());
+        validate_matching_claims(&maps)?;
+        validate_registered_claim_types(&maps)?;
+        validate_required_claims(
+            &maps,
+            self.options.issuer_identified_by_protected_header,
+            true,
+        )?;
+        validate_time_relationships(&maps)?;
+        validate_never_redacted(&disclosures)?;
+
+        let hasher = default_hasher_for_sd_alg(sd_alg(&message.protected)?)?;
+        let report = restore_with_protected_claims(
+            value,
+            protected_claims,
+            disclosures,
+            &hasher,
+            mode,
+            self.options.limits,
+        )?;
+        let Value::Map(entries) = &report.value else {
+            unreachable!();
+        };
+        let restored_maps = claim_maps(entries, report.protected_claims.as_ref());
+        validate_matching_claims(&restored_maps)?;
+        validate_registered_claim_types(&restored_maps)?;
+        validate_time_relationships(&restored_maps)?;
+        if mode == RestoreMode::Holder {
+            validate_required_claims(
+                &restored_maps,
+                self.options.issuer_identified_by_protected_header,
+                false,
+            )?;
+        }
+        Ok(report)
+    }
+}
+
+fn ensure_message_protected_state(message: &cose2::Sign1Message) -> Result<(), Error> {
+    let authenticated = if message.protected_raw().is_empty() {
+        Header::new()
+    } else {
+        Header::from_slice(message.protected_raw())?
+    };
+    if authenticated.to_vec()? != message.protected.to_vec()? {
+        return Err(Error::invalid_state(
+            "SD-CWT protected header differs from authenticated bytes",
+        ));
+    }
+    Ok(())
+}
+
+impl Default for SdCwtValidator {
+    fn default() -> Self {
+        Self::new(SdCwtValidationOptions::default())
+    }
+}
+
+/// Verifies the issuer signature, validates draft-08 structure and restores
+/// disclosures in one operation.
+pub fn verify_validate_and_restore_sd_cwt(
+    verifier: &dyn cose2::Verifier,
+    data: &[u8],
+    external_aad: Option<&[u8]>,
+    mode: RestoreMode,
+    options: SdCwtValidationOptions,
+) -> Result<(cose2::Sign1Message, RestoreReport), Error> {
+    let message = verify_and_decode_sd_cwt(verifier, data, external_aad, options.limits)?;
+    let report = SdCwtValidator::new(options).validate_and_restore(&message, mode)?;
+    Ok((message, report))
+}
+
+fn validate_sd_headers(
+    message: &cose2::Sign1Message,
+    limits: ProcessingLimits,
+) -> Result<(), Error> {
+    for label in [HEADER_SD_CLAIMS, HEADER_SD_AEAD_ENCRYPTED_CLAIMS] {
+        if message.protected.contains_key(label) {
+            return Err(Error::custom(format!(
+                "SD-CWT header {label} must be unprotected"
+            )));
+        }
+    }
+    for label in [HEADER_CWT_CLAIMS, HEADER_TYP, HEADER_SD_ALG, HEADER_SD_AEAD] {
+        if message.unprotected.contains_key(label) {
+            return Err(Error::custom(format!(
+                "SD-CWT header {label} must be protected"
+            )));
+        }
+    }
+    match message.protected.get(HEADER_TYP) {
+        Some(Value::Integer(value))
+            if i64::try_from(*value).ok() == Some(CONTENT_FORMAT_SD_CWT) => {}
+        Some(Value::Text(value)) if is_sd_cwt_content_type(value) => {}
+        _ => {
+            return Err(Error::custom(
+                "SD-CWT protected typ must be 293, application/sd-cwt, or a +sd-cwt media type",
+            ))
+        }
+    }
+    let _ = sd_alg(&message.protected)?;
+    if let Some(algorithm) = sd_aead(&message.protected)? {
+        validate_sd_aead_algorithm(algorithm)?;
+    }
+    let algorithm = message
+        .protected
+        .alg()?
+        .ok_or_else(|| Error::custom("SD-CWT protected header is missing alg"))?;
+    let Label::Int(algorithm) = algorithm else {
+        return Err(Error::custom(
+            "SD-CWT signature algorithm must be a registered integer",
+        ));
+    };
+    if !is_fully_specified_signature_algorithm(algorithm) {
+        return Err(Error::custom(format!(
+            "SD-CWT algorithm {algorithm} is not a recognized fully specified asymmetric signature algorithm"
+        )));
+    }
+    if let Some(claims) = protected_cwt_claims_ref(message)? {
+        validate_issued_value(claims, &mut TraversalBudget::new(limits), 0)?;
+    }
+    validate_safe_headers(message, limits)
+}
+
+fn is_sd_cwt_content_type(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    if value == "application/sd-cwt" {
+        return true;
+    }
+    let Some((type_name, subtype)) = value.split_once('/') else {
+        return false;
+    };
+    is_media_type_token(type_name)
+        && is_media_type_token(subtype)
+        && !subtype.starts_with('+')
+        && subtype.ends_with("+sd-cwt")
+}
+
+fn is_media_type_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-'
+                )
+        })
+}
+
+fn is_fully_specified_signature_algorithm(algorithm: i64) -> bool {
+    matches!(
+        algorithm,
+        cose2::iana::AlgorithmESB512
+            | cose2::iana::AlgorithmESB384
+            | cose2::iana::AlgorithmESB320
+            | cose2::iana::AlgorithmESB256
+            | cose2::iana::AlgorithmWalnutDSA
+            | cose2::iana::AlgorithmRS512
+            | cose2::iana::AlgorithmRS384
+            | cose2::iana::AlgorithmRS256
+            | cose2::iana::AlgorithmEd448
+            | cose2::iana::AlgorithmESP512
+            | cose2::iana::AlgorithmESP384
+            | cose2::iana::AlgorithmML_DSA_87
+            | cose2::iana::AlgorithmML_DSA_65
+            | cose2::iana::AlgorithmML_DSA_44
+            | cose2::iana::AlgorithmES256K
+            | cose2::iana::AlgorithmHSS_LMS
+            | cose2::iana::AlgorithmPS512
+            | cose2::iana::AlgorithmPS384
+            | cose2::iana::AlgorithmPS256
+            | cose2::iana::AlgorithmEd25519
+            | cose2::iana::AlgorithmESP256
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SdAeadDimensions {
+    nonce_size: usize,
+    tag_sizes: &'static [usize],
+}
+
+fn sd_aead_dimensions(algorithm: u16) -> Result<SdAeadDimensions, Error> {
+    // draft-ietf-spice-sd-cwt-08 requires an N_MIN-sized nonce. The values
+    // below come from each algorithm's defining entry in the IANA AEAD
+    // Algorithms registry; tag sizes are restricted to at least 16 bytes by
+    // the draft, with AEGIS-X further restricted to its 256-bit variant.
+    const TAG_128: &[usize] = &[16];
+    const TAG_128_OR_256: &[usize] = &[16, 32];
+    const TAG_256: &[usize] = &[32];
+
+    let (nonce_size, tag_sizes) = match algorithm {
+        1 | 2 => (12, TAG_128),
+        15..=17 | 20 | 23 | 26 => (1, TAG_128),
+        29..=31 => (12, TAG_128),
+        32 => (16, TAG_128_OR_256),
+        33 => (32, TAG_128_OR_256),
+        34 | 35 => (16, TAG_256),
+        36 | 37 => (32, TAG_256),
+        38 | 39 => (24, TAG_128),
+        _ => {
+            return Err(Error::custom(format!(
+                "AEAD algorithm {algorithm} is not permitted for SD-CWT encrypted disclosures"
+            )))
+        }
+    };
+    Ok(SdAeadDimensions {
+        nonce_size,
+        tag_sizes,
+    })
+}
+
+fn validate_sd_aead_algorithm(algorithm: u16) -> Result<(), Error> {
+    sd_aead_dimensions(algorithm).map(|_| ())
+}
+
+fn validate_aead_disclosure_dimensions(
+    encrypted: &[AeadEncryptedDisclosure],
+    algorithm: u16,
+    profile_nonce_size: Option<usize>,
+) -> Result<(), Error> {
+    let dimensions = sd_aead_dimensions(algorithm)?;
+    for entry in encrypted {
+        let actual_nonce_size = entry.nonce.len();
+        if actual_nonce_size != dimensions.nonce_size {
+            return Err(Error::custom(format!(
+                "AEAD algorithm {algorithm} disclosure nonce size mismatch, expected {}, got {actual_nonce_size}",
+                dimensions.nonce_size
+            )));
+        }
+        if let Some(expected) = profile_nonce_size {
+            if actual_nonce_size != expected {
+                return Err(Error::custom(format!(
+                    "AEAD disclosure nonce size does not satisfy the profile, expected {expected}, got {actual_nonce_size}"
+                )));
+            }
+        }
+        if !dimensions.tag_sizes.contains(&entry.tag.len()) {
+            let expected = dimensions
+                .tag_sizes
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(" or ");
+            return Err(Error::custom(format!(
+                "AEAD algorithm {algorithm} disclosure tag size mismatch, expected {expected} bytes, got {}",
+                entry.tag.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_safe_headers(
+    message: &cose2::Sign1Message,
+    limits: ProcessingLimits,
+) -> Result<(), Error> {
+    let mut budget = TraversalBudget::new(limits);
+    for (header, skip_cwt_claims) in [(&message.protected, true), (&message.unprotected, false)] {
+        budget.enter(0)?;
+        budget.container(header.len())?;
+        for (label, value) in header.iter() {
+            budget.enter(1)?;
+            validate_text_label(label)?;
+            if skip_cwt_claims && *label == Label::Int(HEADER_CWT_CLAIMS) {
+                continue;
+            }
+            validate_safe_value(value, &mut budget, 1)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_safe_value(
+    value: &Value,
+    budget: &mut TraversalBudget,
+    depth: usize,
+) -> Result<(), Error> {
+    budget.enter(depth)?;
+    match value {
+        Value::Array(items) => {
+            budget.container(items.len())?;
+            for item in items {
+                validate_safe_value(item, budget, depth + 1)?;
+            }
+        }
+        Value::Map(entries) => {
+            budget.container(entries.len())?;
+            let mut keys = HashSet::with_capacity(entries.len());
+            for (key, value) in entries {
+                budget.enter(depth + 1)?;
+                let key = safe_map_key(key)?;
+                if !keys.insert(key) {
+                    return Err(Error::verify("duplicate safe-map key"));
+                }
+                validate_safe_value(value, budget, depth + 1)?;
+            }
+        }
+        Value::Tag(tag, _)
+            if matches!(
+                *tag,
+                TO_BE_REDACTED_TAG | REDACTED_ELEMENT_TAG | TO_BE_DECOY_TAG
+            ) =>
+        {
+            return Err(Error::UnexpectedType(format!(
+                "SD-CWT reserved tag {tag} is not permitted in this header value"
+            )));
+        }
+        Value::Tag(_, inner) => validate_safe_value(inner, budget, depth + 1)?,
+        Value::Simple(simple) if simple.value() == REDACTED_CLAIM_KEYS_SIMPLE => {
+            return Err(Error::UnexpectedType(
+                "simple(59) is not permitted in this header value".into(),
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_disclosure_value(
+    disclosure: &DisclosureKind,
+    limits: ProcessingLimits,
+) -> Result<(), Error> {
+    let (value, fixed_items) = match disclosure {
+        DisclosureKind::Claim { value, .. } => (value, 3),
+        DisclosureKind::Element { value, .. } => (value, 2),
+        DisclosureKind::Decoy { .. } => return Ok(()),
+    };
+    let mut budget = TraversalBudget::new(limits);
+    budget.consume(fixed_items)?;
+    validate_issued_value(value, &mut budget, 0)
+}
+
+fn validate_issued_value(
+    value: &Value,
+    budget: &mut TraversalBudget,
+    depth: usize,
+) -> Result<(), Error> {
+    budget.enter(depth)?;
+    match value {
+        Value::Map(entries) => {
+            budget.container(entries.len())?;
+            let mut keys = HashSet::with_capacity(entries.len());
+            for (key, value) in entries {
+                budget.enter(depth + 1)?;
+                let canonical = cbor2::to_canonical_vec(key)?;
+                if !keys.insert(canonical) {
+                    return Err(Error::verify("duplicate issued SD-CWT map key"));
+                }
+                if is_redacted_claim_keys_label(key) {
+                    let Value::Array(hashes) = value else {
+                        return Err(Error::UnexpectedType(
+                            "redacted_claim_keys value must be an array".into(),
+                        ));
+                    };
+                    budget.enter(depth + 1)?;
+                    budget.container(hashes.len())?;
+                    for hash in hashes {
+                        budget.enter(depth + 2)?;
+                        expect_bytes(hash, "redacted_claim_keys entry")?;
+                    }
+                } else {
+                    label_from_value(key).map_err(|_| {
+                        Error::UnexpectedType(
+                            "issued SD-CWT map keys must be integers or text".into(),
+                        )
+                    })?;
+                    validate_issued_value(value, budget, depth + 1)?;
+                }
+            }
+        }
+        Value::Array(items) => {
+            budget.container(items.len())?;
+            for item in items {
+                if let Value::Tag(REDACTED_ELEMENT_TAG, inner) = item {
+                    budget.enter(depth + 1)?;
+                    budget.enter(depth + 2)?;
+                    expect_bytes(inner, "redacted array element hash")?;
+                } else {
+                    validate_issued_value(item, budget, depth + 1)?;
+                }
+            }
+        }
+        Value::Tag(tag, _)
+            if matches!(
+                *tag,
+                TO_BE_REDACTED_TAG | REDACTED_ELEMENT_TAG | TO_BE_DECOY_TAG
+            ) =>
+        {
+            return Err(Error::UnexpectedType(format!(
+                "SD-CWT tag {tag} is not valid in this value position"
+            )));
+        }
+        Value::Tag(_, inner) => validate_issued_value(inner, budget, depth + 1)?,
+        Value::Simple(simple) if simple.value() == REDACTED_CLAIM_KEYS_SIMPLE => {
+            return Err(Error::UnexpectedType(
+                "simple(59) is only valid as a redacted_claim_keys map key".into(),
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_text_label(label: &Label) -> Result<(), Error> {
+    if matches!(label, Label::Text(value) if !(1..=255).contains(&value.len())) {
+        Err(Error::UnexpectedType(
+            "SD-CWT text map keys must contain 1 to 255 octets".into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn safe_map_key(value: &Value) -> Result<Vec<u8>, Error> {
+    match value {
+        Value::Integer(_) => {}
+        Value::Text(value) if (1..=255).contains(&value.len()) => {}
+        Value::Text(_) => {
+            return Err(Error::UnexpectedType(
+                "SD-CWT text map keys must contain 1 to 255 octets".into(),
+            ));
+        }
+        _ => {
+            return Err(Error::UnexpectedType(
+                "SD-CWT safe-map keys must be integers or text strings".into(),
+            ));
+        }
+    }
+    Ok(cbor2::to_canonical_vec(value)?)
+}
+
+fn protected_cwt_claims(message: &cose2::Sign1Message) -> Result<Option<Value>, Error> {
+    Ok(protected_cwt_claims_ref(message)?.cloned())
+}
+
+fn protected_cwt_claims_ref(message: &cose2::Sign1Message) -> Result<Option<&Value>, Error> {
+    match message.protected.get(HEADER_CWT_CLAIMS) {
+        None => Ok(None),
+        Some(value @ Value::Map(_)) => Ok(Some(value)),
+        Some(_) => Err(Error::UnexpectedType(
+            "protected CWT_Claims header must contain a claims map".into(),
+        )),
+    }
+}
+
+fn map_value(entries: &[(Value, Value)], label: i64) -> Option<&Value> {
+    entries.iter().find_map(|(key, value)| {
+        matches!(key, Value::Integer(key) if i64::try_from(*key).ok() == Some(label))
+            .then_some(value)
+    })
+}
+
+fn claim_maps<'a>(
+    payload: &'a [(Value, Value)],
+    protected_claims: Option<&'a Value>,
+) -> Vec<&'a [(Value, Value)]> {
+    let mut maps = vec![payload];
+    if let Some(Value::Map(entries)) = protected_claims {
+        maps.push(entries);
+    }
+    maps
+}
+
+fn claim_value<'a>(maps: &[&'a [(Value, Value)]], label: i64) -> Option<&'a Value> {
+    maps.iter().find_map(|entries| map_value(entries, label))
+}
+
+fn validate_matching_claims(maps: &[&[(Value, Value)]]) -> Result<(), Error> {
+    let mut seen = HashMap::<Vec<u8>, (usize, &Value)>::new();
+    for (map_index, entries) in maps.iter().enumerate() {
+        for (key, value) in *entries {
+            if is_redacted_claim_keys_label(key) {
+                continue;
+            }
+            let key_bytes = safe_map_key(key)?;
+            if let Some((previous_map, previous)) = seen.insert(key_bytes, (map_index, value)) {
+                if previous_map == map_index {
+                    return Err(Error::verify(format!("duplicate SD-CWT claim key {key}")));
+                }
+                if cbor2::to_canonical_vec(previous)? != cbor2::to_canonical_vec(value)? {
+                    return Err(Error::verify(format!(
+                        "CWT_Claims header and payload disagree for claim {key}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_registered_claim_types(maps: &[&[(Value, Value)]]) -> Result<(), Error> {
+    for (label, name) in [
+        (cose2::iana::CWTClaimIss, "iss"),
+        (cose2::iana::CWTClaimSub, "sub"),
+        (cose2::iana::CWTClaimAud, "aud"),
+    ] {
+        if claim_value(maps, label).is_some_and(|value| !matches!(value, Value::Text(_))) {
+            return Err(Error::UnexpectedType(format!(
+                "SD-CWT {name} must be a text string"
+            )));
+        }
+    }
+    for (label, name) in [
+        (cose2::iana::CWTClaimExp, "exp"),
+        (cose2::iana::CWTClaimNbf, "nbf"),
+        (cose2::iana::CWTClaimIat, "iat"),
+    ] {
+        if let Some(value) = claim_value(maps, label) {
+            DateValue::from_value(value, name)?;
+        }
+    }
+    if claim_value(maps, cose2::iana::CWTClaimCti)
+        .is_some_and(|value| !matches!(value, Value::Bytes(_)))
+    {
+        return Err(Error::UnexpectedType(
+            "SD-CWT cti must be a byte string".into(),
+        ));
+    }
+    if claim_value(maps, cose2::iana::CWTClaimCnf)
+        .is_some_and(|value| !matches!(value, Value::Map(_)))
+    {
+        return Err(Error::UnexpectedType("SD-CWT cnf must be a map".into()));
+    }
+    if claim_value(maps, CWT_CLAIM_CNONCE).is_some_and(|value| !matches!(value, Value::Bytes(_))) {
+        return Err(Error::UnexpectedType(
+            "SD-CWT cnonce must be a byte string".into(),
+        ));
+    }
+    if let Some(value) = claim_value(maps, CWT_CLAIM_VCT) {
+        match value {
+            Value::Text(_) => {}
+            Value::Integer(value) if u16::try_from(*value).is_ok() => {}
+            _ => {
+                return Err(Error::UnexpectedType(
+                    "SD-CWT vct must be a text string or uint16".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_required_claims(
+    maps: &[&[(Value, Value)]],
+    issuer_from_header: bool,
+    allow_redacted_subject: bool,
+) -> Result<(), Error> {
+    if !issuer_from_header {
+        match claim_value(maps, cose2::iana::CWTClaimIss) {
+            Some(Value::Text(_)) => {}
+            Some(_) => return Err(Error::UnexpectedType("SD-CWT iss must be text".into())),
+            None => return Err(Error::custom("SD-CWT is missing required iss claim")),
+        }
+    }
+    match claim_value(maps, cose2::iana::CWTClaimCnf) {
+        Some(Value::Map(_)) => {}
+        Some(_) => return Err(Error::UnexpectedType("SD-CWT cnf must be a map".into())),
+        None => return Err(Error::custom("SD-CWT is missing required cnf claim")),
+    }
+    if !matches!(
+        claim_value(maps, cose2::iana::CWTClaimSub),
+        Some(Value::Text(_))
+    ) {
+        let has_redacted_root_claim = maps.iter().any(|entries| {
+            entries.iter().any(|(key, value)| {
+                is_redacted_claim_keys_label(key)
+                    && matches!(value, Value::Array(hashes) if !hashes.is_empty())
+            })
+        });
+        if !allow_redacted_subject || !has_redacted_root_claim {
+            return Err(Error::custom(
+                "SD-CWT is missing required disclosed or redacted sub claim",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_never_redacted(disclosures: &[Disclosure]) -> Result<(), Error> {
+    const NEVER_REDACTED: &[i64] = &[1, 3, 4, 5, 6, 7, 8, 39];
+    for disclosure in disclosures {
+        if let DisclosureKind::Claim {
+            key: Label::Int(key),
+            ..
+        } = disclosure.kind()
+        {
+            if NEVER_REDACTED.contains(key) {
+                return Err(Error::custom(format!(
+                    "SD-CWT claim {key} must not be redacted"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum DateValue {
+    Integer(i128),
+    Float(f64),
+}
+
+impl DateValue {
+    fn from_value(value: &Value, name: &str) -> Result<Self, Error> {
+        match value {
+            Value::Integer(value) => Ok(Self::Integer(i128::from(*value))),
+            Value::Float(value) if value.is_finite() && value.abs() <= 9_007_199_254_740_992.0 => {
+                Ok(Self::Float(*value))
+            }
+            Value::Float(_) => Err(Error::UnexpectedType(format!(
+                "{name} must be a finite float in the inclusive range [-2^53, 2^53]"
+            ))),
+            _ => Err(Error::UnexpectedType(format!("{name} must be numeric"))),
+        }
+    }
+
+    fn compare(self, other: Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Self::Integer(left), Self::Integer(right)) => left.partial_cmp(&right),
+            (Self::Integer(left), Self::Float(right)) => {
+                compare_f64_to_i128(right, left).map(std::cmp::Ordering::reverse)
+            }
+            (Self::Float(left), Self::Integer(right)) => compare_f64_to_i128(left, right),
+            (Self::Float(left), Self::Float(right)) => left.partial_cmp(&right),
+        }
+    }
+}
+
+fn compare_f64_to_i128(value: f64, other: i128) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+
+    if !value.is_finite() {
+        return None;
+    }
+    if value >= i128::MAX as f64 {
+        return Some(Ordering::Greater);
+    }
+    if value < i128::MIN as f64 {
+        return Some(Ordering::Less);
+    }
+    let truncated = value as i128;
+    match truncated.cmp(&other) {
+        Ordering::Equal if value == truncated as f64 => Some(Ordering::Equal),
+        Ordering::Equal if value.is_sign_negative() => Some(Ordering::Less),
+        Ordering::Equal => Some(Ordering::Greater),
+        ordering => Some(ordering),
+    }
+}
+
+fn validate_time_relationships(maps: &[&[(Value, Value)]]) -> Result<(), Error> {
+    let exp = claim_value(maps, 4)
+        .map(|value| DateValue::from_value(value, "exp"))
+        .transpose()?;
+    let nbf = claim_value(maps, 5)
+        .map(|value| DateValue::from_value(value, "nbf"))
+        .transpose()?;
+    let iat = claim_value(maps, 6)
+        .map(|value| DateValue::from_value(value, "iat"))
+        .transpose()?;
+    if let (Some(nbf), Some(iat)) = (nbf, iat) {
+        if nbf.compare(iat) == Some(std::cmp::Ordering::Greater) {
+            return Err(Error::custom("SD-CWT requires nbf <= iat"));
+        }
+    }
+    if let (Some(nbf), Some(exp)) = (nbf, exp) {
+        if nbf.compare(exp) != Some(std::cmp::Ordering::Less) {
+            return Err(Error::custom("SD-CWT requires nbf < exp"));
+        }
+    }
+    if let (Some(iat), Some(exp)) = (iat, exp) {
+        if iat.compare(exp) != Some(std::cmp::Ordering::Less) {
+            return Err(Error::custom("SD-CWT requires iat < exp"));
+        }
+    }
+    Ok(())
 }
 
 struct DisclosureMap {
@@ -683,16 +1836,50 @@ struct DisclosureMap {
 }
 
 impl DisclosureMap {
-    fn new<I>(disclosures: I, hasher: &dyn RedactionHasher) -> Result<Self, Error>
+    fn new<I>(
+        disclosures: I,
+        hasher: &dyn RedactionHasher,
+        budget: &mut TraversalBudget,
+    ) -> Result<Self, Error>
     where
         I: IntoIterator<Item = Disclosure>,
     {
         let mut entries = HashMap::new();
-        for disclosure in disclosures {
-            let hash = disclosure.redacted_hash(hasher);
-            if entries.insert(hash, disclosure).is_some() {
-                return Err(Error::verify("duplicate SD-CWT disclosure digest"));
+        let mut salts = HashSet::new();
+        let mut total_bytes = 0usize;
+        for (index, disclosure) in disclosures.into_iter().enumerate() {
+            if index >= budget.limits.max_disclosures {
+                return Err(Error::limit(
+                    "SD-CWT disclosure",
+                    budget.limits.max_disclosures,
+                ));
             }
+            total_bytes = total_bytes
+                .checked_add(disclosure.encoded().len())
+                .ok_or_else(|| Error::custom("SD-CWT disclosure size overflow"))?;
+            if total_bytes > budget.limits.max_disclosure_bytes {
+                return Err(Error::limit(
+                    "SD-CWT disclosure bytes",
+                    budget.limits.max_disclosure_bytes,
+                ));
+            }
+            budget.consume(disclosure.item_count()?)?;
+            let hash = disclosure.redacted_hash(hasher);
+            let entry = match entries.entry(hash) {
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    return Err(Error::verify("duplicate SD-CWT disclosure digest"));
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => entry,
+            };
+            let salt = match disclosure.kind() {
+                DisclosureKind::Claim { salt, .. }
+                | DisclosureKind::Element { salt, .. }
+                | DisclosureKind::Decoy { salt } => salt,
+            };
+            if !salts.insert(salt.clone()) {
+                return Err(Error::verify("duplicate SD-CWT disclosure salt"));
+            }
+            entry.insert(disclosure);
         }
         Ok(Self { entries })
     }
@@ -710,31 +1897,69 @@ struct IssueContext<'a> {
     salts: &'a mut dyn SaltGenerator,
     hasher: &'a dyn RedactionHasher,
     decoy_ids: HashSet<u64>,
+    salts_used: HashSet<[u8; 16]>,
+    digests_used: HashSet<Vec<u8>>,
     disclosures: Vec<Disclosure>,
+    disclosure_bytes: usize,
+    budget: TraversalBudget,
 }
 
-fn issue_value(value: Value, context: &mut IssueContext<'_>) -> Result<Value, Error> {
+impl IssueContext<'_> {
+    fn next_salt(&mut self) -> Result<[u8; 16], Error> {
+        let salt = self.salts.next_salt()?;
+        if !self.salts_used.insert(salt) {
+            return Err(Error::custom("SaltGenerator returned a duplicate salt"));
+        }
+        Ok(salt)
+    }
+
+    fn add_disclosure(&mut self, disclosure: Disclosure) -> Result<Vec<u8>, Error> {
+        if self.disclosures.len() >= self.budget.limits.max_disclosures {
+            return Err(Error::limit(
+                "SD-CWT disclosure",
+                self.budget.limits.max_disclosures,
+            ));
+        }
+        self.disclosure_bytes = self
+            .disclosure_bytes
+            .checked_add(disclosure.encoded().len())
+            .ok_or_else(|| Error::custom("SD-CWT disclosure size overflow"))?;
+        if self.disclosure_bytes > self.budget.limits.max_disclosure_bytes {
+            return Err(Error::limit(
+                "SD-CWT disclosure bytes",
+                self.budget.limits.max_disclosure_bytes,
+            ));
+        }
+        let digest = disclosure.redacted_hash(self.hasher);
+        if !self.digests_used.insert(digest.clone()) {
+            return Err(Error::verify(
+                "redaction hash collision while issuing SD-CWT disclosures",
+            ));
+        }
+        self.disclosures.push(disclosure);
+        Ok(digest)
+    }
+}
+
+fn issue_value(value: Value, context: &mut IssueContext<'_>, depth: usize) -> Result<Value, Error> {
+    context.budget.enter(depth)?;
     match value {
-        Value::Map(entries) => issue_map(entries, context),
-        Value::Array(items) => issue_array(items, context),
-        Value::Tag(tag, inner) if tag == TO_BE_REDACTED_TAG => {
-            let issued = issue_value(*inner, context)?;
-            let disclosure = Disclosure::element(context.salts.next_salt()?, issued)?;
-            let hash = disclosure.redacted_hash(context.hasher);
-            context.disclosures.push(disclosure);
-            Ok(redacted_element(hash))
+        Value::Map(entries) => issue_map(entries, context, depth),
+        Value::Array(items) => issue_array(items, context, depth),
+        Value::Tag(tag, _)
+            if matches!(
+                tag,
+                TO_BE_REDACTED_TAG | TO_BE_DECOY_TAG | REDACTED_ELEMENT_TAG
+            ) =>
+        {
+            Err(Error::custom(format!(
+                "SD-CWT tag {tag} is not valid in this value position"
+            )))
         }
-        Value::Tag(tag, inner) if tag == TO_BE_DECOY_TAG => {
-            record_decoy_id(&inner, context)?;
-            let disclosure = Disclosure::decoy(context.salts.next_salt()?)?;
-            let hash = disclosure.redacted_hash(context.hasher);
-            context.disclosures.push(disclosure);
-            Ok(redacted_element(hash))
-        }
-        Value::Tag(tag, _) if tag == REDACTED_ELEMENT_TAG => Err(Error::custom(
-            "pre-issuance value must not already contain redacted element tag 60",
+        Value::Tag(tag, inner) => Ok(Value::Tag(
+            tag,
+            Box::new(issue_value(*inner, context, depth + 1)?),
         )),
-        Value::Tag(tag, inner) => Ok(Value::Tag(tag, Box::new(issue_value(*inner, context)?))),
         Value::Simple(simple) if simple.value() == REDACTED_CLAIM_KEYS_SIMPLE => Err(
             Error::custom("pre-issuance value must not contain simple(59) redaction labels"),
         ),
@@ -742,35 +1967,42 @@ fn issue_value(value: Value, context: &mut IssueContext<'_>) -> Result<Value, Er
     }
 }
 
-fn issue_map(entries: Vec<(Value, Value)>, context: &mut IssueContext<'_>) -> Result<Value, Error> {
+fn issue_map(
+    entries: Vec<(Value, Value)>,
+    context: &mut IssueContext<'_>,
+    depth: usize,
+) -> Result<Value, Error> {
+    context.budget.container(entries.len())?;
     let mut output = Vec::with_capacity(entries.len());
-    let mut normalized_keys = Vec::<Value>::new();
+    let mut normalized_keys = HashSet::<Vec<u8>>::with_capacity(entries.len());
     let mut redacted_hashes = Vec::<Value>::new();
 
     for (key, value) in entries {
+        context.budget.enter(depth + 1)?;
         match key {
             Value::Tag(tag, inner) if tag == TO_BE_REDACTED_TAG => {
+                context.budget.enter(depth + 2)?;
                 let claim_key = label_from_value(&inner)?;
                 let normalized_key = Value::from(claim_key.clone());
-                reject_duplicate_raw_key(&normalized_keys, &normalized_key)?;
-                normalized_keys.push(normalized_key);
+                insert_normalized_key(&mut normalized_keys, &normalized_key)?;
 
-                let issued_value = issue_value(value, context)?;
-                let disclosure =
-                    Disclosure::claim(context.salts.next_salt()?, claim_key, issued_value)?;
-                redacted_hashes.push(Value::Bytes(disclosure.redacted_hash(context.hasher)));
-                context.disclosures.push(disclosure);
+                let issued_value = issue_value(value, context, depth + 1)?;
+                let disclosure = Disclosure::claim(context.next_salt()?, claim_key, issued_value)?;
+                redacted_hashes.push(Value::Bytes(context.add_disclosure(disclosure)?));
             }
             Value::Tag(tag, inner) if tag == TO_BE_DECOY_TAG => {
+                context.budget.enter(depth + 2)?;
+                let decoy_key = Value::Tag(tag, inner.clone());
+                insert_normalized_key(&mut normalized_keys, &decoy_key)?;
                 record_decoy_id(&inner, context)?;
                 if !matches!(value, Value::Null) {
                     return Err(Error::custom(
                         "map decoy tag 62 entries must have a null value",
                     ));
                 }
-                let disclosure = Disclosure::decoy(context.salts.next_salt()?)?;
-                redacted_hashes.push(Value::Bytes(disclosure.redacted_hash(context.hasher)));
-                context.disclosures.push(disclosure);
+                context.budget.enter(depth + 1)?;
+                let disclosure = Disclosure::decoy(context.next_salt()?)?;
+                redacted_hashes.push(Value::Bytes(context.add_disclosure(disclosure)?));
             }
             key if is_redacted_claim_keys_label(&key) => {
                 return Err(Error::custom(
@@ -779,9 +2011,8 @@ fn issue_map(entries: Vec<(Value, Value)>, context: &mut IssueContext<'_>) -> Re
             }
             key => {
                 ensure_preissuance_key(&key)?;
-                reject_duplicate_raw_key(&normalized_keys, &key)?;
-                normalized_keys.push(key.clone());
-                output.push((key, issue_value(value, context)?));
+                insert_normalized_key(&mut normalized_keys, &key)?;
+                output.push((key, issue_value(value, context, depth + 1)?));
             }
         }
     }
@@ -793,25 +2024,31 @@ fn issue_map(entries: Vec<(Value, Value)>, context: &mut IssueContext<'_>) -> Re
     Ok(Value::Map(output))
 }
 
-fn issue_array(items: Vec<Value>, context: &mut IssueContext<'_>) -> Result<Value, Error> {
+fn issue_array(
+    items: Vec<Value>,
+    context: &mut IssueContext<'_>,
+    depth: usize,
+) -> Result<Value, Error> {
+    context.budget.container(items.len())?;
     let mut output = Vec::with_capacity(items.len());
     for item in items {
         match item {
             Value::Tag(tag, inner) if tag == TO_BE_REDACTED_TAG => {
-                let issued = issue_value(*inner, context)?;
-                let disclosure = Disclosure::element(context.salts.next_salt()?, issued)?;
-                let hash = disclosure.redacted_hash(context.hasher);
+                context.budget.enter(depth + 1)?;
+                let issued = issue_value(*inner, context, depth + 2)?;
+                let disclosure = Disclosure::element(context.next_salt()?, issued)?;
+                let hash = context.add_disclosure(disclosure)?;
                 output.push(redacted_element(hash));
-                context.disclosures.push(disclosure);
             }
             Value::Tag(tag, inner) if tag == TO_BE_DECOY_TAG => {
+                context.budget.enter(depth + 1)?;
+                context.budget.enter(depth + 2)?;
                 record_decoy_id(&inner, context)?;
-                let disclosure = Disclosure::decoy(context.salts.next_salt()?)?;
-                let hash = disclosure.redacted_hash(context.hasher);
+                let disclosure = Disclosure::decoy(context.next_salt()?)?;
+                let hash = context.add_disclosure(disclosure)?;
                 output.push(redacted_element(hash));
-                context.disclosures.push(disclosure);
             }
-            item => output.push(issue_value(item, context)?),
+            item => output.push(issue_value(item, context, depth + 1)?),
         }
     }
     Ok(Value::Array(output))
@@ -846,8 +2083,9 @@ fn ensure_preissuance_key(key: &Value) -> Result<(), Error> {
     }
 }
 
-fn reject_duplicate_raw_key(keys: &[Value], key: &Value) -> Result<(), Error> {
-    if keys.iter().any(|existing| existing == key) {
+fn insert_normalized_key(keys: &mut HashSet<Vec<u8>>, key: &Value) -> Result<(), Error> {
+    let encoded = cbor2::to_canonical_vec(key)?;
+    if !keys.insert(encoded) {
         return Err(Error::verify(format!(
             "duplicate pre-issuance map key {key}"
         )));
@@ -860,26 +2098,33 @@ fn restore_value(
     pending: &mut DisclosureMap,
     mode: RestoreMode,
     stats: &mut RestoreStats,
+    budget: &mut TraversalBudget,
+    depth: usize,
 ) -> Result<Value, Error> {
+    budget.enter(depth)?;
     match value {
-        Value::Map(entries) => restore_map(entries, pending, mode, stats),
-        Value::Array(items) => restore_array(items, pending, mode, stats),
-        Value::Tag(tag, inner) if tag == REDACTED_ELEMENT_TAG => {
-            let hash = expect_bytes(&inner, "redacted array element hash")?;
-            match pending.remove(hash) {
-                Some(disclosure) => restore_element_disclosure(disclosure, pending, mode, stats),
-                None if mode == RestoreMode::Verifier => {
-                    stats.removed_redactions += 1;
-                    Ok(Value::Null)
-                }
-                None => Err(Error::verify(
-                    "holder validation found redacted array element without disclosure",
-                )),
-            }
+        Value::Map(entries) => restore_map(entries, pending, mode, stats, budget, depth),
+        Value::Array(items) => restore_array(items, pending, mode, stats, budget, depth),
+        Value::Tag(tag, _)
+            if matches!(
+                tag,
+                REDACTED_ELEMENT_TAG | TO_BE_REDACTED_TAG | TO_BE_DECOY_TAG
+            ) =>
+        {
+            Err(Error::UnexpectedType(format!(
+                "SD-CWT tag {tag} is not valid in this value position"
+            )))
         }
         Value::Tag(tag, inner) => Ok(Value::Tag(
             tag,
-            Box::new(restore_value(*inner, pending, mode, stats)?),
+            Box::new(restore_value(
+                *inner,
+                pending,
+                mode,
+                stats,
+                budget,
+                depth + 1,
+            )?),
         )),
         Value::Simple(simple) if simple.value() == REDACTED_CLAIM_KEYS_SIMPLE => {
             Err(Error::UnexpectedType(
@@ -895,12 +2140,17 @@ fn restore_map(
     pending: &mut DisclosureMap,
     mode: RestoreMode,
     stats: &mut RestoreStats,
+    budget: &mut TraversalBudget,
+    depth: usize,
 ) -> Result<Value, Error> {
+    budget.container(entries.len())?;
     let mut output = Vec::with_capacity(entries.len());
+    let mut output_keys = HashSet::<Label>::with_capacity(entries.len());
     let mut redacted_hashes = Vec::new();
     let mut saw_redacted_keys = false;
 
     for (key, value) in entries {
+        budget.enter(depth + 1)?;
         if is_redacted_claim_keys_label(&key) {
             if saw_redacted_keys {
                 return Err(Error::verify("duplicate redacted_claim_keys entry"));
@@ -911,7 +2161,10 @@ fn restore_map(
                     "redacted_claim_keys value must be an array".into(),
                 ));
             };
+            budget.enter(depth + 1)?;
+            budget.container(hashes.len())?;
             for hash in hashes {
+                budget.enter(depth + 2)?;
                 redacted_hashes.push(expect_owned_bytes(
                     hash,
                     "redacted_claim_keys entries must be byte strings",
@@ -920,8 +2173,13 @@ fn restore_map(
             continue;
         }
 
-        reject_duplicate_key(&output, &key)?;
-        let value = restore_value(value, pending, mode, stats)?;
+        let label = label_from_value(&key).map_err(|_| {
+            Error::UnexpectedType("issued SD-CWT map keys must be integers or text".into())
+        })?;
+        if !output_keys.insert(label) {
+            return Err(Error::verify(format!("duplicate claim key {key}")));
+        }
+        let value = restore_value(value, pending, mode, stats, budget, depth + 1)?;
         output.push((key, value));
     }
 
@@ -929,10 +2187,11 @@ fn restore_map(
         match pending.remove(&hash) {
             Some(disclosure) => match disclosure.kind {
                 DisclosureKind::Claim { key, value, .. } => {
-                    let key = Value::from(key);
-                    reject_duplicate_key(&output, &key)?;
-                    let value = restore_value(value, pending, mode, stats)?;
-                    output.push((key, value));
+                    if !output_keys.insert(key.clone()) {
+                        return Err(Error::verify(format!("duplicate claim key {key}")));
+                    }
+                    let value = restore_value(value, pending, mode, stats, budget, depth + 1)?;
+                    output.push((Value::from(key), value));
                     stats.disclosed += 1;
                 }
                 DisclosureKind::Decoy { .. } => {
@@ -963,16 +2222,28 @@ fn restore_array(
     pending: &mut DisclosureMap,
     mode: RestoreMode,
     stats: &mut RestoreStats,
+    budget: &mut TraversalBudget,
+    depth: usize,
 ) -> Result<Value, Error> {
+    budget.container(items.len())?;
     let mut output = Vec::with_capacity(items.len());
     for item in items {
         match item {
             Value::Tag(tag, inner) if tag == REDACTED_ELEMENT_TAG => {
+                budget.enter(depth + 1)?;
+                budget.enter(depth + 2)?;
                 let hash = expect_bytes(&inner, "redacted array element hash")?.to_vec();
                 match pending.remove(&hash) {
                     Some(disclosure) => match disclosure.kind {
                         DisclosureKind::Element { value, .. } => {
-                            output.push(restore_value(value, pending, mode, stats)?);
+                            output.push(restore_value(
+                                value,
+                                pending,
+                                mode,
+                                stats,
+                                budget,
+                                depth + 1,
+                            )?);
                             stats.disclosed += 1;
                         }
                         DisclosureKind::Decoy { .. } => {
@@ -994,31 +2265,17 @@ fn restore_array(
                     }
                 }
             }
-            other => output.push(restore_value(other, pending, mode, stats)?),
+            other => output.push(restore_value(
+                other,
+                pending,
+                mode,
+                stats,
+                budget,
+                depth + 1,
+            )?),
         }
     }
     Ok(Value::Array(output))
-}
-
-fn restore_element_disclosure(
-    disclosure: Disclosure,
-    pending: &mut DisclosureMap,
-    mode: RestoreMode,
-    stats: &mut RestoreStats,
-) -> Result<Value, Error> {
-    match disclosure.kind {
-        DisclosureKind::Element { value, .. } => {
-            stats.disclosed += 1;
-            restore_value(value, pending, mode, stats)
-        }
-        DisclosureKind::Decoy { .. } => {
-            stats.decoys += 1;
-            Ok(Value::Null)
-        }
-        DisclosureKind::Claim { .. } => Err(Error::verify(
-            "map-claim disclosure matched a redacted array element",
-        )),
-    }
 }
 
 fn kind_to_value(kind: &DisclosureKind) -> Value {
@@ -1076,6 +2333,9 @@ fn validate_disclosure_kind(kind: &DisclosureKind) -> Result<(), Error> {
             "Salted Disclosed Claim salt must be 16 bytes".into(),
         ));
     }
+    if let DisclosureKind::Claim { key, .. } = kind {
+        validate_text_label(key)?;
+    }
     Ok(())
 }
 
@@ -1084,7 +2344,10 @@ fn label_from_value(value: &Value) -> Result<Label, Error> {
         Value::Integer(value) => i64::try_from(*value)
             .map(Label::Int)
             .map_err(|_| Error::UnexpectedType("claim key integer out of range".into())),
-        Value::Text(value) => Ok(Label::Text(value.clone())),
+        Value::Text(value) if (1..=255).contains(&value.len()) => Ok(Label::Text(value.clone())),
+        Value::Text(_) => Err(Error::UnexpectedType(
+            "SD-CWT text claim keys must contain 1 to 255 octets".into(),
+        )),
         _ => Err(Error::UnexpectedType(
             "disclosed claim key must be an integer or text string".into(),
         )),
@@ -1105,11 +2368,26 @@ fn expect_owned_bytes(value: Value, name: &str) -> Result<Vec<u8>, Error> {
     }
 }
 
-fn reject_duplicate_key(entries: &[(Value, Value)], key: &Value) -> Result<(), Error> {
-    if entries.iter().any(|(existing, _)| existing == key) {
-        return Err(Error::verify(format!("duplicate claim key {key}")));
+fn value_item_count(value: &Value) -> Result<usize, Error> {
+    let mut count = 0usize;
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| Error::custom("SD-CWT item count overflow"))?;
+        match value {
+            Value::Array(items) => pending.extend(items),
+            Value::Map(entries) => {
+                for (key, value) in entries {
+                    pending.push(key);
+                    pending.push(value);
+                }
+            }
+            Value::Tag(_, value) => pending.push(value),
+            _ => {}
+        }
     }
-    Ok(())
+    Ok(count)
 }
 
 #[cfg(test)]

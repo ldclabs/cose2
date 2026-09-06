@@ -8,7 +8,8 @@
 //! pluggable traits for the algorithms the backend exposes in COSE
 //! wire-compatible form:
 //!
-//! - signatures: Ed25519, ES256, ES384, RS256/384/512, PS256/384/512
+//! - signatures: Ed25519/EdDSA, ESP256/ES256, ESP384/ES384,
+//!   RS256/384/512, PS256/384/512
 //! - MACs: HMAC 256/64, HMAC 256/256, HMAC 384/384, HMAC 512/512
 //! - AEAD content encryption: A128GCM, A256GCM, ChaCha20/Poly1305
 //!
@@ -37,12 +38,13 @@ use crate::{iana, Encryptor, Error, Key, Label, Macer, Signer, Verifier};
 pub struct RingMacer {
     alg: i64,
     kid: Option<Vec<u8>>,
-    key: hmac::Key,
+    key: Arc<hmac::Key>,
     // Retained so the symmetric `k` can be re-exported by `to_cose_key`;
-    // `hmac::Key` does not expose its raw bytes. Zeroized on drop (every
-    // clone wipes its own copy).
-    raw_key: Zeroizing<Vec<u8>>,
+    // `hmac::Key` does not expose its raw bytes. The shared allocation is
+    // zeroized when the final clone is dropped.
+    raw_key: Arc<Zeroizing<Vec<u8>>>,
     tag_len: usize,
+    key_ops: Option<Vec<Label>>,
 }
 
 // Manual `Debug` keeps the raw key material out of formatted output.
@@ -63,21 +65,32 @@ impl RingMacer {
         Ok(Self {
             alg,
             kid,
-            key: hmac::Key::new(algorithm, key),
-            raw_key: Zeroizing::new(key.to_vec()),
+            key: Arc::new(hmac::Key::new(algorithm, key)),
+            raw_key: Arc::new(Zeroizing::new(key.to_vec())),
             tag_len,
+            key_ops: None,
         })
     }
 
     /// Creates a provider from a symmetric [`Key`] carrying `alg` and `k`.
     pub fn from_cose_key(key: &Key) -> Result<Self, Error> {
-        require_kty(key, iana::KeyTypeSymmetric)?;
-        let alg = required_alg(key)?;
-        Self::new(
+        key.require_integer_kty(iana::KeyTypeSymmetric)?;
+        let alg = key.required_integer_alg("crypto backend")?;
+        let mut macer = Self::new(
             alg,
-            required_bytes(key, iana::SymmetricKeyParameterK, "k")?,
-            key_kid(key)?,
-        )
+            key.required_bytes(iana::SymmetricKeyParameterK, "k")?,
+            key.kid_owned()?,
+        )?;
+        macer.key_ops = key.ops()?;
+        if !crate::util::key_ops_allow(
+            &macer.key_ops,
+            &[iana::KeyOperationMacCreate, iana::KeyOperationMacVerify],
+        ) {
+            return Err(Error::custom(
+                "COSE_Key key_ops permits neither MAC create nor MAC verify",
+            ));
+        }
+        Ok(macer)
     }
 
     /// Exports this provider as a symmetric COSE_Key carrying `alg` and `k`.
@@ -88,9 +101,10 @@ impl RingMacer {
     pub fn to_cose_key(&self) -> Result<Key, Error> {
         Ok(symmetric_cose_key(
             self.alg,
-            &self.raw_key,
+            self.raw_key.as_slice(),
             self.kid.as_deref(),
             None,
+            &self.key_ops,
         ))
     }
 
@@ -110,15 +124,17 @@ impl Macer for RingMacer {
     }
 
     fn mac_create(&self, data: &[u8]) -> Result<Vec<u8>, Error> {
-        let tag = hmac::sign(&self.key, data);
+        crate::util::require_key_ops(&self.key_ops, &[iana::KeyOperationMacCreate], "MAC create")?;
+        let tag = hmac::sign(self.key.as_ref(), data);
         Ok(tag.as_ref()[..self.tag_len].to_vec())
     }
 
     fn mac_verify(&self, data: &[u8], tag: &[u8]) -> Result<(), Error> {
+        crate::util::require_key_ops(&self.key_ops, &[iana::KeyOperationMacVerify], "MAC verify")?;
         if tag.len() != self.tag_len {
             return Err(Error::verify("HMAC tag length mismatch"));
         }
-        let expected = hmac::sign(&self.key, data);
+        let expected = hmac::sign(self.key.as_ref(), data);
         if constant_time_eq(&expected.as_ref()[..self.tag_len], tag) {
             Ok(())
         } else {
@@ -136,10 +152,11 @@ pub struct RingEncryptor {
     // `LessSafeKey` is `Clone` but `aws-lc-rs`'s is not.
     key: Arc<aead::LessSafeKey>,
     // Retained so the symmetric `k` can be re-exported by `to_cose_key`;
-    // `aead::LessSafeKey` does not expose its raw bytes. Zeroized on drop
-    // (every clone wipes its own copy).
-    raw_key: Zeroizing<Vec<u8>>,
+    // `aead::LessSafeKey` does not expose its raw bytes. The shared allocation
+    // is zeroized when the final clone is dropped.
+    raw_key: Arc<Zeroizing<Vec<u8>>>,
     base_iv: Option<Vec<u8>>,
+    key_ops: Option<Vec<Label>>,
 }
 
 // Manual `Debug` keeps the raw key material out of formatted output.
@@ -163,21 +180,31 @@ impl RingEncryptor {
             alg,
             kid,
             key: Arc::new(aead::LessSafeKey::new(unbound)),
-            raw_key: Zeroizing::new(key.to_vec()),
+            raw_key: Arc::new(Zeroizing::new(key.to_vec())),
             base_iv: None,
+            key_ops: None,
         })
     }
 
     /// Creates a provider from a symmetric [`Key`] carrying `alg` and `k`.
     pub fn from_cose_key(key: &Key) -> Result<Self, Error> {
-        require_kty(key, iana::KeyTypeSymmetric)?;
-        let alg = required_alg(key)?;
+        key.require_integer_kty(iana::KeyTypeSymmetric)?;
+        let alg = key.required_integer_alg("crypto backend")?;
         let mut encryptor = Self::new(
             alg,
-            required_bytes(key, iana::SymmetricKeyParameterK, "k")?,
-            key_kid(key)?,
+            key.required_bytes(iana::SymmetricKeyParameterK, "k")?,
+            key.kid_owned()?,
         )?;
         encryptor.base_iv = key.base_iv()?.map(ToOwned::to_owned);
+        encryptor.key_ops = key.ops()?;
+        if !crate::util::key_ops_allow(
+            &encryptor.key_ops,
+            &[iana::KeyOperationEncrypt, iana::KeyOperationDecrypt],
+        ) {
+            return Err(Error::custom(
+                "COSE_Key key_ops permits neither encryption nor decryption",
+            ));
+        }
         Ok(encryptor)
     }
 
@@ -196,9 +223,10 @@ impl RingEncryptor {
     pub fn to_cose_key(&self) -> Result<Key, Error> {
         Ok(symmetric_cose_key(
             self.alg,
-            &self.raw_key,
+            self.raw_key.as_slice(),
             self.kid.as_deref(),
             self.base_iv.as_deref(),
+            &self.key_ops,
         ))
     }
 
@@ -226,6 +254,7 @@ impl Encryptor for RingEncryptor {
     }
 
     fn encrypt(&self, nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, Error> {
+        crate::util::require_key_ops(&self.key_ops, &[iana::KeyOperationEncrypt], "encryption")?;
         let nonce = aead::Nonce::try_assume_unique_for_key(nonce)
             .map_err(|_| Error::custom("invalid AEAD nonce length"))?;
         let mut out = plaintext.to_vec();
@@ -236,14 +265,17 @@ impl Encryptor for RingEncryptor {
     }
 
     fn decrypt(&self, nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> Result<Vec<u8>, Error> {
+        crate::util::require_key_ops(&self.key_ops, &[iana::KeyOperationDecrypt], "decryption")?;
         let nonce = aead::Nonce::try_assume_unique_for_key(nonce)
             .map_err(|_| Error::custom("invalid AEAD nonce length"))?;
         let mut in_out = ciphertext.to_vec();
-        let plaintext = self
+        let plaintext_len = self
             .key
             .open_in_place(nonce, aead::Aad::from(aad), &mut in_out)
-            .map_err(|_| Error::verify("AEAD authentication failed"))?;
-        Ok(plaintext.to_vec())
+            .map_err(|_| Error::verify("AEAD authentication failed"))?
+            .len();
+        in_out.truncate(plaintext_len);
+        Ok(in_out)
     }
 }
 
@@ -277,10 +309,14 @@ impl fmt::Debug for RingSigningKey {
 impl RingSigner {
     /// Creates a signer from a COSE_Key.
     pub fn from_cose_key(key: &Key) -> Result<Self, Error> {
-        let alg = required_alg(key)?;
+        key.require_any_operation(&[iana::KeyOperationSign], "signing")?;
+        let alg = key.required_integer_alg("crypto backend")?;
         match alg {
-            iana::AlgorithmEdDSA => Self::ed25519_from_cose_key(key),
-            iana::AlgorithmES256 | iana::AlgorithmES384 => Self::ecdsa_from_cose_key(key, alg),
+            iana::AlgorithmEdDSA | iana::AlgorithmEd25519 => Self::ed25519_from_cose_key(key, alg),
+            iana::AlgorithmES256
+            | iana::AlgorithmESP256
+            | iana::AlgorithmES384
+            | iana::AlgorithmESP384 => Self::ecdsa_from_cose_key(key, alg),
             iana::AlgorithmRS256
             | iana::AlgorithmRS384
             | iana::AlgorithmRS512
@@ -293,10 +329,21 @@ impl RingSigner {
 
     /// Creates an Ed25519 signer from PKCS#8 private-key bytes.
     pub fn ed25519_from_pkcs8(pkcs8: &[u8], kid: Option<Vec<u8>>) -> Result<Self, Error> {
+        Self::ed25519_from_pkcs8_with_alg(iana::AlgorithmEd25519, pkcs8, kid)
+    }
+
+    /// Creates an Ed25519 signer using either the fully specified Ed25519
+    /// identifier or the legacy generic EdDSA identifier.
+    pub fn ed25519_from_pkcs8_with_alg(
+        alg: i64,
+        pkcs8: &[u8],
+        kid: Option<Vec<u8>>,
+    ) -> Result<Self, Error> {
+        require_ed25519_alg(alg)?;
         let key = signature::Ed25519KeyPair::from_pkcs8(pkcs8)
             .map_err(|_| Error::custom("invalid Ed25519 PKCS#8 key"))?;
         Ok(Self {
-            alg: iana::AlgorithmEdDSA,
+            alg,
             kid,
             key: RingSigningKey::Ed25519(key),
         })
@@ -308,10 +355,26 @@ impl RingSigner {
         public_key: &[u8],
         kid: Option<Vec<u8>>,
     ) -> Result<Self, Error> {
+        Self::ed25519_from_seed_and_public_key_with_alg(
+            iana::AlgorithmEd25519,
+            seed,
+            public_key,
+            kid,
+        )
+    }
+
+    /// Creates an Ed25519 signer with an explicit compatible COSE identifier.
+    pub fn ed25519_from_seed_and_public_key_with_alg(
+        alg: i64,
+        seed: &[u8],
+        public_key: &[u8],
+        kid: Option<Vec<u8>>,
+    ) -> Result<Self, Error> {
+        require_ed25519_alg(alg)?;
         let key = signature::Ed25519KeyPair::from_seed_and_public_key(seed, public_key)
             .map_err(|_| Error::custom("invalid Ed25519 key material"))?;
         Ok(Self {
-            alg: iana::AlgorithmEdDSA,
+            alg,
             kid,
             key: RingSigningKey::Ed25519(key),
         })
@@ -327,10 +390,30 @@ impl RingSigner {
         )
     }
 
+    /// Creates a fully specified ESP256 signer from PKCS#8 private-key bytes.
+    pub fn esp256_from_pkcs8(pkcs8: &[u8], kid: Option<Vec<u8>>) -> Result<Self, Error> {
+        Self::ecdsa_from_pkcs8(
+            iana::AlgorithmESP256,
+            &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+            pkcs8,
+            kid,
+        )
+    }
+
     /// Creates an ES384 signer from PKCS#8 private-key bytes.
     pub fn es384_from_pkcs8(pkcs8: &[u8], kid: Option<Vec<u8>>) -> Result<Self, Error> {
         Self::ecdsa_from_pkcs8(
             iana::AlgorithmES384,
+            &signature::ECDSA_P384_SHA384_FIXED_SIGNING,
+            pkcs8,
+            kid,
+        )
+    }
+
+    /// Creates a fully specified ESP384 signer from PKCS#8 private-key bytes.
+    pub fn esp384_from_pkcs8(pkcs8: &[u8], kid: Option<Vec<u8>>) -> Result<Self, Error> {
+        Self::ecdsa_from_pkcs8(
+            iana::AlgorithmESP384,
             &signature::ECDSA_P384_SHA384_FIXED_SIGNING,
             pkcs8,
             kid,
@@ -378,7 +461,7 @@ impl RingSigner {
     /// the backends expose no public modulus for them; use the raw modulus and
     /// exponent with [`RingVerifier::rsa_components`] instead.
     pub fn to_cose_key(&self) -> Result<Key, Error> {
-        match &self.key {
+        let mut key = match &self.key {
             RingSigningKey::Ed25519(key) => Ok(okp_public_cose_key(
                 self.alg,
                 key.public_key().as_ref(),
@@ -390,7 +473,9 @@ impl RingSigner {
             RingSigningKey::Rsa { .. } => Err(Error::custom(
                 "cannot export a COSE_Key from an RSA RingSigner: the backend exposes no public key",
             )),
-        }
+        }?;
+        key.set_ops([iana::KeyOperationVerify]);
+        Ok(key)
     }
 
     /// The configured COSE algorithm.
@@ -398,35 +483,40 @@ impl RingSigner {
         self.alg
     }
 
-    fn ed25519_from_cose_key(key: &Key) -> Result<Self, Error> {
-        require_kty(key, iana::KeyTypeOKP)?;
-        require_curve(key, iana::OKPKeyParameterCrv, iana::EllipticCurveEd25519)?;
-        Self::ed25519_from_seed_and_public_key(
-            required_bytes(key, iana::OKPKeyParameterD, "d")?,
-            required_bytes(key, iana::OKPKeyParameterX, "x")?,
-            key_kid(key)?,
+    fn ed25519_from_cose_key(key: &Key, alg: i64) -> Result<Self, Error> {
+        key.require_integer_kty(iana::KeyTypeOKP)?;
+        key.require_integer_parameter(
+            iana::OKPKeyParameterCrv,
+            iana::EllipticCurveEd25519,
+            "curve",
+        )?;
+        Self::ed25519_from_seed_and_public_key_with_alg(
+            alg,
+            key.required_bytes(iana::OKPKeyParameterD, "d")?,
+            key.required_bytes(iana::OKPKeyParameterX, "x")?,
+            key.kid_owned()?,
         )
     }
 
     fn ecdsa_from_cose_key(key: &Key, alg: i64) -> Result<Self, Error> {
-        require_kty(key, iana::KeyTypeEC2)?;
+        key.require_integer_kty(iana::KeyTypeEC2)?;
         let (curve, signing_algorithm, coordinate_len) = match alg {
-            iana::AlgorithmES256 => (
+            iana::AlgorithmES256 | iana::AlgorithmESP256 => (
                 iana::EllipticCurveP_256,
                 &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
                 32,
             ),
-            iana::AlgorithmES384 => (
+            iana::AlgorithmES384 | iana::AlgorithmESP384 => (
                 iana::EllipticCurveP_384,
                 &signature::ECDSA_P384_SHA384_FIXED_SIGNING,
                 48,
             ),
             _ => return Err(unsupported_alg("ECDSA signing", alg)),
         };
-        require_curve(key, iana::EC2KeyParameterCrv, curve)?;
-        let kid = key_kid(key)?;
+        key.require_integer_parameter(iana::EC2KeyParameterCrv, curve, "curve")?;
+        let kid = key.kid_owned()?;
         let public_key = ec2_uncompressed_public_key(key, coordinate_len)?;
-        let d = required_bytes(key, iana::EC2KeyParameterD, "d")?;
+        let d = key.required_bytes(iana::EC2KeyParameterD, "d")?;
         // `ring` requires an RNG argument here; `aws-lc-rs` does not.
         #[cfg(feature = "crypto-ring")]
         let signing_key = signature::EcdsaKeyPair::from_private_key_and_public_key(
@@ -475,18 +565,18 @@ impl RingSigner {
     }
 
     fn rsa_from_cose_key(key: &Key, alg: i64) -> Result<Self, Error> {
-        require_kty(key, iana::KeyTypeRSA)?;
+        key.require_integer_kty(iana::KeyTypeRSA)?;
         let padding = rsa_signing_algorithm(alg)?;
         // A COSE_Key carries the full RSA CRT parameter set, but the backends
         // disagree on how to ingest it: `ring` offers `from_components` while
         // `aws-lc-rs` only parses DER. Serialize the components into a PKCS#1
         // `RSAPrivateKey` DER, which `RsaKeyPair::from_der` accepts on both.
-        let der = rsa_pkcs1_private_key_der(key)?;
-        let key_pair =
-            rsa::KeyPair::from_der(&der).map_err(|_| Error::custom("invalid RSA key material"))?;
+        let der = Zeroizing::new(rsa_pkcs1_private_key_der(key)?);
+        let key_pair = rsa::KeyPair::from_der(der.as_slice())
+            .map_err(|_| Error::custom("invalid RSA key material"))?;
         Ok(Self {
             alg,
-            kid: key_kid(key)?,
+            kid: key.kid_owned()?,
             key: RingSigningKey::Rsa { key_pair, padding },
         })
     }
@@ -549,28 +639,38 @@ enum RingVerificationKey {
 impl RingVerifier {
     /// Creates a verifier from a COSE_Key.
     pub fn from_cose_key(key: &Key) -> Result<Self, Error> {
-        let alg = required_alg(key)?;
+        key.require_any_operation(&[iana::KeyOperationVerify], "signature verification")?;
+        let alg = key.required_integer_alg("crypto backend")?;
         match alg {
-            iana::AlgorithmEdDSA => {
-                require_kty(key, iana::KeyTypeOKP)?;
-                require_curve(key, iana::OKPKeyParameterCrv, iana::EllipticCurveEd25519)?;
-                Self::ed25519(
-                    required_bytes(key, iana::OKPKeyParameterX, "x")?,
-                    key_kid(key)?,
+            iana::AlgorithmEdDSA | iana::AlgorithmEd25519 => {
+                key.require_integer_kty(iana::KeyTypeOKP)?;
+                key.require_integer_parameter(
+                    iana::OKPKeyParameterCrv,
+                    iana::EllipticCurveEd25519,
+                    "curve",
+                )?;
+                Self::ed25519_with_alg(
+                    alg,
+                    key.required_bytes(iana::OKPKeyParameterX, "x")?,
+                    key.kid_owned()?,
                 )
             }
-            iana::AlgorithmES256 | iana::AlgorithmES384 => {
-                require_kty(key, iana::KeyTypeEC2)?;
-                let (expected_curve, coordinate_len) = if alg == iana::AlgorithmES256 {
-                    (iana::EllipticCurveP_256, 32)
-                } else {
-                    (iana::EllipticCurveP_384, 48)
-                };
-                require_curve(key, iana::EC2KeyParameterCrv, expected_curve)?;
+            iana::AlgorithmES256
+            | iana::AlgorithmESP256
+            | iana::AlgorithmES384
+            | iana::AlgorithmESP384 => {
+                key.require_integer_kty(iana::KeyTypeEC2)?;
+                let (expected_curve, coordinate_len) =
+                    if matches!(alg, iana::AlgorithmES256 | iana::AlgorithmESP256) {
+                        (iana::EllipticCurveP_256, 32)
+                    } else {
+                        (iana::EllipticCurveP_384, 48)
+                    };
+                key.require_integer_parameter(iana::EC2KeyParameterCrv, expected_curve, "curve")?;
                 Self::ecdsa(
                     alg,
                     &ec2_uncompressed_public_key(key, coordinate_len)?,
-                    key_kid(key)?,
+                    key.kid_owned()?,
                 )
             }
             iana::AlgorithmRS256
@@ -579,12 +679,12 @@ impl RingVerifier {
             | iana::AlgorithmPS256
             | iana::AlgorithmPS384
             | iana::AlgorithmPS512 => {
-                require_kty(key, iana::KeyTypeRSA)?;
+                key.require_integer_kty(iana::KeyTypeRSA)?;
                 Self::rsa_components(
                     alg,
-                    required_bytes(key, iana::RSAKeyParameterN, "n")?,
-                    required_bytes(key, iana::RSAKeyParameterE, "e")?,
-                    key_kid(key)?,
+                    key.required_bytes(iana::RSAKeyParameterN, "n")?,
+                    key.required_bytes(iana::RSAKeyParameterE, "e")?,
+                    key.kid_owned()?,
                 )
             }
             _ => Err(unsupported_alg("verification", alg)),
@@ -593,8 +693,18 @@ impl RingVerifier {
 
     /// Creates an Ed25519 verifier from the raw public key.
     pub fn ed25519(public_key: &[u8], kid: Option<Vec<u8>>) -> Result<Self, Error> {
+        Self::ed25519_with_alg(iana::AlgorithmEd25519, public_key, kid)
+    }
+
+    /// Creates an Ed25519 verifier with an explicit compatible COSE identifier.
+    pub fn ed25519_with_alg(
+        alg: i64,
+        public_key: &[u8],
+        kid: Option<Vec<u8>>,
+    ) -> Result<Self, Error> {
+        require_ed25519_alg(alg)?;
         Ok(Self {
-            alg: iana::AlgorithmEdDSA,
+            alg,
             kid,
             key: RingVerificationKey::Ed25519(public_key.to_vec()),
         })
@@ -644,7 +754,7 @@ impl RingVerifier {
     /// verifiers built from a DER public key have their PKCS#1 `RSAPublicKey`
     /// parsed back into the COSE `n` and `e` parameters.
     pub fn to_cose_key(&self) -> Result<Key, Error> {
-        match &self.key {
+        let mut key = match &self.key {
             RingVerificationKey::Ed25519(public_key) => Ok(okp_public_cose_key(
                 self.alg,
                 public_key,
@@ -660,7 +770,9 @@ impl RingVerifier {
                 let (n, e) = rsa_public_key_from_der(der)?;
                 Ok(rsa_public_cose_key(self.alg, &n, &e, self.kid.as_deref()))
             }
-        }
+        }?;
+        key.set_ops([iana::KeyOperationVerify]);
+        Ok(key)
     }
 
     /// The configured COSE algorithm.
@@ -731,8 +843,8 @@ fn ecdsa_verification_algorithm(
     alg: i64,
 ) -> Result<&'static dyn signature::VerificationAlgorithm, Error> {
     match alg {
-        iana::AlgorithmES256 => Ok(&signature::ECDSA_P256_SHA256_FIXED),
-        iana::AlgorithmES384 => Ok(&signature::ECDSA_P384_SHA384_FIXED),
+        iana::AlgorithmES256 | iana::AlgorithmESP256 => Ok(&signature::ECDSA_P256_SHA256_FIXED),
+        iana::AlgorithmES384 | iana::AlgorithmESP384 => Ok(&signature::ECDSA_P384_SHA384_FIXED),
         _ => Err(unsupported_alg("ECDSA verification", alg)),
     }
 }
@@ -761,47 +873,12 @@ fn rsa_verification_algorithm(alg: i64) -> Result<&'static RsaParameters, Error>
     }
 }
 
-fn required_alg(key: &Key) -> Result<i64, Error> {
-    match key.alg()? {
-        Some(Label::Int(alg)) => Ok(alg),
-        Some(Label::Text(_)) => Err(Error::custom(
-            "the built-in crypto backend does not support private text-string algorithms",
-        )),
-        None => Err(Error::custom("COSE_Key is missing alg")),
+fn require_ed25519_alg(alg: i64) -> Result<(), Error> {
+    if matches!(alg, iana::AlgorithmEd25519 | iana::AlgorithmEdDSA) {
+        Ok(())
+    } else {
+        Err(unsupported_alg("Ed25519", alg))
     }
-}
-
-fn require_kty(key: &Key, expected: i64) -> Result<(), Error> {
-    match key.kty()? {
-        Some(Label::Int(kty)) if kty == expected => Ok(()),
-        Some(other) => Err(Error::custom(format!(
-            "COSE_Key kty mismatch, expected {}, got {}",
-            Label::from(expected),
-            other
-        ))),
-        None => Err(Error::custom("COSE_Key is missing kty")),
-    }
-}
-
-fn require_curve(key: &Key, label: i64, expected: i64) -> Result<(), Error> {
-    match key.get_label(label)? {
-        Some(Label::Int(curve)) if curve == expected => Ok(()),
-        Some(other) => Err(Error::custom(format!(
-            "COSE_Key curve mismatch, expected {}, got {}",
-            Label::from(expected),
-            other
-        ))),
-        None => Err(Error::custom("COSE_Key is missing curve")),
-    }
-}
-
-fn required_bytes<'a>(key: &'a Key, label: i64, name: &str) -> Result<&'a [u8], Error> {
-    key.get_bytes(label)?
-        .ok_or_else(|| Error::custom(format!("COSE_Key is missing {name}")))
-}
-
-fn key_kid(key: &Key) -> Result<Option<Vec<u8>>, Error> {
-    Ok(key.kid()?.map(ToOwned::to_owned))
 }
 
 /// Concatenates an EC2 key's `x`/`y` into an uncompressed SEC 1 point.
@@ -809,8 +886,8 @@ fn key_kid(key: &Key) -> Result<Option<Vec<u8>>, Error> {
 /// Each coordinate must be exactly `coordinate_len` bytes for the curve, so
 /// a boundary-shifted `x`/`y` pair cannot pass as an aggregate-length match.
 fn ec2_uncompressed_public_key(key: &Key, coordinate_len: usize) -> Result<Vec<u8>, Error> {
-    let x = required_bytes(key, iana::EC2KeyParameterX, "x")?;
-    let y = required_bytes(key, iana::EC2KeyParameterY, "y")?;
+    let x = key.required_bytes(iana::EC2KeyParameterX, "x")?;
+    let y = key.required_bytes(iana::EC2KeyParameterY, "y")?;
     if x.len() != coordinate_len || y.len() != coordinate_len {
         return Err(Error::custom(format!(
             "EC2 coordinates must be {coordinate_len} bytes, got x = {} and y = {}",
@@ -827,7 +904,13 @@ fn ec2_uncompressed_public_key(key: &Key, coordinate_len: usize) -> Result<Vec<u
 
 /// Builds a symmetric COSE_Key (`kty` = Symmetric) carrying `alg`, `k`, an
 /// optional `kid` and an optional Base IV.
-fn symmetric_cose_key(alg: i64, k: &[u8], kid: Option<&[u8]>, base_iv: Option<&[u8]>) -> Key {
+fn symmetric_cose_key(
+    alg: i64,
+    k: &[u8],
+    kid: Option<&[u8]>,
+    base_iv: Option<&[u8]>,
+    key_ops: &Option<Vec<Label>>,
+) -> Key {
     let mut key = Key::new();
     key.set_kty(iana::KeyTypeSymmetric).set_alg(alg);
     if let Some(kid) = kid {
@@ -837,6 +920,7 @@ fn symmetric_cose_key(alg: i64, k: &[u8], kid: Option<&[u8]>, base_iv: Option<&[
     if let Some(base_iv) = base_iv {
         key.insert(iana::KeyParameterBaseIV, base_iv.to_vec());
     }
+    crate::util::set_key_ops(&mut key, key_ops);
     key
 }
 
@@ -858,8 +942,8 @@ fn okp_public_cose_key(alg: i64, x: &[u8], kid: Option<&[u8]>) -> Key {
 /// ECDSA `alg`.
 fn ec2_public_cose_key(alg: i64, point: &[u8], kid: Option<&[u8]>) -> Result<Key, Error> {
     let (curve, coord_len) = match alg {
-        iana::AlgorithmES256 => (iana::EllipticCurveP_256, 32),
-        iana::AlgorithmES384 => (iana::EllipticCurveP_384, 48),
+        iana::AlgorithmES256 | iana::AlgorithmESP256 => (iana::EllipticCurveP_256, 32),
+        iana::AlgorithmES384 | iana::AlgorithmESP384 => (iana::EllipticCurveP_384, 48),
         _ => return Err(unsupported_alg("ECDSA", alg)),
     };
     // RFC 9053 EC2 keys use fixed-length field-element coordinates, so a valid
@@ -896,17 +980,17 @@ fn rsa_public_cose_key(alg: i64, n: &[u8], e: &[u8], kid: Option<&[u8]>) -> Key 
 fn rsa_pkcs1_private_key_der(key: &Key) -> Result<Vec<u8>, Error> {
     // Field order is fixed by the ASN.1 `RSAPrivateKey` SEQUENCE.
     let fields = [
-        required_bytes(key, iana::RSAKeyParameterN, "n")?,
-        required_bytes(key, iana::RSAKeyParameterE, "e")?,
-        required_bytes(key, iana::RSAKeyParameterD, "d")?,
-        required_bytes(key, iana::RSAKeyParameterP, "p")?,
-        required_bytes(key, iana::RSAKeyParameterQ, "q")?,
-        required_bytes(key, iana::RSAKeyParameterDP, "dP")?,
-        required_bytes(key, iana::RSAKeyParameterDQ, "dQ")?,
-        required_bytes(key, iana::RSAKeyParameterQInv, "qInv")?,
+        key.required_bytes(iana::RSAKeyParameterN, "n")?,
+        key.required_bytes(iana::RSAKeyParameterE, "e")?,
+        key.required_bytes(iana::RSAKeyParameterD, "d")?,
+        key.required_bytes(iana::RSAKeyParameterP, "p")?,
+        key.required_bytes(iana::RSAKeyParameterQ, "q")?,
+        key.required_bytes(iana::RSAKeyParameterDP, "dP")?,
+        key.required_bytes(iana::RSAKeyParameterDQ, "dQ")?,
+        key.required_bytes(iana::RSAKeyParameterQInv, "qInv")?,
     ];
 
-    let mut body = Vec::new();
+    let mut body = Zeroizing::new(Vec::new());
     der_unsigned_integer(&[0], &mut body); // version: 0 (two-prime)
     for field in fields {
         der_unsigned_integer(field, &mut body);
@@ -915,7 +999,7 @@ fn rsa_pkcs1_private_key_der(key: &Key) -> Result<Vec<u8>, Error> {
     let mut der = Vec::with_capacity(body.len() + 4);
     der.push(0x30); // SEQUENCE
     der_length(body.len(), &mut der);
-    der.extend_from_slice(&body);
+    der.extend_from_slice(body.as_slice());
     Ok(der)
 }
 
@@ -1030,6 +1114,15 @@ fn unsupported_alg(operation: &str, alg: i64) -> Error {
         Label::from(alg)
     ))
 }
+
+/// Backend-neutral alias for [`RingSigner`].
+pub type BackendSigner = RingSigner;
+/// Backend-neutral alias for [`RingVerifier`].
+pub type BackendVerifier = RingVerifier;
+/// Backend-neutral alias for [`RingMacer`].
+pub type BackendMacer = RingMacer;
+/// Backend-neutral alias for [`RingEncryptor`].
+pub type BackendEncryptor = RingEncryptor;
 
 #[cfg(test)]
 mod tests {

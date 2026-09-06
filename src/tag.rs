@@ -1,8 +1,8 @@
 //! CBOR tag prefixes for COSE structures and helpers to add/strip them.
 //!
-//! COSE messages may be transported tagged (e.g. `0xd2` for COSE_Sign1) or
-//! untagged. These helpers add a tag prefix on encode and tolerate optional
-//! prefixes on decode.
+//! COSE messages may be transported tagged or untagged. Encoding uses the
+//! preferred tag bytes below; decoding compares semantic tag numbers and also
+//! accepts valid non-preferred CBOR encodings.
 
 /// Fixed prefix of a CWT CBOR tag (`#6.61`).
 pub const CWT_PREFIX: &[u8] = &[0xd8, 0x3d];
@@ -21,6 +21,13 @@ pub const SIGN_PREFIX: &[u8] = &[0xd8, 0x62];
 /// Self-described CBOR prefix (`#6.55799`, RFC 8949 §3.4.6).
 pub const CBOR_SELF_PREFIX: &[u8] = &[0xd9, 0xd9, 0xf7];
 
+pub(crate) const CWT_ENCRYPT0_PREFIX: &[u8] = &[0xd8, 0x3d, 0xd0];
+pub(crate) const CWT_MAC0_PREFIX: &[u8] = &[0xd8, 0x3d, 0xd1];
+pub(crate) const CWT_SIGN1_PREFIX: &[u8] = &[0xd8, 0x3d, 0xd2];
+pub(crate) const CWT_ENCRYPT_PREFIX: &[u8] = &[0xd8, 0x3d, 0xd8, 0x60];
+pub(crate) const CWT_MAC_PREFIX: &[u8] = &[0xd8, 0x3d, 0xd8, 0x61];
+pub(crate) const CWT_SIGN_PREFIX: &[u8] = &[0xd8, 0x3d, 0xd8, 0x62];
+
 /// Returns `tag` followed by `data`.
 pub fn with_tag(tag: &[u8], data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(tag.len() + data.len());
@@ -38,35 +45,13 @@ pub fn skip_tag<'a>(tag: &[u8], data: &'a [u8]) -> &'a [u8] {
     }
 }
 
-/// Removes a leading self-described CBOR prefix, a CWT tag prefix and any one
-/// COSE message tag prefix from `data`.
+/// Removes a leading self-described CBOR tag, CWT tag and one known COSE tag.
+/// Malformed or multi-item input is returned unchanged.
 pub fn remove_cbor_tag(data: &[u8]) -> &[u8] {
-    let data = skip_tag(CBOR_SELF_PREFIX, data);
-    let data = skip_tag(CWT_PREFIX, data);
-
-    for prefix in [
-        SIGN1_PREFIX,
-        MAC0_PREFIX,
-        ENCRYPT0_PREFIX,
-        SIGN_PREFIX,
-        MAC_PREFIX,
-        ENCRYPT_PREFIX,
-    ] {
-        if let Some(rest) = data.strip_prefix(prefix) {
-            return rest;
-        }
-    }
-
-    data
+    crate::strict::remove_known_tags(data).unwrap_or(data)
 }
 
-/// Strips only the optional self-described CBOR and CWT wrapper prefixes.
-pub(crate) fn strip_message_wrappers(data: &[u8]) -> &[u8] {
-    let data = skip_tag(CBOR_SELF_PREFIX, data);
-    skip_tag(CWT_PREFIX, data)
-}
-
-/// Returns true when `data` begins with a CBOR semantic tag header.
-pub(crate) fn starts_with_cbor_tag(data: &[u8]) -> bool {
-    matches!(data.first(), Some(0xc0..=0xdb))
+/// Validates semantic wrapper tags and returns the untagged COSE array body.
+pub(crate) fn message_body(data: &[u8], expected_tag: u64) -> Result<&[u8], crate::Error> {
+    crate::strict::message_body(data, expected_tag)
 }

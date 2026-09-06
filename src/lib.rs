@@ -7,16 +7,17 @@
 //! ships no cryptographic dependencies in its default feature set.
 //! Top-level COSE messages use named Rust structs with `#[cbor(array)]` to keep
 //! the COSE array wire shape, and encode with their registered CBOR tags
-//! through `#[derive(cbor2::Cbor)]`. CWT claims likewise encode with their
-//! registered CBOR tag. Decode helpers still accept untagged messages and claim
-//! maps for compatibility; use `to_untagged_vec` when a peer expects an
-//! untagged wire body.
+//! through `#[derive(cbor2::Cbor)]`. CWT claims encode as the untagged map used
+//! in a COSE payload; a message's `to_cwt_vec` method adds the RFC 8392 outer
+//! `61(COSE_Tagged(...))` wrapper. The legacy `61(claims-map)` representation
+//! has an explicit compatibility decoder.
 //! Headers reject malformed `crit` parameters and protected/unprotected bucket
 //! label collisions. Critical header parameters (`crit`) that an application
 //! must understand are validated structurally on decode; applications that
 //! process untrusted input should additionally call
-//! [`Header::ensure_crit_understood`] on each protected header to enforce the
-//! RFC 9052 §3.1 rule that an unrecognised critical parameter is a fatal error.
+//! [`Header::ensure_crit_understood`] directly when validating headers outside
+//! a cryptographic operation. Verification and decryption obtain application
+//! critical labels from the selected provider and reject unknown labels.
 //! Header accessors and the message layer read attributes from the protected
 //! bucket first and then the unprotected bucket (RFC 9052 §3).
 //! Keys enforce required `kty` values and non-empty `COSE_KeySet`s. Recipient
@@ -78,11 +79,13 @@ mod header;
 mod key;
 mod label;
 mod map;
+mod strict;
 pub mod tag;
 mod traits;
 mod util;
 
 mod context;
+mod countersign;
 mod encrypt;
 mod encrypt0;
 mod mac;
@@ -100,13 +103,14 @@ pub mod cwt;
 pub mod ed25519;
 
 pub use error::Error;
-pub use header::{is_understood_header, Header};
+pub use header::{is_understood_header, ContentType, Header};
 pub use key::{Key, KeySet};
 pub use label::Label;
 pub use map::CoseMap;
 pub use traits::{EncryptionContext, Encryptor, Macer, Signer, Verifier};
 
 pub use context::{KdfContext, PartyInfo, PartyNonce, SuppPubInfo};
+pub use countersign::CounterSignature;
 pub use encrypt::EncryptMessage;
 pub use encrypt0::Encrypt0Message;
 pub use mac::MacMessage;
@@ -119,3 +123,4 @@ pub use sign1::Sign1Message;
 ///
 /// Re-exported from [`cbor2`].
 pub use cbor2::Value;
+pub use strict::{validate_with_limits as validate_cbor, CborLimits};

@@ -190,6 +190,8 @@ fn header_accessors_support_int_and_text_algorithm_ids() {
         Some(Label::Text("private-alg".into()))
     );
 
+    assert!(header.to_vec().is_err());
+    header.remove(iana::HeaderParameterPartialIV);
     let bytes = header.to_vec().unwrap();
     let back = Header::from_slice(&bytes).unwrap();
     assert_eq!(back, header);
@@ -223,20 +225,35 @@ fn header_content_type_accepts_text_and_uint() {
     header.set_content_type("application/cbor");
     assert_eq!(
         header.content_type().unwrap(),
-        Some(Label::Text("application/cbor".into()))
+        Some(cose2::ContentType::Text("application/cbor".into()))
     );
 
-    header.set_content_type(60i64); // application/cbor CoAP Content-Format
-    assert_eq!(header.content_type().unwrap(), Some(Label::Int(60)));
+    header.set_content_type(60u16); // application/cbor CoAP Content-Format
+    assert_eq!(
+        header.content_type().unwrap(),
+        Some(cose2::ContentType::Uint(60))
+    );
 
     // Round-trips through CBOR with the registered label 3.
     let bytes = header.to_vec().unwrap();
     let back = Header::from_slice(&bytes).unwrap();
-    assert_eq!(back.content_type().unwrap(), Some(Label::Int(60)));
+    assert_eq!(
+        back.content_type().unwrap(),
+        Some(cose2::ContentType::Uint(60))
+    );
     assert_eq!(
         back.get(iana::HeaderParameterContentType),
         Some(&Value::from(60i64))
     );
+    assert_eq!(
+        cose2::ContentType::try_from(65_535u32).unwrap(),
+        cose2::ContentType::Uint(65_535)
+    );
+    assert!(cose2::ContentType::try_from(65_536u64).is_err());
+
+    header.set_content_type(" invalid ");
+    assert!(header.content_type().is_err());
+    assert!(header.to_vec().is_err());
 }
 
 #[test]
@@ -264,12 +281,8 @@ fn header_ensure_crit_understood_enforces_rfc9052_3_1() {
         .ensure_crit_understood(&[Label::Text("private".into())])
         .is_ok());
 
-    // RFC 9052 §3.1: the RFC 8152 "counter signature" parameter (label 7)
-    // must be understood by new implementations, so an RFC 8152 sender that
-    // marks it critical must not be rejected.
-    let mut legacy = Header::new();
-    legacy.set_crit([iana::HeaderParameterCounterSignature]);
-    assert!(legacy.ensure_crit_understood(&[]).is_ok());
+    // RFC 9052 requires implementations to understand the legacy RFC 8152
+    // countersignature label for compatibility.
     assert!(cose2::is_understood_header(&Label::Int(
         iana::HeaderParameterCounterSignature
     )));
@@ -317,6 +330,10 @@ fn key_ops_errors_on_non_integer_array() {
     let mut empty = Key::new();
     empty.set_kty("private-kty");
     assert_eq!(empty.ops().unwrap(), None);
+    assert!(!empty.allows_any_operation(&[]).unwrap());
+    assert!(empty
+        .allows_any_operation(&[iana::KeyOperationSign])
+        .unwrap());
     assert_eq!(
         empty.kty().unwrap(),
         Some(Label::Text("private-kty".into()))
@@ -369,7 +386,7 @@ fn keyset_lookup_and_round_trip() {
 }
 
 #[test]
-fn keyset_decode_is_strict_by_default_and_lenient_on_request() {
+fn keyset_decode_is_rfc_compliant_by_default_and_has_strict_option() {
     let mut k1 = Key::new();
     k1.set_kty(iana::KeyTypeOKP).set_kid(b"same".to_vec());
     let mut k2 = Key::new();
@@ -383,18 +400,17 @@ fn keyset_decode_is_strict_by_default_and_lenient_on_request() {
     ])
     .unwrap();
 
-    // Default decode: one malformed entry fails the whole key set.
-    assert!(KeySet::from_slice(&raw).is_err());
-
-    // Lenient decode: malformed entries are dropped, valid ones survive.
-    let set = KeySet::from_slice_lenient(&raw).unwrap();
+    // RFC decode: malformed entries are dropped, valid ones survive.
+    let set = KeySet::from_slice(&raw).unwrap();
     assert_eq!(set.len(), 2);
     assert_eq!(set.lookup(b"same").count(), 2);
+    assert!(KeySet::from_slice_strict(&raw).is_err());
 
     // A fully valid key set decodes identically through both paths.
     let good = set.to_vec().unwrap();
     assert_eq!(KeySet::from_slice(&good).unwrap(), set);
     assert_eq!(KeySet::from_slice_lenient(&good).unwrap(), set);
+    assert_eq!(KeySet::from_slice_strict(&good).unwrap(), set);
 
     // Lenient decode still errors when no entry survives.
     let all_bad = cbor2::to_vec(&vec![
@@ -402,6 +418,22 @@ fn keyset_decode_is_strict_by_default_and_lenient_on_request() {
     ])
     .unwrap();
     assert!(KeySet::from_slice_lenient(&all_bad).is_err());
+
+    // Duplicate labels make one key malformed, but must not prevent the next
+    // key from being processed independently.
+    let duplicate_then_valid = [
+        0x82, // array(2)
+        0xa2, 0x01, 0x04, 0x01, 0x04, // {1: 4, 1: 4}
+        0xa1, 0x01, 0x04, // {1: 4}
+    ];
+    assert_eq!(KeySet::from_slice(&duplicate_then_valid).unwrap().len(), 1);
+    assert_eq!(
+        cbor2::from_slice::<KeySet>(&duplicate_then_valid)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(KeySet::from_slice_strict(&duplicate_then_valid).is_err());
 }
 
 // ----------------------------------------------------------------------------
@@ -423,6 +455,12 @@ fn iana_constants_match_registry() {
     assert_eq!(iana::HeaderParameterIV, 5);
     assert_eq!(iana::HeaderParameterPartialIV, 6);
     assert_eq!(iana::HeaderParameterCounterSignature, 7);
+
+    // Fully specified signature algorithms used by SD-CWT profiles.
+    assert_eq!(iana::AlgorithmEd25519, -19);
+    assert_eq!(iana::AlgorithmESP256, -9);
+    assert_eq!(iana::AlgorithmESP384, -51);
+    assert_eq!(iana::AlgorithmESP512, -52);
 
     // CWT claims (RFC 8392).
     assert_eq!(iana::CWTClaimIss, 1);
@@ -477,6 +515,28 @@ fn error_display_and_constructors() {
         "cose: verification failed: z"
     );
     assert_eq!(format!("{}", Error::Custom("w".into())), "cose: w");
+    assert_eq!(
+        format!("{}", Error::invalid_state("new")),
+        "cose: invalid state: new"
+    );
+    assert_eq!(
+        format!(
+            "{}",
+            Error::AlgorithmMismatch {
+                declared: "-7".into(),
+                expected: "-9".into(),
+            }
+        ),
+        "cose: algorithm mismatch, declared -7, expected -9"
+    );
+    assert_eq!(
+        format!("{}", Error::key_operation("sign")),
+        "cose: key operation denied: sign"
+    );
+    assert_eq!(
+        format!("{}", Error::limit("depth", 64)),
+        "cose: depth limit 64 exceeded"
+    );
 
     assert_eq!(Error::custom("a"), Error::Custom("a".into()));
     assert_eq!(Error::verify("b"), Error::Verify("b".into()));

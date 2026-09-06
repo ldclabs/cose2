@@ -1,5 +1,7 @@
 //! COSE_KDF_Context and its sub-structures (RFC 9053 §5.2).
 
+use std::borrow::Cow;
+
 use cbor2::Cbor;
 use serde::{
     de::{Error as DeError, IgnoredAny, SeqAccess, Visitor},
@@ -15,14 +17,13 @@ use crate::{
 /// A `PartyInfo` nonce: `bstr / int` (RFC 9053 §5.2, where the field is
 /// `bstr / int / nil`; absence is modeled with `Option`).
 ///
-/// Integer nonces are modeled as `i64`; a CBOR integer outside that range
-/// is rejected during decode with an "out of range" error.
+/// Integer nonces retain the complete CBOR integer range in an `i128`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PartyNonce {
     /// A byte-string nonce.
     Bytes(Vec<u8>),
     /// An integer nonce.
-    Int(i64),
+    Int(i128),
 }
 
 impl From<Vec<u8>> for PartyNonce {
@@ -39,7 +40,13 @@ impl From<&[u8]> for PartyNonce {
 
 impl From<i64> for PartyNonce {
     fn from(value: i64) -> Self {
-        PartyNonce::Int(value)
+        PartyNonce::Int(i128::from(value))
+    }
+}
+
+impl From<u64> for PartyNonce {
+    fn from(value: u64) -> Self {
+        PartyNonce::Int(i128::from(value))
     }
 }
 
@@ -50,7 +57,10 @@ impl Serialize for PartyNonce {
     {
         match self {
             PartyNonce::Bytes(b) => serializer.serialize_bytes(b),
-            PartyNonce::Int(i) => serializer.serialize_i64(*i),
+            PartyNonce::Int(i) => {
+                validate_party_nonce_integer(*i).map_err(serde::ser::Error::custom)?;
+                serializer.serialize_i128(*i)
+            }
         }
     }
 }
@@ -78,29 +88,37 @@ impl<'de> Deserialize<'de> for PartyNonce {
             }
 
             fn visit_i64<E: DeError>(self, v: i64) -> Result<PartyNonce, E> {
-                Ok(PartyNonce::Int(v))
+                Ok(PartyNonce::Int(i128::from(v)))
             }
 
             fn visit_u64<E: DeError>(self, v: u64) -> Result<PartyNonce, E> {
-                i64::try_from(v)
-                    .map(PartyNonce::Int)
-                    .map_err(|_| E::custom("integer nonce out of range"))
+                Ok(PartyNonce::Int(i128::from(v)))
             }
 
             fn visit_i128<E: DeError>(self, v: i128) -> Result<PartyNonce, E> {
-                i64::try_from(v)
-                    .map(PartyNonce::Int)
-                    .map_err(|_| E::custom("integer nonce out of range"))
+                validate_party_nonce_integer(v).map_err(E::custom)?;
+                Ok(PartyNonce::Int(v))
             }
 
             fn visit_u128<E: DeError>(self, v: u128) -> Result<PartyNonce, E> {
-                i64::try_from(v)
-                    .map(PartyNonce::Int)
-                    .map_err(|_| E::custom("integer nonce out of range"))
+                let value =
+                    i128::try_from(v).map_err(|_| E::custom("integer nonce out of CBOR range"))?;
+                validate_party_nonce_integer(value).map_err(E::custom)?;
+                Ok(PartyNonce::Int(value))
             }
         }
 
         deserializer.deserialize_any(NonceVisitor)
+    }
+}
+
+fn validate_party_nonce_integer(value: i128) -> Result<(), Error> {
+    if value < -1 - i128::from(u64::MAX) || value > i128::from(u64::MAX) {
+        Err(Error::UnexpectedType(
+            "integer nonce out of CBOR integer range".into(),
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -112,17 +130,17 @@ impl<'de> Deserialize<'de> for PartyNonce {
 #[cbor(array)]
 pub struct PartyInfo {
     /// Party identity information.
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::strict::optional_bytes")]
     pub identity: Option<Vec<u8>>,
     /// Party-provided nonce.
     pub nonce: Option<PartyNonce>,
     /// Other party-provided information.
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::strict::optional_bytes")]
     pub other: Option<Vec<u8>>,
 }
 
 /// A `SuppPubInfo` structure: `[keyDataLength, protected, ?other]`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct SuppPubInfo {
     /// Length of the derived key material, in bits.
     pub key_data_length: u64,
@@ -130,6 +148,24 @@ pub struct SuppPubInfo {
     pub protected: Header,
     /// Optional other supplemental public information.
     pub other: Option<Vec<u8>>,
+    /// Exact decoded protected bytes. Leave as `None` when constructing.
+    #[doc(hidden)]
+    pub protected_raw: Option<Vec<u8>>,
+}
+
+impl PartialEq for SuppPubInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.key_data_length == other.key_data_length
+            && self.protected == other.protected
+            && self.other == other.other
+    }
+}
+
+impl SuppPubInfo {
+    /// Returns the decoded protected-header bytes, when available.
+    pub fn protected_raw(&self) -> Option<&[u8]> {
+        self.protected_raw.as_deref()
+    }
 }
 
 impl Serialize for SuppPubInfo {
@@ -137,11 +173,18 @@ impl Serialize for SuppPubInfo {
     where
         S: Serializer,
     {
-        let protected_raw = encode_protected(&self.protected).map_err(S::Error::custom)?;
+        let protected_raw: Cow<'_, [u8]> = match &self.protected_raw {
+            Some(raw) => {
+                crate::header::validate_protected_state(&self.protected, raw)
+                    .map_err(S::Error::custom)?;
+                Cow::Borrowed(raw)
+            }
+            None => Cow::Owned(encode_protected(&self.protected).map_err(S::Error::custom)?),
+        };
         let len = if self.other.is_some() { 3 } else { 2 };
         let mut seq = serializer.serialize_seq(Some(len))?;
         seq.serialize_element(&self.key_data_length)?;
-        seq.serialize_element(serde_bytes::Bytes::new(&protected_raw))?;
+        seq.serialize_element(serde_bytes::Bytes::new(protected_raw.as_ref()))?;
         if let Some(other) = &self.other {
             seq.serialize_element(serde_bytes::Bytes::new(other))?;
         }
@@ -170,18 +213,19 @@ impl<'de> Deserialize<'de> for SuppPubInfo {
                 let key_data_length: u64 = seq
                     .next_element()?
                     .ok_or_else(|| A::Error::custom("missing keyDataLength"))?;
-                let protected_raw: serde_bytes::ByteBuf = seq
+                let protected_raw: crate::strict::StrictBytes = seq
                     .next_element()?
                     .ok_or_else(|| A::Error::custom("missing protected header"))?;
-                let other = seq.next_element::<serde_bytes::ByteBuf>()?;
+                let other = seq.next_element::<crate::strict::StrictBytes>()?;
                 if seq.next_element::<IgnoredAny>()?.is_some() {
                     return Err(A::Error::invalid_length(4, &self));
                 }
-                let protected = decode_protected(&protected_raw).map_err(A::Error::custom)?;
+                let protected = decode_protected(&protected_raw.0).map_err(A::Error::custom)?;
                 Ok(SuppPubInfo {
                     key_data_length,
                     protected,
-                    other: other.map(|o| o.into_vec()),
+                    other: other.map(|o| o.0),
+                    protected_raw: Some(protected_raw.0),
                 })
             }
         }
@@ -210,6 +254,7 @@ pub struct KdfContext {
 impl KdfContext {
     /// Decodes a context from CBOR bytes.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
+        crate::strict::validate_array(data)?;
         Ok(cbor2::from_slice(data)?)
     }
 
@@ -267,7 +312,7 @@ impl<'de> Deserialize<'de> for KdfContext {
                 let supp_pub_info: SuppPubInfo = seq
                     .next_element()?
                     .ok_or_else(|| A::Error::custom("missing SuppPubInfo"))?;
-                let supp_priv_info = seq.next_element::<serde_bytes::ByteBuf>()?;
+                let supp_priv_info = seq.next_element::<crate::strict::StrictBytes>()?;
                 if seq.next_element::<IgnoredAny>()?.is_some() {
                     return Err(A::Error::invalid_length(6, &self));
                 }
@@ -276,7 +321,7 @@ impl<'de> Deserialize<'de> for KdfContext {
                     party_u_info,
                     party_v_info,
                     supp_pub_info,
-                    supp_priv_info: supp_priv_info.map(|p| p.into_vec()),
+                    supp_priv_info: supp_priv_info.map(|p| p.0),
                 })
             }
         }

@@ -4,17 +4,17 @@ use cbor2::Cbor;
 
 use crate::{
     header::{decode_protected, encode_protected, validate_header_buckets},
-    iana, tag, util, EncryptionContext, Encryptor, Error, Header, Label, Value,
+    iana, tag, util, EncryptionContext, Encryptor, Error, Header, Label,
 };
 
 /// The on-the-wire COSE_Encrypt0 array: `[protected, unprotected, ciphertext]`.
 #[derive(Clone, Debug, PartialEq, Cbor)]
 #[cbor(tag = 16, array)]
 struct Encrypt0Wire {
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::strict::bytes")]
     protected: Vec<u8>,
     unprotected: Header,
-    #[serde(with = "serde_bytes")]
+    #[serde(with = "crate::strict::optional_bytes")]
     ciphertext: Option<Vec<u8>>,
 }
 
@@ -36,7 +36,7 @@ pub struct Encrypt0Message {
     ciphertext: Vec<u8>,
     ciphertext_detached: bool,
     protected_raw: Vec<u8>,
-    encrypted: bool,
+    state: util::OperationState,
 }
 
 impl Encrypt0Message {
@@ -54,11 +54,11 @@ impl Encrypt0Message {
     /// messages should usually call [`prepare_encryption`](Self::prepare_encryption)
     /// so the protected header bytes stored in the message match the AAD.
     pub fn to_be_encrypted(protected_raw: &[u8], external_aad: &[u8]) -> Result<Vec<u8>, Error> {
-        util::encode_structure(vec![
-            Value::from("Encrypt0"),
-            Value::Bytes(protected_raw.to_vec()),
-            Value::Bytes(external_aad.to_vec()),
-        ])
+        util::encode_structure(&(
+            "Encrypt0",
+            serde_bytes::Bytes::new(protected_raw),
+            serde_bytes::Bytes::new(external_aad),
+        ))
     }
 
     /// Prepares this message for external encryption.
@@ -77,8 +77,8 @@ impl Encrypt0Message {
         base_iv: Option<&[u8]>,
         external_aad: Option<&[u8]>,
     ) -> Result<EncryptionContext, Error> {
-        util::ensure_protected_alg(&mut self.protected, alg)?;
-        util::ensure_unprotected_kid(&mut self.unprotected, kid);
+        util::ensure_protected_alg(&mut self.protected, &mut self.unprotected, alg)?;
+        util::ensure_unprotected_kid(&self.protected, &mut self.unprotected, kid)?;
         validate_header_buckets(&self.protected, &self.unprotected)?;
         util::require_plaintext(&self.payload, "Encrypt0Message::prepare_encryption")?;
 
@@ -91,9 +91,9 @@ impl Encrypt0Message {
         let protected_raw = encode_protected(&self.protected)?;
         let aad = Self::to_be_encrypted(&protected_raw, external_aad.unwrap_or(&[]))?;
         self.protected_raw = protected_raw;
+        self.state = util::OperationState::Prepared;
         self.ciphertext.clear();
         self.ciphertext_detached = false;
-        self.encrypted = false;
         Ok(EncryptionContext { nonce, aad })
     }
 
@@ -110,12 +110,27 @@ impl Encrypt0Message {
         base_iv: Option<&[u8]>,
         external_aad: Option<&[u8]>,
     ) -> Result<EncryptionContext, Error> {
-        if !self.encrypted {
-            return Err(Error::Custom(
+        self.prepare_decryption_with_crit(alg, nonce_size, base_iv, external_aad, &[])
+    }
+
+    /// Prepares external decryption while accepting application critical headers.
+    pub fn prepare_decryption_with_crit(
+        &self,
+        alg: Option<Label>,
+        nonce_size: usize,
+        base_iv: Option<&[u8]>,
+        external_aad: Option<&[u8]>,
+        understood_critical_headers: &[Label],
+    ) -> Result<EncryptionContext, Error> {
+        if !self.state.complete() {
+            return Err(Error::InvalidState(
                 "Encrypt0Message must be decoded before decrypting".into(),
             ));
         }
-        util::check_protected_alg(&self.protected, alg)?;
+        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        self.protected
+            .ensure_crit_understood(understood_critical_headers)?;
+        util::check_protected_alg(&self.protected, &self.unprotected, alg)?;
         let nonce = util::nonce_from_header_values(
             &self.protected,
             &self.unprotected,
@@ -137,12 +152,13 @@ impl Encrypt0Message {
         detached: bool,
     ) -> Result<(), Error> {
         validate_header_buckets(&self.protected, &self.unprotected)?;
-        if self.protected_raw.is_empty() && !self.protected.is_empty() {
+        if !self.state.initialized() {
             self.protected_raw = encode_protected(&self.protected)?;
         }
+        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
         self.ciphertext = ciphertext.into();
         self.ciphertext_detached = detached;
-        self.encrypted = true;
+        self.state = util::OperationState::Complete;
         Ok(())
     }
 
@@ -159,9 +175,8 @@ impl Encrypt0Message {
             encryptor.base_iv(),
             external_aad,
         )?;
-        let plaintext =
-            util::require_plaintext(&self.payload, "Encrypt0Message::encrypt")?.to_vec();
-        let ciphertext = encryptor.encrypt(&context.nonce, &plaintext, &context.aad)?;
+        let plaintext = util::require_plaintext(&self.payload, "Encrypt0Message::encrypt")?;
+        let ciphertext = encryptor.encrypt(&context.nonce, plaintext, &context.aad)?;
         self.set_ciphertext(ciphertext, false)
     }
 
@@ -190,19 +205,28 @@ impl Encrypt0Message {
     }
 
     /// Encrypts with detached ciphertext and returns `(message, ciphertext)`.
+    ///
+    /// The ciphertext buffer is moved into the return value to avoid a full
+    /// duplicate allocation; [`ciphertext`](Self::ciphertext) is empty afterward.
     pub fn encrypt_detached_and_encode(
         &mut self,
         encryptor: &dyn Encryptor,
         external_aad: Option<&[u8]>,
     ) -> Result<(Vec<u8>, Vec<u8>), Error> {
         self.encrypt_detached(encryptor, external_aad)?;
-        let ciphertext = self.ciphertext.clone();
-        Ok((self.to_vec()?, ciphertext))
+        let encoded = self.to_vec()?;
+        let ciphertext = std::mem::take(&mut self.ciphertext);
+        Ok((encoded, ciphertext))
     }
 
     /// Encodes an encrypted message to tagged COSE_Encrypt0 bytes.
     pub fn to_vec(&self) -> Result<Vec<u8>, Error> {
         self.encode(tag::ENCRYPT0_PREFIX)
+    }
+
+    /// Encodes this tagged COSE_Encrypt0 as a CWT (`61(16(...))`).
+    pub fn to_cwt_vec(&self) -> Result<Vec<u8>, Error> {
+        self.encode(tag::CWT_ENCRYPT0_PREFIX)
     }
 
     /// Encodes an encrypted message to canonical COSE_Encrypt0 bytes without the CBOR tag.
@@ -212,22 +236,24 @@ impl Encrypt0Message {
 
     /// Serializes the wire array borrowing this message's buffers.
     fn encode(&self, prefix: &[u8]) -> Result<Vec<u8>, Error> {
-        if !self.encrypted {
-            return Err(Error::Custom(
+        if !self.state.complete() {
+            return Err(Error::InvalidState(
                 "Encrypt0Message must be encrypted before encoding".into(),
             ));
         }
         validate_header_buckets(&self.protected, &self.unprotected)?;
+        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
         let ciphertext = if self.ciphertext_detached {
             None
         } else {
             Some(serde_bytes::Bytes::new(&self.ciphertext))
         };
+        let unprotected = util::canonical_raw(&self.unprotected)?;
         util::encode_prefixed(
             prefix,
             &(
                 serde_bytes::Bytes::new(&self.protected_raw),
-                &self.unprotected,
+                &unprotected,
                 ciphertext,
             ),
         )
@@ -235,12 +261,7 @@ impl Encrypt0Message {
 
     /// Decodes a COSE_Encrypt0 message (tagged or untagged) without decrypting.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
-        let body = tag::strip_message_wrappers(data);
-        if !body.starts_with(tag::ENCRYPT0_PREFIX) && tag::starts_with_cbor_tag(body) {
-            return Err(Error::Custom(
-                "unexpected CBOR tag for COSE_Encrypt0".into(),
-            ));
-        }
+        let body = tag::message_body(data, Self::TAG)?;
         let wire: Encrypt0Wire = cbor2::from_slice(body)?;
         let protected = decode_protected(&wire.protected)?;
         validate_header_buckets(&protected, &wire.unprotected)?;
@@ -255,7 +276,7 @@ impl Encrypt0Message {
             ciphertext,
             ciphertext_detached,
             protected_raw: wire.protected,
-            encrypted: true,
+            state: util::OperationState::Complete,
         })
     }
 
@@ -266,8 +287,8 @@ impl Encrypt0Message {
         encryptor: &dyn Encryptor,
         external_aad: Option<&[u8]>,
     ) -> Result<&[u8], Error> {
-        if !self.encrypted {
-            return Err(Error::Custom(
+        if !self.state.complete() {
+            return Err(Error::InvalidState(
                 "Encrypt0Message must be decoded before decrypting".into(),
             ));
         }
@@ -276,7 +297,16 @@ impl Encrypt0Message {
                 "Encrypt0Message has detached ciphertext; use decrypt_detached".into(),
             ));
         }
-        self.decrypt_ciphertext(encryptor, self.ciphertext.clone(), external_aad)
+        let context = self.prepare_decryption_with_crit(
+            encryptor.alg(),
+            encryptor.nonce_size(),
+            encryptor.base_iv(),
+            external_aad,
+            encryptor.understood_critical_headers(),
+        )?;
+        let plaintext = encryptor.decrypt(&context.nonce, &self.ciphertext, &context.aad)?;
+        self.payload = Some(plaintext);
+        Ok(self.payload.as_deref().expect("payload was just set"))
     }
 
     /// Decrypts a detached ciphertext for a decoded COSE_Encrypt0 message.
@@ -286,8 +316,8 @@ impl Encrypt0Message {
         detached_ciphertext: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<&[u8], Error> {
-        if !self.encrypted {
-            return Err(Error::Custom(
+        if !self.state.complete() {
+            return Err(Error::InvalidState(
                 "Encrypt0Message must be decoded before decrypting".into(),
             ));
         }
@@ -296,25 +326,18 @@ impl Encrypt0Message {
                 "Encrypt0Message carries embedded ciphertext; use decrypt".into(),
             ));
         }
-        self.decrypt_ciphertext(encryptor, detached_ciphertext.to_vec(), external_aad)
-    }
-
-    fn decrypt_ciphertext(
-        &mut self,
-        encryptor: &dyn Encryptor,
-        ciphertext: Vec<u8>,
-        external_aad: Option<&[u8]>,
-    ) -> Result<&[u8], Error> {
-        let context = self.prepare_decryption(
+        let context = self.prepare_decryption_with_crit(
             encryptor.alg(),
             encryptor.nonce_size(),
             encryptor.base_iv(),
             external_aad,
+            encryptor.understood_critical_headers(),
         )?;
-        let plaintext = encryptor.decrypt(&context.nonce, &ciphertext, &context.aad)?;
-        self.ciphertext = ciphertext;
+        let plaintext = encryptor.decrypt(&context.nonce, detached_ciphertext, &context.aad)?;
+        self.ciphertext.clear();
+        self.ciphertext.extend_from_slice(detached_ciphertext);
         self.payload = Some(plaintext);
-        Ok(self.payload.as_deref().unwrap())
+        Ok(self.payload.as_deref().expect("payload was just set"))
     }
 
     /// Decodes and decrypts a COSE_Encrypt0 message in one step.

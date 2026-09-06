@@ -17,7 +17,8 @@ implement the relevant trait.
 Enable the optional `crypto-ring` feature (or the aggregate `crypto` feature)
 to use the built-in [`crypto`] module backed by [`ring`], or `crypto-aws-lc-rs`
 to back it with [`aws-lc-rs`] instead. Both backends expose the same providers
-and implement Ed25519, ES256, ES384, RS256/384/512, PS256/384/512, HMAC
+and implement Ed25519/EdDSA, ESP256/ES256, ESP384/ES384, RS256/384/512,
+PS256/384/512, HMAC
 256/64, HMAC 256/256, HMAC 384/384, HMAC 512/512, A128GCM, A256GCM and
 ChaCha20/Poly1305. Algorithms outside the backend's support are rejected at
 provider construction. When both backend features are enabled, `crypto-ring`
@@ -39,21 +40,23 @@ dependency.
 - **Keys** — `COSE_Key` objects (`Key`) and non-empty key sets (`KeySet`) with
   typed accessors for `kty`, `kid`, `alg`, `key_ops` and `Base IV`.
 - **Headers** — protected/unprotected `Header` maps with integer or text
-  labels and the full IANA parameter registry under [`iana`].
+  labels and registry constants under [`iana`], including legacy RFC 8152 full
+  countersignature parsing and verification.
 - **CWT** — typed [`cwt::Claims`], a label-keyed [`cwt::ClaimsMap`], and a
   [`cwt::Validator`] for expiry, not-before, issued-at, issuer and audience.
 - **SD-CWT** — the workspace also includes [`sd-cwt`](sd-cwt/README.md), a
   companion crate for selective-disclosure claims, `simple(59)`,
   tag-60 redacted elements, `sd_claims`, and Holder/Verifier restoration.
 - **KDF context** — `KdfContext`, `PartyInfo`, `SuppPubInfo` (RFC 9053 §5.2).
-- **Tagging** — tagged or untagged messages, with optional CWT and
-  self-described CBOR prefixes handled transparently. Newly encoded COSE
-  messages and CWT claims use their registered CBOR tags through
-  `#[derive(cbor2::Cbor)]`; use `to_untagged_vec` when a peer expects the
-  untagged wire body.
+- **Tagging** — tagged or untagged COSE messages, with optional CWT and
+  self-described CBOR wrappers parsed semantically. `Claims::to_vec` emits the
+  untagged claims map used as a COSE payload; `message.to_cwt_vec()` emits the
+  RFC 8392 `61(COSE_Tagged(...))` envelope.
 - **Optional crypto** — `crypto-ring` or `crypto-aws-lc-rs` provides
   `RingSigner`, `RingVerifier`, `RingMacer` and `RingEncryptor` implementations
   behind a feature flag, backed by `ring` or `aws-lc-rs` respectively.
+  `BackendSigner`, `BackendVerifier`, `BackendMacer` and `BackendEncryptor`
+  provide backend-neutral aliases for new code.
   `crypto-ed25519-dalek` adds an `Ed25519Signer`/`Ed25519Verifier` backed by
   `ed25519-dalek`, and `crypto-aes-gcm` adds an `AesGcmEncryptor` backed by
   `aes-gcm`.
@@ -100,7 +103,7 @@ assert_eq!(verified.payload.as_deref(), Some(&b"This is the content"[..]));
 | Async/remote signing       | `prepare_signature` / `prepare_signatures`, then `set_signature` / `set_signatures`   | Sign the returned `Sig_structure` bytes outside the synchronous trait.                             |
 | Async/remote MAC           | `prepare_tag` / `prepare_detached_tag`, then `set_tag`                                | MAC the returned `MAC_structure` bytes outside the synchronous trait.                              |
 | Async/remote encryption    | `prepare_encryption` then `set_ciphertext`                                            | Encrypt with the returned nonce and `Enc_structure` AAD.                                           |
-| Work with CWT claims       | `cwt::Claims`, `cwt::ClaimsMap`, `cwt::Validator`                                     | `Claims::extra` preserves custom claims; use `ClaimsMap` for map-only use.                         |
+| Work with CWT claims       | `cwt::Claims`, `cwt::ClaimsMap`, `cwt::Validator`, then `message.to_cwt_vec()`         | `Claims::to_vec` is the untagged payload map; `Claims::extra` preserves custom keys.                |
 | Work with SD-CWT claims    | `sd-cwt` companion crate                                                              | Issue tag-58/62 pre-issuance claims, write `sd_claims`, and restore Holder/Verifier presentations. |
 | Work with COSE keys        | `Key`, `KeySet`                                                                       | `KeySet::lookup(kid)` returns all matches because `kid` is not unique.                             |
 
@@ -124,6 +127,10 @@ recipe table][agent-recipes] mapping each algorithm to its required COSE key
 parameters — see the [Agent guide for cose2][agent-guide]. Agents modifying this
 crate's source should start from [AGENTS.md](AGENTS.md).
 
+Applications upgrading from 0.4 should read [Migrating from cose2 0.4 to
+0.5](docs/migration-0.5.md), especially the corrected CWT wrapper and typed
+claim changes.
+
 For selective-disclosure credentials, start with the
 [`sd-cwt` README](sd-cwt/README.md) and its runnable `basic` example. The
 example shows pre-issuance redaction requests, issuer signing with
@@ -138,10 +145,12 @@ subset.
   parameters (`alg`, `crit`, `kid`, `iv`, `Partial IV`) while still
   dereferencing to the underlying map for custom labels. Message and recipient
   decoding rejects malformed `crit` values and protected/unprotected bucket
-  label collisions.
-- [`Key`] requires `kty`; [`KeySet`] encodes/decodes as a non-empty COSE_KeySet
-  and `lookup` returns all keys with a matching `kid`, since COSE key
-  identifiers are not unique.
+  label collisions. Verification and decryption reject unknown critical
+  headers unless the provider declares that it processes them.
+- [`Key`] requires `kty`; built-in providers enforce `key_ops`. [`KeySet`]
+  processes each entry independently as required by RFC 9052;
+  `from_slice_strict` is available when one malformed entry should reject the
+  entire set. `lookup` returns all matching `kid` values.
 - `alg` values in crypto traits are `Option<Label>`, so both registered
   integer algorithms and private text-string algorithms are representable.
 - The default build has no crypto dependency. The `crypto-ring` and
@@ -150,13 +159,12 @@ subset.
   falling back to a mismatched primitive.
 - The protected header is captured as raw bytes on decode and reused verbatim
   in the `Sig_structure`/`MAC_structure`/`Enc_structure`, so signatures made
-  with non-canonical encodings still verify.
-- Top-level COSE message wire types use named Rust structs with
-  `#[cbor(tag = ..., array)]`, preserving the COSE array wire shape while
-  declaring their IANA CBOR tags. CWT claims declare their IANA CBOR tag with
-  `#[cbor(tag = 61)]`. Decoders still accept untagged COSE messages and
-  untagged claim maps for compatibility, and tagged types provide
-  `to_untagged_vec` for tagless canonical encoding.
+  with non-canonical encodings still verify. Mutating the public protected
+  header after those bytes are prepared invalidates the message state.
+- Decoders enforce protocol wire types, reject duplicate map keys recursively,
+  accept semantically equivalent CBOR tag encodings, and require a CWT tag to
+  wrap a tagged COSE message. The old `61(claims-map)` form can be read only
+  through `Claims::from_slice_legacy_tagged`.
 - Detached payloads are explicit: use `sign_detached*`,
   `compute_detached*`, `verify_detached*`, or `verify_detached_and_decode`.
 - Detached ciphertext is explicit: use `encrypt_detached*` and
@@ -177,9 +185,17 @@ subset.
 
 `cargo test` runs the unit, integration and doc tests, including a byte-exact
 reproduction of the [RFC 9052 Appendix C.4.1][c41] `COSE_Encrypt0` vector.
-Coverage measured with `cargo llvm-cov` is **100% of lines and functions**;
-the remaining uncovered regions are unreachable error-propagation arms on
-serialization that cannot fail.
+CI runs formatting, clippy, tests, rustdoc, MSRV, backend-specific builds,
+coverage and fuzz-target compilation. The coverage job enforces the threshold
+recorded in `.github/workflows/ci.yml`; it does not claim unreachable paths are
+covered.
+
+Lightweight performance probes are available with:
+
+```sh
+cargo run --release --example benchmark_encoding
+cargo run --release -p sd-cwt --example benchmark_restore
+```
 
 ## License
 

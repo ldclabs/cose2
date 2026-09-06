@@ -56,6 +56,11 @@ pub trait Verifier {
         None
     }
 
+    /// Application-specific critical protected headers this verifier processes.
+    fn understood_critical_headers(&self) -> &[Label] {
+        &[]
+    }
+
     /// Returns `Ok(())` if `signature` is valid for `data`, otherwise an error.
     fn verify(&self, data: &[u8], signature: &[u8]) -> Result<(), Error>;
 }
@@ -73,6 +78,11 @@ pub trait Macer {
     /// The key identifier to write to the unprotected header, if any.
     fn kid(&self) -> Option<&[u8]> {
         None
+    }
+
+    /// Application-specific critical protected headers this provider processes.
+    fn understood_critical_headers(&self) -> &[Label] {
+        &[]
     }
 
     /// Computes the authentication tag over `data`.
@@ -94,6 +104,11 @@ pub trait Encryptor {
     /// The key identifier to write to the unprotected header, if any.
     fn kid(&self) -> Option<&[u8]> {
         None
+    }
+
+    /// Application-specific critical protected headers this provider processes.
+    fn understood_critical_headers(&self) -> &[Label] {
+        &[]
     }
 
     /// The nonce (IV) size, in bytes, this encryptor expects.

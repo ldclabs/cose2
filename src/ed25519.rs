@@ -2,9 +2,9 @@
 //! [`ed25519-dalek`](https://crates.io/crates/ed25519-dalek).
 //!
 //! This module is available with the `crypto-ed25519-dalek` feature. It
-//! implements the crate's [`Signer`] and [`Verifier`] traits for the COSE
-//! `EdDSA` algorithm over the Ed25519 curve (RFC 9053 §2.2), using COSE OKP
-//! keys (`kty` = OKP, `crv` = Ed25519).
+//! implements the crate's [`Signer`] and [`Verifier`] traits for the fully
+//! specified COSE `Ed25519` algorithm and legacy generic `EdDSA` identifier,
+//! using COSE OKP keys (`kty` = OKP, `crv` = Ed25519).
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey, PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH};
 
@@ -13,6 +13,7 @@ use crate::{iana, Error, Key, Label, Signer, Verifier};
 /// A built-in Ed25519 signing provider for COSE_Sign and COSE_Sign1.
 #[derive(Clone, Debug)]
 pub struct Ed25519Signer {
+    alg: i64,
     kid: Option<Vec<u8>>,
     key: SigningKey,
 }
@@ -20,10 +21,21 @@ pub struct Ed25519Signer {
 impl Ed25519Signer {
     /// Creates a signer from the 32-byte OKP private seed (`d`).
     pub fn from_secret_key(secret_key: &[u8], kid: Option<Vec<u8>>) -> Result<Self, Error> {
+        Self::from_secret_key_with_alg(iana::AlgorithmEd25519, secret_key, kid)
+    }
+
+    /// Creates a signer with the fully specified Ed25519 or legacy EdDSA identifier.
+    pub fn from_secret_key_with_alg(
+        alg: i64,
+        secret_key: &[u8],
+        kid: Option<Vec<u8>>,
+    ) -> Result<Self, Error> {
+        require_supported_alg(alg)?;
         let seed: [u8; SECRET_KEY_LENGTH] = secret_key
             .try_into()
             .map_err(|_| Error::custom("Ed25519 private key must be 32 bytes"))?;
         Ok(Self {
+            alg,
             kid,
             key: SigningKey::from_bytes(&seed),
         })
@@ -31,13 +43,27 @@ impl Ed25519Signer {
 
     /// Creates a signer from an OKP COSE_Key carrying `crv` = Ed25519 and `d`.
     pub fn from_cose_key(key: &Key) -> Result<Self, Error> {
-        require_alg(key)?;
-        require_kty(key, iana::KeyTypeOKP)?;
-        require_curve(key, iana::EllipticCurveEd25519)?;
-        Self::from_secret_key(
-            required_bytes(key, iana::OKPKeyParameterD, "d")?,
-            key_kid(key)?,
-        )
+        key.require_any_operation(&[iana::KeyOperationSign], "signing")?;
+        let alg = require_alg(key)?;
+        key.require_integer_kty(iana::KeyTypeOKP)?;
+        key.require_integer_parameter(
+            iana::OKPKeyParameterCrv,
+            iana::EllipticCurveEd25519,
+            "curve",
+        )?;
+        let signer = Self::from_secret_key_with_alg(
+            alg,
+            key.required_bytes(iana::OKPKeyParameterD, "d")?,
+            key.kid_owned()?,
+        )?;
+        if let Some(expected) = key.get_bytes(iana::OKPKeyParameterX)? {
+            if expected != signer.public_key() {
+                return Err(Error::custom(
+                    "COSE_Key Ed25519 public key x does not match private key d",
+                ));
+            }
+        }
+        Ok(signer)
     }
 
     /// Returns the 32-byte Ed25519 public key.
@@ -51,21 +77,24 @@ impl Ed25519Signer {
     /// the public parameter `x` and round-trips through
     /// [`Ed25519Verifier::from_cose_key`].
     pub fn to_cose_key(&self) -> Result<Key, Error> {
-        Ok(okp_public_cose_key(
+        let mut key = okp_public_cose_key(
+            self.alg,
             self.key.verifying_key().as_bytes(),
             self.kid.as_deref(),
-        ))
+        );
+        key.set_ops([iana::KeyOperationVerify]);
+        Ok(key)
     }
 
-    /// The configured COSE algorithm (always `EdDSA`).
+    /// The configured COSE algorithm (`Ed25519` by default).
     pub fn algorithm(&self) -> i64 {
-        iana::AlgorithmEdDSA
+        self.alg
     }
 }
 
 impl Signer for Ed25519Signer {
     fn alg(&self) -> Option<Label> {
-        Some(iana::AlgorithmEdDSA.into())
+        Some(self.alg.into())
     }
 
     fn kid(&self) -> Option<&[u8]> {
@@ -83,6 +112,7 @@ impl Signer for Ed25519Signer {
 /// A built-in Ed25519 verifier for COSE_Sign and COSE_Sign1.
 #[derive(Clone, Debug)]
 pub struct Ed25519Verifier {
+    alg: i64,
     kid: Option<Vec<u8>>,
     key: VerifyingKey,
 }
@@ -90,22 +120,38 @@ pub struct Ed25519Verifier {
 impl Ed25519Verifier {
     /// Creates a verifier from the 32-byte OKP public key (`x`).
     pub fn from_public_key(public_key: &[u8], kid: Option<Vec<u8>>) -> Result<Self, Error> {
+        Self::from_public_key_with_alg(iana::AlgorithmEd25519, public_key, kid)
+    }
+
+    /// Creates a verifier with the fully specified Ed25519 or legacy EdDSA identifier.
+    pub fn from_public_key_with_alg(
+        alg: i64,
+        public_key: &[u8],
+        kid: Option<Vec<u8>>,
+    ) -> Result<Self, Error> {
+        require_supported_alg(alg)?;
         let bytes: [u8; PUBLIC_KEY_LENGTH] = public_key
             .try_into()
             .map_err(|_| Error::custom("Ed25519 public key must be 32 bytes"))?;
         let key = VerifyingKey::from_bytes(&bytes)
             .map_err(|_| Error::custom("invalid Ed25519 public key"))?;
-        Ok(Self { kid, key })
+        Ok(Self { alg, kid, key })
     }
 
     /// Creates a verifier from an OKP COSE_Key carrying `crv` = Ed25519 and `x`.
     pub fn from_cose_key(key: &Key) -> Result<Self, Error> {
-        require_alg(key)?;
-        require_kty(key, iana::KeyTypeOKP)?;
-        require_curve(key, iana::EllipticCurveEd25519)?;
-        Self::from_public_key(
-            required_bytes(key, iana::OKPKeyParameterX, "x")?,
-            key_kid(key)?,
+        key.require_any_operation(&[iana::KeyOperationVerify], "signature verification")?;
+        let alg = require_alg(key)?;
+        key.require_integer_kty(iana::KeyTypeOKP)?;
+        key.require_integer_parameter(
+            iana::OKPKeyParameterCrv,
+            iana::EllipticCurveEd25519,
+            "curve",
+        )?;
+        Self::from_public_key_with_alg(
+            alg,
+            key.required_bytes(iana::OKPKeyParameterX, "x")?,
+            key.kid_owned()?,
         )
     }
 
@@ -118,21 +164,20 @@ impl Ed25519Verifier {
     ///
     /// The result round-trips through [`Ed25519Verifier::from_cose_key`].
     pub fn to_cose_key(&self) -> Result<Key, Error> {
-        Ok(okp_public_cose_key(
-            self.key.as_bytes(),
-            self.kid.as_deref(),
-        ))
+        let mut key = okp_public_cose_key(self.alg, self.key.as_bytes(), self.kid.as_deref());
+        key.set_ops([iana::KeyOperationVerify]);
+        Ok(key)
     }
 
-    /// The configured COSE algorithm (always `EdDSA`).
+    /// The configured COSE algorithm (`Ed25519` by default).
     pub fn algorithm(&self) -> i64 {
-        iana::AlgorithmEdDSA
+        self.alg
     }
 }
 
 impl Verifier for Ed25519Verifier {
     fn alg(&self) -> Option<Label> {
-        Some(iana::AlgorithmEdDSA.into())
+        Some(self.alg.into())
     }
 
     fn kid(&self) -> Option<&[u8]> {
@@ -151,9 +196,9 @@ impl Verifier for Ed25519Verifier {
 
 /// Builds an Ed25519 OKP public COSE_Key carrying `alg`, `crv`, `x` and an
 /// optional `kid`.
-fn okp_public_cose_key(x: &[u8], kid: Option<&[u8]>) -> Key {
+fn okp_public_cose_key(alg: i64, x: &[u8], kid: Option<&[u8]>) -> Key {
     let mut key = Key::new();
-    key.set_kty(iana::KeyTypeOKP).set_alg(iana::AlgorithmEdDSA);
+    key.set_kty(iana::KeyTypeOKP).set_alg(alg);
     if let Some(kid) = kid {
         key.set_kid(kid.to_vec());
     }
@@ -162,48 +207,28 @@ fn okp_public_cose_key(x: &[u8], kid: Option<&[u8]>) -> Key {
     key
 }
 
-/// Accepts a COSE_Key whose `alg` is absent or exactly `EdDSA`.
-fn require_alg(key: &Key) -> Result<(), Error> {
+/// Accepts a COSE_Key whose `alg` is absent, Ed25519, or legacy EdDSA.
+fn require_alg(key: &Key) -> Result<i64, Error> {
     match key.alg()? {
-        None => Ok(()),
-        Some(Label::Int(alg)) if alg == iana::AlgorithmEdDSA => Ok(()),
+        None => Ok(iana::AlgorithmEd25519),
+        Some(Label::Int(alg)) if matches!(alg, iana::AlgorithmEd25519 | iana::AlgorithmEdDSA) => {
+            Ok(alg)
+        }
         Some(other) => Err(Error::custom(format!(
-            "COSE_Key alg mismatch, expected {}, got {}",
-            Label::from(iana::AlgorithmEdDSA),
-            other
+            "COSE_Key alg mismatch, expected {} or {}, got {other}",
+            Label::from(iana::AlgorithmEd25519),
+            Label::from(iana::AlgorithmEdDSA)
         ))),
     }
 }
 
-fn require_kty(key: &Key, expected: i64) -> Result<(), Error> {
-    match key.kty()? {
-        Some(Label::Int(kty)) if kty == expected => Ok(()),
-        Some(other) => Err(Error::custom(format!(
-            "COSE_Key kty mismatch, expected {}, got {}",
-            Label::from(expected),
-            other
-        ))),
-        None => Err(Error::custom("COSE_Key is missing kty")),
+fn require_supported_alg(alg: i64) -> Result<(), Error> {
+    if matches!(alg, iana::AlgorithmEd25519 | iana::AlgorithmEdDSA) {
+        Ok(())
+    } else {
+        Err(Error::custom(format!(
+            "unsupported Ed25519 algorithm {}",
+            Label::from(alg)
+        )))
     }
-}
-
-fn require_curve(key: &Key, expected: i64) -> Result<(), Error> {
-    match key.get_label(iana::OKPKeyParameterCrv)? {
-        Some(Label::Int(curve)) if curve == expected => Ok(()),
-        Some(other) => Err(Error::custom(format!(
-            "COSE_Key curve mismatch, expected {}, got {}",
-            Label::from(expected),
-            other
-        ))),
-        None => Err(Error::custom("COSE_Key is missing curve")),
-    }
-}
-
-fn required_bytes<'a>(key: &'a Key, label: i64, name: &str) -> Result<&'a [u8], Error> {
-    key.get_bytes(label)?
-        .ok_or_else(|| Error::custom(format!("COSE_Key is missing {name}")))
-}
-
-fn key_kid(key: &Key) -> Result<Option<Vec<u8>>, Error> {
-    Ok(key.kid()?.map(ToOwned::to_owned))
 }

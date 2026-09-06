@@ -90,6 +90,114 @@ impl Key {
         }
     }
 
+    /// Returns whether `key_ops` permits at least one registered operation.
+    /// An absent `key_ops` parameter imposes no restriction.
+    pub fn allows_any_operation(&self, operations: &[i64]) -> Result<bool, Error> {
+        if operations.is_empty() {
+            return Ok(false);
+        }
+        let Some(configured) = self.ops()? else {
+            return Ok(true);
+        };
+        Ok(configured
+            .iter()
+            .any(|operation| matches!(operation, Label::Int(value) if operations.contains(value))))
+    }
+
+    /// Requires `key_ops`, when present, to permit one of `operations`.
+    #[cfg(any(
+        feature = "crypto-ring",
+        feature = "crypto-aws-lc-rs",
+        feature = "crypto-ed25519-dalek"
+    ))]
+    pub(crate) fn require_any_operation(
+        &self,
+        operations: &[i64],
+        operation_name: &str,
+    ) -> Result<(), Error> {
+        if self.allows_any_operation(operations)? {
+            Ok(())
+        } else {
+            Err(Error::KeyOperation(format!(
+                "COSE_Key key_ops does not permit {operation_name}"
+            )))
+        }
+    }
+
+    #[cfg(any(
+        feature = "crypto-ring",
+        feature = "crypto-aws-lc-rs",
+        feature = "crypto-aes-gcm"
+    ))]
+    pub(crate) fn required_integer_alg(&self, provider: &str) -> Result<i64, Error> {
+        match self.alg()? {
+            Some(Label::Int(alg)) => Ok(alg),
+            Some(Label::Text(_)) => Err(Error::custom(format!(
+                "the built-in {provider} does not support text-string algorithms"
+            ))),
+            None => Err(Error::custom("COSE_Key is missing alg")),
+        }
+    }
+
+    #[cfg(any(
+        feature = "crypto-ring",
+        feature = "crypto-aws-lc-rs",
+        feature = "crypto-ed25519-dalek",
+        feature = "crypto-aes-gcm"
+    ))]
+    pub(crate) fn require_integer_kty(&self, expected: i64) -> Result<(), Error> {
+        match self.kty()? {
+            Some(Label::Int(kty)) if kty == expected => Ok(()),
+            Some(other) => Err(Error::custom(format!(
+                "COSE_Key kty mismatch, expected {}, got {other}",
+                Label::from(expected)
+            ))),
+            None => Err(Error::custom("COSE_Key is missing kty")),
+        }
+    }
+
+    #[cfg(any(
+        feature = "crypto-ring",
+        feature = "crypto-aws-lc-rs",
+        feature = "crypto-ed25519-dalek"
+    ))]
+    pub(crate) fn require_integer_parameter(
+        &self,
+        label: i64,
+        expected: i64,
+        name: &str,
+    ) -> Result<(), Error> {
+        match self.get_label(label)? {
+            Some(Label::Int(value)) if value == expected => Ok(()),
+            Some(other) => Err(Error::custom(format!(
+                "COSE_Key {name} mismatch, expected {}, got {other}",
+                Label::from(expected)
+            ))),
+            None => Err(Error::custom(format!("COSE_Key is missing {name}"))),
+        }
+    }
+
+    #[cfg(any(
+        feature = "crypto-ring",
+        feature = "crypto-aws-lc-rs",
+        feature = "crypto-ed25519-dalek",
+        feature = "crypto-aes-gcm"
+    ))]
+    pub(crate) fn required_bytes(&self, label: i64, name: &str) -> Result<&[u8], Error> {
+        self.get_bytes(label)?
+            .ok_or_else(|| Error::custom(format!("COSE_Key is missing {name}")))
+    }
+
+    #[cfg(any(
+        feature = "crypto-ring",
+        feature = "crypto-aws-lc-rs",
+        feature = "crypto-ed25519-dalek",
+        feature = "crypto-aes-gcm"
+    ))]
+    pub(crate) fn kid_owned(&self) -> Result<Option<Vec<u8>>, Error> {
+        Ok(self.kid()?.map(ToOwned::to_owned))
+    }
+
     /// Sets the key operations.
     pub fn set_ops<I, L>(&mut self, ops: I) -> &mut Self
     where
@@ -177,28 +285,28 @@ impl KeySet {
 
     /// Decodes a key set from CBOR bytes.
     ///
-    /// Every entry must be a valid COSE_Key; a single malformed entry fails
-    /// the whole decode. Use [`KeySet::from_slice_lenient`] for best-effort
-    /// parsing.
+    /// Entries are processed independently as required by RFC 9052: malformed
+    /// or unsupported entries are ignored, while valid keys remain available.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
-        Ok(cbor2::from_slice(data)?)
+        let members = crate::strict::independently_validated_array_members(data)?;
+        let keys = members
+            .into_iter()
+            .filter_map(|member| Key::from_slice(member).ok())
+            .collect();
+        let key_set = KeySet(keys);
+        key_set.validate()?;
+        Ok(key_set)
     }
 
-    /// Decodes a key set from CBOR bytes, silently discarding entries that
-    /// are not valid COSE_Keys.
-    ///
-    /// Callers that treat a key set as an integrity-checked document should
-    /// prefer [`KeySet::from_slice`]: with this method a corrupted or
-    /// tampered entry disappears without any diagnostic. Errors only when
-    /// the input is not a CBOR array or no entry survives.
+    /// Compatibility alias for the RFC-compliant [`KeySet::from_slice`].
     pub fn from_slice_lenient(data: &[u8]) -> Result<Self, Error> {
-        let values = cbor2::from_slice::<Vec<Value>>(data)?;
-        let mut keys = Vec::with_capacity(values.len());
-        for value in values {
-            if let Ok(key) = Key::try_from(value) {
-                keys.push(key);
-            }
-        }
+        Self::from_slice(data)
+    }
+
+    /// Decodes a key set and rejects the entire set if any entry is malformed.
+    pub fn from_slice_strict(data: &[u8]) -> Result<Self, Error> {
+        crate::strict::validate_array(data)?;
+        let keys = cbor2::from_slice::<Vec<Key>>(data)?;
         let key_set = KeySet(keys);
         key_set.validate()?;
         Ok(key_set)
@@ -260,8 +368,13 @@ impl<'de> Deserialize<'de> for KeySet {
     where
         D: Deserializer<'de>,
     {
-        let key_set = KeySet(Vec::<Key>::deserialize(deserializer)?);
-        key_set.validate().map_err(serde::de::Error::custom)?;
-        Ok(key_set)
+        if deserializer.is_human_readable() {
+            let key_set = KeySet(Vec::<Key>::deserialize(deserializer)?);
+            key_set.validate().map_err(serde::de::Error::custom)?;
+            Ok(key_set)
+        } else {
+            let raw = cbor2::RawValue::deserialize(deserializer)?;
+            KeySet::from_slice(raw.as_bytes()).map_err(serde::de::Error::custom)
+        }
     }
 }

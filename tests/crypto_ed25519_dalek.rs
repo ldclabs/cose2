@@ -19,7 +19,7 @@ fn ed25519_dalek_verifies_rfc8032_test1_vector() {
                        5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b";
 
     let verifier = Ed25519Verifier::from_public_key(&hx(PUB), Some(b"rfc8032-1".to_vec())).unwrap();
-    assert_eq!(verifier.algorithm(), iana::AlgorithmEdDSA);
+    assert_eq!(verifier.algorithm(), iana::AlgorithmEd25519);
     assert!(verifier.verify(b"", &hx(SIG)).is_ok());
 
     // A flipped signature byte and a wrong-length signature are both rejected.

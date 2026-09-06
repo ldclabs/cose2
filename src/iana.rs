@@ -18,6 +18,34 @@
 
 /// RSASSA-PKCS1-v1_5 using SHA-1
 pub const AlgorithmRS1: i64 = -65535;
+/// AES-CTR mode with a 128-bit key.
+pub const AlgorithmA128CTR: i64 = -65534;
+/// AES-CTR mode with a 192-bit key.
+pub const AlgorithmA192CTR: i64 = -65533;
+/// AES-CTR mode with a 256-bit key.
+pub const AlgorithmA256CTR: i64 = -65532;
+/// AES-CBC mode with a 128-bit key.
+pub const AlgorithmA128CBC: i64 = -65531;
+/// AES-CBC mode with a 192-bit key.
+pub const AlgorithmA192CBC: i64 = -65530;
+/// AES-CBC mode with a 256-bit key.
+pub const AlgorithmA256CBC: i64 = -65529;
+/// ESB512 algorithm.
+pub const AlgorithmESB512: i64 = -268;
+/// ESB384 algorithm.
+pub const AlgorithmESB384: i64 = -267;
+/// ESB320 algorithm.
+pub const AlgorithmESB320: i64 = -266;
+/// ESB256 algorithm.
+pub const AlgorithmESB256: i64 = -265;
+/// KT256 algorithm.
+pub const AlgorithmKT256: i64 = -264;
+/// KT128 algorithm.
+pub const AlgorithmKT128: i64 = -263;
+/// TurboSHAKE256 hash.
+pub const AlgorithmTurboSHAKE256: i64 = -262;
+/// TurboSHAKE128 hash.
+pub const AlgorithmTurboSHAKE128: i64 = -261;
 /// WalnutDSA signature
 pub const AlgorithmWalnutDSA: i64 = -260;
 /// RSASSA-PKCS1-v1_5 using SHA-512
@@ -26,6 +54,18 @@ pub const AlgorithmRS512: i64 = -259;
 pub const AlgorithmRS384: i64 = -258;
 /// RSASSA-PKCS1-v1_5 using SHA-256
 pub const AlgorithmRS256: i64 = -257;
+/// Fully specified Ed448 signature.
+pub const AlgorithmEd448: i64 = -53;
+/// Fully specified ECDSA P-521 with SHA-512.
+pub const AlgorithmESP512: i64 = -52;
+/// Fully specified ECDSA P-384 with SHA-384.
+pub const AlgorithmESP384: i64 = -51;
+/// ML-DSA-87 signature.
+pub const AlgorithmML_DSA_87: i64 = -50;
+/// ML-DSA-65 signature.
+pub const AlgorithmML_DSA_65: i64 = -49;
+/// ML-DSA-44 signature.
+pub const AlgorithmML_DSA_44: i64 = -48;
 /// ECDSA using secp256k1 curve and SHA-256
 pub const AlgorithmES256K: i64 = -47;
 /// HSS/LMS hash-based digital signature
@@ -72,6 +112,8 @@ pub const AlgorithmECDH_SS_HKDF_256: i64 = -27;
 pub const AlgorithmECDH_ES_HKDF_512: i64 = -26;
 /// ECDH ES w/ HKDF - generate key directly
 pub const AlgorithmECDH_ES_HKDF_256: i64 = -25;
+/// Fully specified Ed25519 signature.
+pub const AlgorithmEd25519: i64 = -19;
 /// SHAKE-128 256-bit Hash Value
 pub const AlgorithmSHAKE128: i64 = -18;
 /// SHA-2 512-bit Hash truncated to 256-bits
@@ -90,6 +132,8 @@ pub const AlgorithmDirect_HKDF_AES_128: i64 = -12;
 pub const AlgorithmDirect_HKDF_SHA_512: i64 = -11;
 /// Shared secret w/ HKDF and SHA-256
 pub const AlgorithmDirect_HKDF_SHA_256: i64 = -10;
+/// Fully specified ECDSA P-256 with SHA-256.
+pub const AlgorithmESP256: i64 = -9;
 /// EdDSA
 pub const AlgorithmEdDSA: i64 = -8;
 /// ECDSA w/ SHA-256

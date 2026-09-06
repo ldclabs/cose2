@@ -209,7 +209,9 @@ fn encrypt_detached_ciphertext_one_step_and_guards() {
     encm.unprotected.set_iv(vec![4u8; 12]);
     let (msg_bytes, ciphertext) = encm.encrypt_detached_and_encode(&enc, None).unwrap();
     assert!(encm.is_ciphertext_detached());
-    assert!(!encm.ciphertext().is_empty());
+    // Ownership is transferred to the returned detached ciphertext, avoiding
+    // a second full-size copy in the message.
+    assert!(encm.ciphertext().is_empty());
     let decoded =
         EncryptMessage::decrypt_detached_and_decode(&enc, &msg_bytes, &ciphertext, None).unwrap();
     assert_eq!(decoded.payload.as_deref(), Some(&b"secret"[..]));
@@ -285,6 +287,15 @@ fn recipient_validate_all_error_branches() {
     // Key-agreement-with-key-wrap: valid (ciphertext present) and invalid.
     let mut ka_kw = Recipient::new();
     ka_kw.protected.set_alg(iana::AlgorithmECDH_ES_A128KW);
+    let mut sender_key = cose2::Key::new();
+    sender_key.set_kty(iana::KeyTypeEC2);
+    sender_key.insert(iana::EC2KeyParameterCrv, iana::EllipticCurveP_256);
+    sender_key.insert(iana::EC2KeyParameterX, vec![1u8; 32]);
+    sender_key.insert(iana::EC2KeyParameterY, vec![2u8; 32]);
+    ka_kw.unprotected.insert(
+        iana::HeaderAlgorithmParameterEphemeralKey,
+        cbor2::from_slice::<Value>(&sender_key.to_vec().unwrap()).unwrap(),
+    );
     ka_kw.ciphertext = Some(vec![7, 7]);
     assert!(ka_kw.validate().is_ok());
     let mut ka_kw_bad = ka_kw.clone();

@@ -8,7 +8,7 @@
 use aws_lc_rs::{rand::SystemRandom, signature};
 use cose2::{
     crypto::{RingEncryptor, RingMacer, RingSigner, RingVerifier},
-    iana, Encrypt0Message, Key, Mac0Message, Sign1Message,
+    iana, Encrypt0Message, Key, Mac0Message, Macer, Sign1Message,
 };
 
 // A static P-256 key (SEC1 uncompressed public point `04 || x || y`).
@@ -200,6 +200,22 @@ fn aws_lc_rs_backend_rejects_unsupported_algorithms() {
     assert!(RingEncryptor::new(iana::AlgorithmA192GCM, &[0u8; 24], None).is_err());
     assert!(RingMacer::new(iana::AlgorithmAES_MAC_128_64, &[0u8; 16], None).is_err());
     assert!(RingVerifier::ecdsa(iana::AlgorithmES512, &[0u8; 133], None).is_err());
+}
+
+#[test]
+fn aws_lc_rs_enforces_key_ops() {
+    let mut key = symmetric_key(iana::AlgorithmHMAC_256_256, vec![0x11; 32]);
+    key.set_ops([iana::KeyOperationMacVerify]);
+    let restricted = RingMacer::from_cose_key(&key).unwrap();
+    assert!(restricted.mac_create(b"message").is_err());
+
+    let unrestricted = RingMacer::new(iana::AlgorithmHMAC_256_256, &[0x11; 32], None).unwrap();
+    let tag = unrestricted.mac_create(b"message").unwrap();
+    assert!(restricted.mac_verify(b"message", &tag).is_ok());
+
+    let mut wrap_only = symmetric_key(iana::AlgorithmA128GCM, vec![0x22; 16]);
+    wrap_only.set_ops([iana::KeyOperationWrapKey]);
+    assert!(RingEncryptor::from_cose_key(&wrap_only).is_err());
 }
 
 // The RSA-2048 public key as a PKCS#1 `RSAPublicKey` DER (`SEQUENCE { n, e }`).
