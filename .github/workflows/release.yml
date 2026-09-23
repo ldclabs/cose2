@@ -24,6 +24,7 @@ jobs:
   publish:
     name: publish to crates.io
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       # Required to mint the OIDC token consumed by crates-io-auth-action.
       id-token: write
@@ -36,31 +37,20 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Verify the package before publishing; mirrors the CI gate so a bad tag
-      # never reaches crates.io.
+      # Run the tests before publishing; the full lint/backend matrix is in CI.
       - name: Test
         run: cargo test --workspace --all-targets --all-features
+
+      - name: Doctest
+        run: cargo test --workspace --doc --all-features
 
       - name: Authenticate to crates.io
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
 
-      - name: Publish cose2
-        run: cargo publish -p cose2
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-
-      # crates.io's sparse index can lag briefly behind a successful publish;
-      # sd-cwt depends on the just-published cose2 version.
-      - name: Publish sd-cwt
-        run: |
-          for attempt in 1 2 3 4 5; do
-            echo "Publishing sd-cwt (attempt $attempt of 5)"
-            if cargo publish -p sd-cwt; then
-              exit 0
-            fi
-            sleep 20
-          done
-          exit 1
+      # Publish only missing versions, in dependency order. Retrying also
+      # covers index propagation after cose2 has been published.
+      - name: Publish crates
+        run: python3 scripts/publish_crates.py
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

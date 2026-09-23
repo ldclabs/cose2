@@ -257,7 +257,12 @@ impl Encryptor for RingEncryptor {
         crate::util::require_key_ops(&self.key_ops, &[iana::KeyOperationEncrypt], "encryption")?;
         let nonce = aead::Nonce::try_assume_unique_for_key(nonce)
             .map_err(|_| Error::custom("invalid AEAD nonce length"))?;
-        let mut out = plaintext.to_vec();
+        let capacity = plaintext
+            .len()
+            .checked_add(self.key.algorithm().tag_len())
+            .ok_or_else(|| Error::custom("AEAD ciphertext size overflow"))?;
+        let mut out = Vec::with_capacity(capacity);
+        out.extend_from_slice(plaintext);
         self.key
             .seal_in_place_append_tag(nonce, aead::Aad::from(aad), &mut out)
             .map_err(|_| Error::custom("AEAD encryption failed"))?;

@@ -10,15 +10,17 @@ use crate::{
 };
 
 /// The on-the-wire COSE_Mac array: `[protected, unprotected, payload, tag, recipients]`.
+// Private wire types are decoded only after `tag::message_body` validates
+// their exact field kinds. Decode byte strings directly into their final buffers.
 #[derive(Clone, Debug, PartialEq, Cbor)]
 #[cbor(tag = 97, array)]
 struct MacWire {
-    #[serde(with = "crate::strict::bytes")]
+    #[serde(with = "serde_bytes")]
     protected: Vec<u8>,
     unprotected: Header,
-    #[serde(with = "crate::strict::optional_bytes")]
+    #[serde(with = "serde_bytes")]
     payload: Option<Vec<u8>>,
-    #[serde(with = "crate::strict::bytes")]
+    #[serde(with = "serde_bytes")]
     tag: Vec<u8>,
     recipients: Vec<Recipient>,
 }
@@ -289,6 +291,7 @@ impl MacMessage {
         payload: &[u8],
         external_aad: &[u8],
     ) -> Result<(), Error> {
+        validate_header_buckets(&self.protected, &self.unprotected)?;
         crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
         self.protected
             .ensure_crit_understood(macer.understood_critical_headers())?;

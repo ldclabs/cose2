@@ -36,6 +36,9 @@ This guide is for AI coding agents and code-generation tools that need to use
 - New code that may switch between those features can use the neutral
   `BackendSigner`, `BackendVerifier`, `BackendMacer`, and `BackendEncryptor`
   aliases.
+- Standalone `crypto-ed25519-dalek` and `crypto-aes-gcm` providers are also
+  available. The dalek Ed25519 importer can derive an omitted public `x` from
+  the private seed; ring/aws-lc-rs import requires both `d` and matching `x`.
 - Do not add an always-on crypto dependency to this crate. Optional crypto
   providers belong behind feature flags.
 
@@ -56,7 +59,7 @@ profiles should use the fully specified `Ed25519` or `ESP*` identifiers.
 
 | Algorithm | `iana` algorithm constant | `kty` | `crv` | Signer key params (private) | Verifier key params (public) |
 | --- | --- | --- | --- | --- | --- |
-| Ed25519 / legacy EdDSA | `AlgorithmEd25519` / `AlgorithmEdDSA` | `KeyTypeOKP` | `EllipticCurveEd25519` | `d`, optional matching `x` | `x` |
+| Ed25519 / legacy EdDSA | `AlgorithmEd25519` / `AlgorithmEdDSA` | `KeyTypeOKP` | `EllipticCurveEd25519` | `d`, matching `x` (both required by ring/aws-lc-rs) | `x` |
 | ESP256 / ES256 | `AlgorithmESP256` / `AlgorithmES256` | `KeyTypeEC2` | `EllipticCurveP_256` | `d`, `x`, `y` | `x`, `y` |
 | ESP384 / ES384 | `AlgorithmESP384` / `AlgorithmES384` | `KeyTypeEC2` | `EllipticCurveP_384` | `d`, `x`, `y` | `x`, `y` |
 | RS256 / RS384 / RS512 | `AlgorithmRS256` / `AlgorithmRS384` / `AlgorithmRS512` | `KeyTypeRSA` | — | `n`, `e`, `d`, `p`, `q`, `dP`, `dQ`, `qInv` | `n`, `e` |
@@ -204,7 +207,7 @@ verify/decrypt APIs.
 - Decoding validates malformed `crit` and protected/unprotected label
   collisions. Verification/decryption rejects unknown critical labels; custom
   providers declare processed labels through `understood_critical_headers`.
-- `cose2` does not generate randomness or nonces. Encryption needs a full `IV`
+- Message APIs do not generate encryption nonces. Encryption needs a full `IV`
   or a `Partial IV` combined with the encryptor's Base IV. Never reuse an AEAD
   nonce with the same key.
 - Recipient structures are validated for known algorithm classes, but key wrap,
@@ -224,6 +227,7 @@ Use these before proposing a generated change:
 
 ```sh
 cargo test --workspace --all-targets --all-features
+cargo test --workspace --doc --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
 ```

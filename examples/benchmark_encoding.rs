@@ -1,4 +1,4 @@
-//! Lightweight allocation/throughput probe for authenticated COSE structures.
+//! Lightweight throughput probe for authenticated structures and message decoding.
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -18,6 +18,18 @@ fn main() {
         }
         println!(
             "payload={size} bytes: {:.0} ns/encoding",
+            started.elapsed().as_nanos() as f64 / iterations as f64
+        );
+
+        let mut message = Sign1Message::new(Some(payload));
+        message.set_signature(vec![0; 64]).unwrap();
+        let encoded = message.to_vec().unwrap();
+        let started = Instant::now();
+        for _ in 0..iterations {
+            black_box(Sign1Message::from_slice(black_box(&encoded)).unwrap());
+        }
+        println!(
+            "payload={size} bytes: {:.0} ns/decoding",
             started.elapsed().as_nanos() as f64 / iterations as f64
         );
     }

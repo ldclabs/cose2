@@ -8,13 +8,15 @@ use crate::{
 };
 
 /// The on-the-wire COSE_Signature array: `[protected, unprotected, signature]`.
+// Private wire types are decoded only after `tag::message_body` validates
+// their exact field kinds. Decode byte strings directly into their final buffers.
 #[derive(Clone, Debug, PartialEq, Cbor)]
 #[cbor(array)]
 struct SignatureWire {
-    #[serde(with = "crate::strict::bytes")]
+    #[serde(with = "serde_bytes")]
     protected: Vec<u8>,
     unprotected: Header,
-    #[serde(with = "crate::strict::bytes")]
+    #[serde(with = "serde_bytes")]
     signature: Vec<u8>,
 }
 
@@ -22,10 +24,10 @@ struct SignatureWire {
 #[derive(Clone, Debug, PartialEq, Cbor)]
 #[cbor(tag = 98, array)]
 struct SignWire {
-    #[serde(with = "crate::strict::bytes")]
+    #[serde(with = "serde_bytes")]
     protected: Vec<u8>,
     unprotected: Header,
-    #[serde(with = "crate::strict::optional_bytes")]
+    #[serde(with = "serde_bytes")]
     payload: Option<Vec<u8>>,
     signatures: Vec<SignatureWire>,
 }
@@ -478,9 +480,11 @@ impl SignMessage {
         if self.signatures.is_empty() {
             return Err(Error::Custom("SignMessage has no signatures".into()));
         }
+        validate_header_buckets(&self.protected, &self.unprotected)?;
         crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
 
         for sig in &self.signatures {
+            validate_header_buckets(&sig.protected, &sig.unprotected)?;
             crate::header::validate_protected_state(&sig.protected, &sig.protected_raw)?;
             let kid = sig.kid()?;
             let tbs = Self::to_be_signed(

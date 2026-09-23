@@ -894,7 +894,7 @@ pub fn restore_with_limits<I>(
 where
     I: IntoIterator<Item = Disclosure>,
 {
-    restore_with_protected_claims(value, None, disclosures, hasher, mode, limits)
+    restore_with_protected_claims(value, None, disclosures, hasher, mode, limits, false)
 }
 
 fn restore_with_protected_claims<I>(
@@ -904,6 +904,7 @@ fn restore_with_protected_claims<I>(
     hasher: &dyn RedactionHasher,
     mode: RestoreMode,
     limits: ProcessingLimits,
+    validate_claims: bool,
 ) -> Result<RestoreReport, Error>
 where
     I: IntoIterator<Item = Disclosure>,
@@ -911,14 +912,27 @@ where
     let mut stats = RestoreStats::default();
     let mut budget = TraversalBudget::new(limits);
     let mut pending = DisclosureMap::new(disclosures, hasher, &mut budget)?;
-    let protected_claims = protected_claims
+    pending.validate_claims = validate_claims;
+    let mut protected_claims = protected_claims
         .map(|claims| restore_value(claims, &mut pending, mode, &mut stats, &mut budget, 0))
         .transpose()?;
-    let value = restore_value(value, &mut pending, mode, &mut stats, &mut budget, 0)?;
+    let mut value = restore_value(value, &mut pending, mode, &mut stats, &mut budget, 0)?;
     if !pending.is_empty() {
         return Err(Error::verify(
             "sd_claims contains a disclosure without a matching redacted claim",
         ));
+    }
+    if validate_claims {
+        let Value::Map(entries) = &value else {
+            unreachable!("the structural validator requires a claims map");
+        };
+        // Preserve undisclosed markers until comparison: removing them first
+        // loses the distinction between absent and still-hidden fields.
+        validate_matching_claims(&claim_maps(entries, protected_claims.as_ref()))?;
+        remove_undisclosed_redactions(&mut value);
+        if let Some(claims) = &mut protected_claims {
+            remove_undisclosed_redactions(claims);
+        }
     }
     Ok(RestoreReport {
         value,
@@ -1014,6 +1028,7 @@ where
         hasher,
         mode,
         limits,
+        false,
     )
 }
 
@@ -1154,7 +1169,6 @@ impl SdCwtValidator {
             ));
         };
         let maps = claim_maps(entries, protected_claims.as_ref());
-        validate_matching_claims(&maps)?;
         validate_registered_claim_types(&maps)?;
         validate_required_claims(
             &maps,
@@ -1162,7 +1176,6 @@ impl SdCwtValidator {
             true,
         )?;
         validate_time_relationships(&maps)?;
-        validate_never_redacted(&disclosures)?;
 
         let hasher = default_hasher_for_sd_alg(sd_alg(&message.protected)?)?;
         let report = restore_with_protected_claims(
@@ -1172,12 +1185,12 @@ impl SdCwtValidator {
             &hasher,
             mode,
             self.options.limits,
+            true,
         )?;
         let Value::Map(entries) = &report.value else {
             unreachable!();
         };
         let restored_maps = claim_maps(entries, report.protected_claims.as_ref());
-        validate_matching_claims(&restored_maps)?;
         validate_registered_claim_types(&restored_maps)?;
         validate_time_relationships(&restored_maps)?;
         if mode == RestoreMode::Holder {
@@ -1192,12 +1205,18 @@ impl SdCwtValidator {
 }
 
 fn ensure_message_protected_state(message: &cose2::Sign1Message) -> Result<(), Error> {
+    let current = message.protected.to_vec()?;
+    if current == message.protected_raw()
+        || (message.protected.is_empty() && message.protected_raw().is_empty())
+    {
+        return Ok(());
+    }
     let authenticated = if message.protected_raw().is_empty() {
         Header::new()
     } else {
         Header::from_slice(message.protected_raw())?
     };
-    if authenticated.to_vec()? != message.protected.to_vec()? {
+    if authenticated.to_vec()? != current {
         return Err(Error::invalid_state(
             "SD-CWT protected header differs from authenticated bytes",
         ));
@@ -1229,6 +1248,18 @@ fn validate_sd_headers(
     message: &cose2::Sign1Message,
     limits: ProcessingLimits,
 ) -> Result<(), Error> {
+    // The protected map is CBOR embedded inside a byte string. Validating the
+    // outer message cannot inspect its encoding or apply these limits to it.
+    if !message.protected_raw().is_empty() {
+        cose2::validate_cbor(
+            message.protected_raw(),
+            cose2::CborLimits {
+                max_depth: limits.max_depth,
+                max_items: limits.max_items,
+                require_definite: true,
+            },
+        )?;
+    }
     for label in [HEADER_SD_CLAIMS, HEADER_SD_AEAD_ENCRYPTED_CLAIMS] {
         if message.protected.contains_key(label) {
             return Err(Error::custom(format!(
@@ -1633,7 +1664,7 @@ fn validate_matching_claims(maps: &[&[(Value, Value)]]) -> Result<(), Error> {
                 if previous_map == map_index {
                     return Err(Error::verify(format!("duplicate SD-CWT claim key {key}")));
                 }
-                if cbor2::to_canonical_vec(previous)? != cbor2::to_canonical_vec(value)? {
+                if !claim_values_match(previous, value)? {
                     return Err(Error::verify(format!(
                         "CWT_Claims header and payload disagree for claim {key}"
                     )));
@@ -1642,6 +1673,99 @@ fn validate_matching_claims(maps: &[&[(Value, Value)]]) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Compares the visible parts of restored claims. Unmatched hashes conceal
+/// values (or decoys), so their bytes are not evidence of a value mismatch.
+fn claim_values_match(left: &Value, right: &Value) -> Result<bool, Error> {
+    match (left, right) {
+        (Value::Map(left), Value::Map(right)) => {
+            let left_hidden = left
+                .iter()
+                .any(|(key, _)| is_redacted_claim_keys_label(key));
+            let right_hidden = right
+                .iter()
+                .any(|(key, _)| is_redacted_claim_keys_label(key));
+            let mut right_values = right
+                .iter()
+                .filter(|(key, _)| !is_redacted_claim_keys_label(key))
+                .map(|(key, value)| Ok((label_from_value(key)?, value)))
+                .collect::<Result<HashMap<_, _>, Error>>()?;
+            for (key, value) in left {
+                if is_redacted_claim_keys_label(key) {
+                    continue;
+                }
+                match right_values.remove(&label_from_value(key)?) {
+                    Some(other) if !claim_values_match(value, other)? => return Ok(false),
+                    None if !right_hidden => return Ok(false),
+                    _ => {}
+                }
+            }
+            Ok(left_hidden || right_values.is_empty())
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            let left_known = left.iter().filter(|v| !is_redacted_element(v)).count();
+            let right_known = right.iter().filter(|v| !is_redacted_element(v)).count();
+            if left_known > right.len() || right_known > left.len() {
+                return Ok(false);
+            }
+            if left_known == left.len() && right_known == right.len() {
+                for (left, right) in left.iter().zip(right) {
+                    if !claim_values_match(left, right)? {
+                        return Ok(false);
+                    }
+                }
+            } else {
+                // An undisclosed element may be a decoy, so middle positions
+                // cannot be aligned yet. Known prefixes and suffixes can.
+                for (left, right) in left
+                    .iter()
+                    .take_while(|v| !is_redacted_element(v))
+                    .zip(right.iter().take_while(|v| !is_redacted_element(v)))
+                    .chain(
+                        left.iter()
+                            .rev()
+                            .take_while(|v| !is_redacted_element(v))
+                            .zip(right.iter().rev().take_while(|v| !is_redacted_element(v))),
+                    )
+                {
+                    if !claim_values_match(left, right)? {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        }
+        (Value::Tag(left_tag, left), Value::Tag(right_tag, right)) if left_tag == right_tag => {
+            claim_values_match(left, right)
+        }
+        _ => Ok(cbor2::to_canonical_vec(left)? == cbor2::to_canonical_vec(right)?),
+    }
+}
+
+fn is_redacted_element(value: &Value) -> bool {
+    matches!(value, Value::Tag(REDACTED_ELEMENT_TAG, _))
+}
+
+fn remove_undisclosed_redactions(value: &mut Value) {
+    match value {
+        Value::Map(entries) => entries.retain_mut(|(key, value)| {
+            if is_redacted_claim_keys_label(key) {
+                return false;
+            }
+            remove_undisclosed_redactions(value);
+            true
+        }),
+        Value::Array(items) => items.retain_mut(|value| {
+            if is_redacted_element(value) {
+                return false;
+            }
+            remove_undisclosed_redactions(value);
+            true
+        }),
+        Value::Tag(_, value) => remove_undisclosed_redactions(value),
+        _ => {}
+    }
 }
 
 fn validate_registered_claim_types(maps: &[&[(Value, Value)]]) -> Result<(), Error> {
@@ -1732,20 +1856,12 @@ fn validate_required_claims(
     Ok(())
 }
 
-fn validate_never_redacted(disclosures: &[Disclosure]) -> Result<(), Error> {
+fn validate_root_disclosure_key(key: &Label) -> Result<(), Error> {
     const NEVER_REDACTED: &[i64] = &[1, 3, 4, 5, 6, 7, 8, 39];
-    for disclosure in disclosures {
-        if let DisclosureKind::Claim {
-            key: Label::Int(key),
-            ..
-        } = disclosure.kind()
-        {
-            if NEVER_REDACTED.contains(key) {
-                return Err(Error::custom(format!(
-                    "SD-CWT claim {key} must not be redacted"
-                )));
-            }
-        }
+    if matches!(key, Label::Int(key) if NEVER_REDACTED.contains(key)) {
+        return Err(Error::custom(format!(
+            "SD-CWT claim {key} must not be redacted"
+        )));
     }
     Ok(())
 }
@@ -1833,6 +1949,9 @@ fn validate_time_relationships(maps: &[&[(Value, Value)]]) -> Result<(), Error> 
 
 struct DisclosureMap {
     entries: HashMap<Vec<u8>, Disclosure>,
+    // Only the structural validator applies registered-claim policy and
+    // retains unmatched markers until duplicate claims have been compared.
+    validate_claims: bool,
 }
 
 impl DisclosureMap {
@@ -1881,7 +2000,10 @@ impl DisclosureMap {
             }
             entry.insert(disclosure);
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            validate_claims: false,
+        })
     }
 
     fn remove(&mut self, hash: &[u8]) -> Option<Disclosure> {
@@ -2075,12 +2197,7 @@ fn record_decoy_id(value: &Value, context: &mut IssueContext<'_>) -> Result<(), 
 }
 
 fn ensure_preissuance_key(key: &Value) -> Result<(), Error> {
-    match key {
-        Value::Integer(_) | Value::Text(_) => Ok(()),
-        _ => Err(Error::UnexpectedType(
-            "pre-issuance map keys must be int, text, tag 58, or tag 62".into(),
-        )),
-    }
+    label_from_value(key).map(|_| ())
 }
 
 fn insert_normalized_key(keys: &mut HashSet<Vec<u8>>, key: &Value) -> Result<(), Error> {
@@ -2183,10 +2300,14 @@ fn restore_map(
         output.push((key, value));
     }
 
+    let mut undisclosed_hashes = Vec::new();
     for hash in redacted_hashes {
         match pending.remove(&hash) {
             Some(disclosure) => match disclosure.kind {
                 DisclosureKind::Claim { key, value, .. } => {
+                    if pending.validate_claims && depth == 0 {
+                        validate_root_disclosure_key(&key)?;
+                    }
                     if !output_keys.insert(key.clone()) {
                         return Err(Error::verify(format!("duplicate claim key {key}")));
                     }
@@ -2205,6 +2326,9 @@ fn restore_map(
             },
             None if mode == RestoreMode::Verifier => {
                 stats.removed_redactions += 1;
+                if pending.validate_claims {
+                    undisclosed_hashes.push(Value::Bytes(hash));
+                }
             }
             None => {
                 return Err(Error::verify(
@@ -2212,6 +2336,13 @@ fn restore_map(
                 ));
             }
         }
+    }
+
+    if !undisclosed_hashes.is_empty() {
+        output.push((
+            redacted_claim_keys_label(),
+            Value::Array(undisclosed_hashes),
+        ));
     }
 
     Ok(Value::Map(output))
@@ -2257,6 +2388,9 @@ fn restore_array(
                     },
                     None if mode == RestoreMode::Verifier => {
                         stats.removed_redactions += 1;
+                        if pending.validate_claims {
+                            output.push(redacted_element(hash));
+                        }
                     }
                     None => {
                         return Err(Error::verify(

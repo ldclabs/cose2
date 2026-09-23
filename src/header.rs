@@ -470,8 +470,14 @@ pub(crate) fn validate_protected_state(
     protected: &Header,
     protected_raw: &[u8],
 ) -> Result<(), Error> {
+    let current = encode_protected(protected)?;
+    if current == protected_raw {
+        return Ok(());
+    }
+    // Decoded messages may retain non-preferred encodings. Compare their
+    // meaning without replacing the bytes used by the cryptographic operation.
     let decoded = decode_protected(protected_raw)?;
-    if encode_protected(&decoded)? != encode_protected(protected)? {
+    if encode_protected(&decoded)? != current {
         return Err(Error::InvalidState(
             "protected header changed after its authenticated bytes were prepared".into(),
         ));

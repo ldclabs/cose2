@@ -64,3 +64,23 @@ rustdoc with warnings denied, the Rust 1.89 MSRV, aws-lc-rs-only checks,
 standalone backend checks, package construction, fuzz-target compilation,
 coverage, IANA registry comparison, and a RustSec dependency audit. CI now
 contains matching jobs and an 85% minimum line-coverage gate.
+
+## Follow-up review: 2026-09-23
+
+The follow-up fixes five remaining inconsistencies: registered SD-CWT claim
+redaction policy now applies only at Claims Map roots; duplicate structured
+claims are compared after disclosure restoration and before unmatched hashes
+are removed; protected-header CBOR receives its own definite-length check;
+issuance and restoration share text-key validation; and cryptographic message
+operations recheck mutable protected/unprotected header buckets.
+
+Protected-state checks now compare canonical bytes first, while preserving the
+semantic fallback for nonpreferred wire encodings. Private message wire types
+decode byte strings directly after strict shape validation, and ring/aws-lc
+encryption reserves room for the authentication tag before copying plaintext.
+The encoding probe now also measures full message decoding.
+
+Regression coverage is in `tests/validation_state.rs` and
+`sd-cwt/tests/hardening.rs`. Release publishing now declares its configured
+environment and skips existing package versions when rerun; the publisher is
+tested with simulated registry and Cargo responses, without uploading crates.

@@ -24,7 +24,9 @@ change; CI (`.github/workflows/ci.yml`) runs the same set:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
+cargo test --workspace --doc --all-features
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
+python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 Quick example smoke test:
@@ -44,6 +46,9 @@ cargo run --example sign1_ring --features crypto-ring
   `use aws_lc_rs as backend` alias; a handful of API differences are bridged
   with `#[cfg]` arms. When both features are enabled, `crypto-ring` wins.
 - `crypto` — aggregate alias that currently enables `crypto-ring`.
+- `crypto-ed25519-dalek` — standalone `Ed25519Signer` / `Ed25519Verifier`
+  (module `ed25519`).
+- `crypto-aes-gcm` — standalone `AesGcmEncryptor` (module `aes_gcm`).
 
 ## Repository layout
 
@@ -60,6 +65,10 @@ cargo run --example sign1_ring --features crypto-ring
 | `src/traits.rs`                             | `Signer` / `Verifier` / `Macer` / `Encryptor`.                  |
 | `src/cwt.rs`                                | `Claims` / `ClaimsMap` / `Validator`.                           |
 | `src/crypto.rs`                             | Built-in providers (`crypto-ring` / `crypto-aws-lc-rs`).        |
+| `src/ed25519.rs`, `src/aes_gcm.rs`          | Standalone cryptographic providers.                           |
+| `src/strict.rs`, `src/countersign.rs`       | Strict CBOR checks; legacy full countersignatures.             |
+| `sd-cwt/src/`                              | SD-CWT disclosures, issuance, restoration and validation.     |
+| `scripts/`                                | Registry consistency and repeatable release publishing.      |
 | `src/error.rs`, `src/tag.rs`, `src/util.rs` | `Error`; CBOR-tag helpers; internal helpers.                    |
 | `examples/`, `tests/`, `docs/`              | Runnable examples, integration tests, the consumer agent guide. |
 
@@ -78,8 +87,9 @@ are load-bearing for cryptographic soundness:
    not re-encode it.
 4. **Newly built protected headers and keys serialize canonically** (RFC 8949
    §4.2.1) via `cbor2::to_canonical_vec`.
-5. **The crate generates no randomness or nonces.** Encryption takes a full `IV`,
-   or a `Partial IV` combined with `Encryptor::base_iv`.
+5. **Message APIs generate no keys or encryption nonces.** Encryption takes a full
+   `IV`, or a `Partial IV` combined with `Encryptor::base_iv`. Optional signing
+   backends use their own RNG for ECDSA/RSA signature operations.
 6. **`external_aad: None` means an empty byte string**, not "ignore AAD". It must
    match on create and verify/decrypt.
 7. **Detached payload / detached ciphertext are explicit APIs** (`*_detached*`).

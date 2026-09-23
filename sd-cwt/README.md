@@ -155,7 +155,12 @@ level is rejected.
 
 When the protected `CWT_Claims` header is present, its restored map is returned
 as `RestoreReport::protected_claims`. Any unredacted claim repeated there and
-in the payload must have the same value.
+in the payload must have the same value after restoration. Different redaction
+salts and nested disclosure choices are permitted. In Verifier mode, visible
+fields are compared before unmatched redactions are removed; hidden values
+cannot be compared until disclosed. Restrictions on redacting registered CWT
+claims apply to the two root Claims Maps, not to application map keys nested
+inside claim values.
 
 ## Protocol boundaries
 

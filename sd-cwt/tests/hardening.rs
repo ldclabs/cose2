@@ -458,3 +458,337 @@ fn salts_are_unique_and_disclosure_item_budget_is_aggregate() {
         2
     );
 }
+
+fn validate_message(
+    mut message: Sign1Message,
+    mode: RestoreMode,
+) -> Result<sd_cwt::RestoreReport, Error> {
+    let encoded = message.sign_and_encode(&Toy, None)?;
+    verify_validate_and_restore_sd_cwt(
+        &Toy,
+        &encoded,
+        None,
+        mode,
+        SdCwtValidationOptions::default(),
+    )
+    .map(|(_, report)| report)
+}
+
+#[test]
+fn registered_claim_redaction_rules_apply_only_to_claims_roots() {
+    for in_header in [false, true] {
+        let keys = [1, 3, 4, 5, 6, 7, 8, 39];
+        let nested = Value::Map(
+            keys.iter()
+                .map(|key| {
+                    (
+                        Value::Tag(TO_BE_REDACTED_TAG, Box::new(Value::from(*key))),
+                        Value::from("local field"),
+                    )
+                })
+                .collect(),
+        );
+        let preissued = Value::Map(vec![(Value::from("profile"), nested)]);
+        let mut next_salt = 0u8;
+        let issued = issue_from_preissuance(
+            preissued,
+            &mut || {
+                next_salt += 1;
+                [next_salt; 16]
+            },
+            &Sha256RedactionHasher,
+        )
+        .unwrap();
+        let mut msg = message(valid_claims());
+        if in_header {
+            msg.protected.insert(HEADER_CWT_CLAIMS, issued.value);
+        } else {
+            let Value::Map(mut claims) = valid_claims() else {
+                unreachable!()
+            };
+            let Value::Map(nested) = issued.value else {
+                unreachable!()
+            };
+            claims.extend(nested);
+            msg.payload = Some(cbor2::to_vec(&Value::Map(claims)).unwrap());
+        }
+        set_disclosures(&mut msg.unprotected, issued.disclosures.as_slice());
+        for mode in [RestoreMode::Holder, RestoreMode::Verifier] {
+            assert_eq!(
+                validate_message(msg.clone(), mode).unwrap().disclosed,
+                keys.len()
+            );
+        }
+
+        // exp is optional, but a disclosed root exp must still be rejected.
+        let exp = Disclosure::claim(vec![20; 16], 4, 300).unwrap();
+        let redactions = Value::Map(vec![(
+            redacted_claim_keys_label(),
+            Value::Array(vec![Value::Bytes(
+                exp.redacted_hash(&Sha256RedactionHasher),
+            )]),
+        )]);
+        let mut msg = message(valid_claims());
+        if in_header {
+            msg.protected.insert(HEADER_CWT_CLAIMS, redactions);
+        } else {
+            let Value::Map(mut claims) = valid_claims() else {
+                unreachable!()
+            };
+            claims.retain(|(key, _)| *key != Value::from(4));
+            let Value::Map(redactions) = redactions else {
+                unreachable!()
+            };
+            claims.extend(redactions);
+            msg.payload = Some(cbor2::to_vec(&Value::Map(claims)).unwrap());
+        }
+        set_disclosures(&mut msg.unprotected, &[exp]);
+        for mode in [RestoreMode::Holder, RestoreMode::Verifier] {
+            assert!(validate_message(msg.clone(), mode)
+                .unwrap_err()
+                .to_string()
+                .contains("claim 4 must not be redacted"));
+        }
+    }
+}
+
+fn profile_message(
+    payload_profile: Value,
+    header_profile: Value,
+    disclosures: &[Disclosure],
+) -> Sign1Message {
+    let Value::Map(mut claims) = valid_claims() else {
+        unreachable!()
+    };
+    claims.push((Value::from("profile"), payload_profile));
+    let mut msg = message(Value::Map(claims));
+    msg.protected.insert(
+        HEADER_CWT_CLAIMS,
+        Value::Map(vec![(Value::from("profile"), header_profile)]),
+    );
+    set_disclosures(&mut msg.unprotected, disclosures);
+    msg
+}
+
+fn hidden_claim(disclosure: &Disclosure) -> Value {
+    Value::Map(vec![(
+        redacted_claim_keys_label(),
+        Value::Array(vec![Value::Bytes(
+            disclosure.redacted_hash(&Sha256RedactionHasher),
+        )]),
+    )])
+}
+
+#[test]
+fn matching_claims_are_compared_after_nested_disclosures_are_restored() {
+    let first = Disclosure::claim(vec![31; 16], "name", "Alice").unwrap();
+    let second = Disclosure::claim(vec![32; 16], "name", "Alice").unwrap();
+    let plain = Value::Map(vec![(Value::from("name"), Value::from("Alice"))]);
+    for mode in [RestoreMode::Holder, RestoreMode::Verifier] {
+        for reverse in [false, true] {
+            let (payload, header) = if reverse {
+                (plain.clone(), hidden_claim(&first))
+            } else {
+                (hidden_claim(&first), plain.clone())
+            };
+            validate_message(
+                profile_message(payload, header, std::slice::from_ref(&first)),
+                mode,
+            )
+            .unwrap();
+        }
+        validate_message(
+            profile_message(
+                hidden_claim(&first),
+                hidden_claim(&second),
+                &[first.clone(), second.clone()],
+            ),
+            mode,
+        )
+        .unwrap();
+        let conflict = Value::Map(vec![(Value::from("name"), Value::from("Bob"))]);
+        assert!(validate_message(
+            profile_message(hidden_claim(&first), conflict, std::slice::from_ref(&first)),
+            mode
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("disagree"));
+    }
+}
+
+#[test]
+fn partial_duplicate_claims_keep_unknown_fields_until_comparison() {
+    let name = Disclosure::claim(vec![41; 16], "name", "Alice").unwrap();
+    let age = Disclosure::claim(vec![42; 16], "age", 30).unwrap();
+    let Value::Map(mut left) = hidden_claim(&name) else {
+        unreachable!()
+    };
+    left.push((Value::from("age"), Value::from(30)));
+    let Value::Map(mut right) = hidden_claim(&age) else {
+        unreachable!()
+    };
+    right.push((Value::from("name"), Value::from("Alice")));
+    let report = validate_message(
+        profile_message(Value::Map(left.clone()), Value::Map(right.clone()), &[]),
+        RestoreMode::Verifier,
+    )
+    .unwrap();
+    assert_eq!(report.removed_redactions, 2);
+    let Value::Map(mut expected_payload) = valid_claims() else {
+        unreachable!()
+    };
+    expected_payload.push((
+        Value::from("profile"),
+        Value::Map(vec![(Value::from("age"), Value::from(30))]),
+    ));
+    assert_eq!(report.value, Value::Map(expected_payload));
+    assert_eq!(
+        report.protected_claims,
+        Some(Value::Map(vec![(
+            Value::from("profile"),
+            Value::Map(vec![(Value::from("name"), Value::from("Alice"))]),
+        )]))
+    );
+
+    right.push((Value::from("age"), Value::from(31)));
+    assert!(validate_message(
+        profile_message(Value::Map(left), Value::Map(right), &[]),
+        RestoreMode::Verifier
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("disagree"));
+    // An absent field in a fully disclosed map cannot hide a known extra key.
+    assert!(validate_message(
+        profile_message(hidden_claim(&name), Value::Map(vec![]), &[name]),
+        RestoreMode::Verifier
+    )
+    .is_err());
+}
+
+#[test]
+fn duplicate_array_claims_support_disclosures_and_detect_visible_conflicts() {
+    let item = Disclosure::element(vec![51; 16], "Alice").unwrap();
+    let hidden = Value::Array(vec![
+        redacted_element(item.redacted_hash(&Sha256RedactionHasher)),
+        Value::from("tail"),
+    ]);
+    let plain = Value::Array(vec![Value::from("Alice"), Value::from("tail")]);
+    for disclosures in [vec![], vec![item.clone()]] {
+        let report = validate_message(
+            profile_message(hidden.clone(), plain.clone(), &disclosures),
+            RestoreMode::Verifier,
+        )
+        .unwrap();
+        assert_eq!(
+            report.removed_redactions,
+            usize::from(disclosures.is_empty())
+        );
+    }
+    let conflict = Value::Array(vec![Value::from("Alice"), Value::from("wrong tail")]);
+    assert!(validate_message(
+        profile_message(hidden, conflict, &[]),
+        RestoreMode::Verifier
+    )
+    .is_err());
+    assert!(validate_message(
+        profile_message(plain, Value::Array(vec![]), &[]),
+        RestoreMode::Verifier
+    )
+    .is_err());
+}
+
+#[test]
+fn strict_sd_decoding_checks_the_embedded_protected_encoding_and_limits() {
+    let mut protected = cose2::Header::new();
+    protected.set_alg(iana::AlgorithmEd25519);
+    set_sd_cwt_typ(&mut protected);
+    let mut raw = protected.to_vec().unwrap();
+    raw[0] = 0xbf;
+    raw.push(0xff);
+    let payload = cbor2::to_vec(&valid_claims()).unwrap();
+    let wire = |raw: &[u8]| {
+        let signature = Toy
+            .sign(&Sign1Message::to_be_signed(raw, b"", &payload).unwrap())
+            .unwrap();
+        cbor2::to_vec(&Value::Array(vec![
+            Value::Bytes(raw.to_vec()),
+            Value::Map(vec![]),
+            Value::Bytes(payload.clone()),
+            Value::Bytes(signature),
+        ]))
+        .unwrap()
+    };
+    let encoded = wire(&raw);
+    let decoded = Sign1Message::verify_and_decode(&Toy, &encoded, None).unwrap();
+    assert!(verify_and_decode_sd_cwt(&Toy, &encoded, None, ProcessingLimits::default()).is_err());
+    assert!(SdCwtValidator::default()
+        .validate_and_restore(&decoded, RestoreMode::Holder)
+        .is_err());
+
+    // Definite but nonpreferred encodings remain valid and byte-preserved.
+    let nonpreferred = [0xa2, 0x18, 0x01, 0x32, 0x10, 0x19, 0x01, 0x25];
+    let decoded = verify_and_decode_sd_cwt(
+        &Toy,
+        &wire(&nonpreferred),
+        None,
+        ProcessingLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(decoded.protected_raw(), nonpreferred);
+
+    // The outer array has five items; the embedded header has more.
+    protected.insert(99, Value::Array(vec![Value::from(0); 8]));
+    let limits = ProcessingLimits {
+        max_items: 8,
+        ..Default::default()
+    };
+    assert!(matches!(
+        verify_and_decode_sd_cwt(&Toy, &wire(&protected.to_vec().unwrap()), None, limits),
+        Err(Error::LimitExceeded { .. })
+    ));
+}
+
+#[test]
+fn issuance_and_restoration_share_text_key_limits() {
+    for key in [String::new(), "a".repeat(256), "é".repeat(128)] {
+        for redacted in [false, true] {
+            let key = Value::Text(key.clone());
+            let key = if redacted {
+                Value::Tag(TO_BE_REDACTED_TAG, Box::new(key))
+            } else {
+                key
+            };
+            assert!(issue_from_preissuance(
+                Value::Map(vec![(key, Value::from(1))]),
+                &mut || [61; 16],
+                &Sha256RedactionHasher
+            )
+            .is_err());
+        }
+    }
+    for key in ["a".repeat(255), format!("{}a", "é".repeat(127))] {
+        for redacted in [false, true] {
+            let key = Value::Text(key.clone());
+            let input_key = if redacted {
+                Value::Tag(TO_BE_REDACTED_TAG, Box::new(key.clone()))
+            } else {
+                key.clone()
+            };
+            let issued = issue_from_preissuance(
+                Value::Map(vec![(input_key, Value::from(1))]),
+                &mut || [62; 16],
+                &Sha256RedactionHasher,
+            )
+            .unwrap();
+            let restored = sd_cwt::restore_for_holder(
+                issued.value,
+                issued.disclosures,
+                &Sha256RedactionHasher,
+            )
+            .unwrap();
+            assert_eq!(restored.value, Value::Map(vec![(key, Value::from(1))]));
+        }
+    }
+}

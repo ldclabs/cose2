@@ -39,6 +39,12 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets --all-features
 
+      - name: Doctest
+        run: cargo test --workspace --doc --all-features
+
+      - name: Release script tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
       - name: Doc
         env:
           RUSTDOCFLAGS: "-D warnings"

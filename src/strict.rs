@@ -588,20 +588,6 @@ impl<'de> Deserialize<'de> for StrictOptionalBytes {
     }
 }
 
-pub(crate) mod bytes {
-    use super::*;
-
-    pub(crate) fn serialize<S: Serializer>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(value)
-    }
-
-    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Vec<u8>, D::Error> {
-        StrictBytes::deserialize(deserializer).map(|value| value.0)
-    }
-}
-
 pub(crate) mod optional_bytes {
     use super::*;
 

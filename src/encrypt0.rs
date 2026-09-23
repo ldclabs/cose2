@@ -8,13 +8,15 @@ use crate::{
 };
 
 /// The on-the-wire COSE_Encrypt0 array: `[protected, unprotected, ciphertext]`.
+// Private wire types are decoded only after `tag::message_body` validates
+// their exact field kinds. Decode byte strings directly into their final buffers.
 #[derive(Clone, Debug, PartialEq, Cbor)]
 #[cbor(tag = 16, array)]
 struct Encrypt0Wire {
-    #[serde(with = "crate::strict::bytes")]
+    #[serde(with = "serde_bytes")]
     protected: Vec<u8>,
     unprotected: Header,
-    #[serde(with = "crate::strict::optional_bytes")]
+    #[serde(with = "serde_bytes")]
     ciphertext: Option<Vec<u8>>,
 }
 
@@ -127,6 +129,7 @@ impl Encrypt0Message {
                 "Encrypt0Message must be decoded before decrypting".into(),
             ));
         }
+        validate_header_buckets(&self.protected, &self.unprotected)?;
         crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
         self.protected
             .ensure_crit_understood(understood_critical_headers)?;
