@@ -103,7 +103,7 @@ assert_eq!(verified.payload.as_deref(), Some(&b"This is the content"[..]));
 | Async/remote signing       | `prepare_signature` / `prepare_signatures`, then `set_signature` / `set_signatures`   | Sign the returned `Sig_structure` bytes outside the synchronous trait.                             |
 | Async/remote MAC           | `prepare_tag` / `prepare_detached_tag`, then `set_tag`                                | MAC the returned `MAC_structure` bytes outside the synchronous trait.                              |
 | Async/remote encryption    | `prepare_encryption` then `set_ciphertext`                                            | Encrypt with the returned nonce and `Enc_structure` AAD.                                           |
-| Work with CWT claims       | `cwt::Claims`, `cwt::ClaimsMap`, `cwt::Validator`, then `message.to_cwt_vec()`         | `Claims::to_vec` is the untagged payload map; `Claims::extra` preserves custom keys.                |
+| Work with CWT claims       | `cwt::Claims`, `cwt::ClaimsMap`, `cwt::Validator`, then `message.to_cwt_vec()`        | `Claims::to_vec` is the untagged payload map; `Claims::extra` preserves custom keys.               |
 | Work with SD-CWT claims    | `sd-cwt` companion crate                                                              | Issue tag-58/62 pre-issuance claims, write `sd_claims`, and restore Holder/Verifier presentations. |
 | Work with COSE keys        | `Key`, `KeySet`                                                                       | `KeySet::lookup(kid)` returns all matches because `kid` is not unique.                             |
 

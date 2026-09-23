@@ -86,40 +86,40 @@ algorithm registry; report which checks actually ran.
 
 ## Repository layout
 
-| Path | Contents |
-| --- | --- |
-| `src/lib.rs` | Crate root and public re-exports. |
-| `src/iana.rs` | IANA constants for algorithms, key parameters, claims and tags. |
-| `src/label.rs`, `src/map.rs` | `Label` (`int`/`tstr`) and the shared `CoseMap`. |
-| `src/header.rs`, `src/key.rs` | `Header`; `Key` / `KeySet`. |
-| `src/sign1.rs`, `src/sign.rs` | `Sign1Message`; `SignMessage` / `Signature`. |
-| `src/mac0.rs`, `src/mac.rs` | `Mac0Message`; `MacMessage`. |
-| `src/encrypt0.rs`, `src/encrypt.rs` | `Encrypt0Message`; `EncryptMessage`. |
-| `src/recipient.rs`, `src/context.rs` | `Recipient`; `KdfContext` / `PartyInfo` / `SuppPubInfo`. |
-| `src/traits.rs` | `Signer` / `Verifier` / `Macer` / `Encryptor`. |
-| `src/cwt.rs` | `Claims`, `Audience`, `NumericDate`, `ClaimsMap` and `Validator`. |
-| `src/crypto.rs` | Shared ring/aws-lc-rs providers, also exposed through `Backend*` aliases. |
-| `src/ed25519.rs`, `src/aes_gcm.rs` | Standalone cryptographic providers. |
-| `src/strict.rs`, `src/countersign.rs` | Strict CBOR checks; legacy full countersignatures. |
-| `src/error.rs`, `src/tag.rs`, `src/util.rs` | Errors, CBOR-tag handling and message helpers. |
-| `tests/hardening.rs`, `tests/validation_state.rs` | Protocol, mutable-state and decoder regressions. |
-| `tests/rfc_examples.rs`, `tests/crypto_*.rs` | RFC vectors and backend coverage. |
-| `fuzz/fuzz_targets/` | COSE decode and SD-CWT fuzz targets; separate Cargo workspace. |
-| `scripts/check_iana_algorithms.py` | Compare algorithm constants with an IANA XML snapshot. |
-| `scripts/publish_crates.py`, `scripts/test_publish_crates.py` | Repeatable publishing and mocked release tests. |
-| `examples/`, `docs/` | Runnable examples, consumer guide and migration notes. |
+| Path                                                          | Contents                                                                  |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| `src/lib.rs`                                                  | Crate root and public re-exports.                                         |
+| `src/iana.rs`                                                 | IANA constants for algorithms, key parameters, claims and tags.           |
+| `src/label.rs`, `src/map.rs`                                  | `Label` (`int`/`tstr`) and the shared `CoseMap`.                          |
+| `src/header.rs`, `src/key.rs`                                 | `Header`; `Key` / `KeySet`.                                               |
+| `src/sign1.rs`, `src/sign.rs`                                 | `Sign1Message`; `SignMessage` / `Signature`.                              |
+| `src/mac0.rs`, `src/mac.rs`                                   | `Mac0Message`; `MacMessage`.                                              |
+| `src/encrypt0.rs`, `src/encrypt.rs`                           | `Encrypt0Message`; `EncryptMessage`.                                      |
+| `src/recipient.rs`, `src/context.rs`                          | `Recipient`; `KdfContext` / `PartyInfo` / `SuppPubInfo`.                  |
+| `src/traits.rs`                                               | `Signer` / `Verifier` / `Macer` / `Encryptor`.                            |
+| `src/cwt.rs`                                                  | `Claims`, `Audience`, `NumericDate`, `ClaimsMap` and `Validator`.         |
+| `src/crypto.rs`                                               | Shared ring/aws-lc-rs providers, also exposed through `Backend*` aliases. |
+| `src/ed25519.rs`, `src/aes_gcm.rs`                            | Standalone cryptographic providers.                                       |
+| `src/strict.rs`, `src/countersign.rs`                         | Strict CBOR checks; legacy full countersignatures.                        |
+| `src/error.rs`, `src/tag.rs`, `src/util.rs`                   | Errors, CBOR-tag handling and message helpers.                            |
+| `tests/hardening.rs`, `tests/validation_state.rs`             | Protocol, mutable-state and decoder regressions.                          |
+| `tests/rfc_examples.rs`, `tests/crypto_*.rs`                  | RFC vectors and backend coverage.                                         |
+| `fuzz/fuzz_targets/`                                          | COSE decode and SD-CWT fuzz targets; separate Cargo workspace.            |
+| `scripts/check_iana_algorithms.py`                            | Compare algorithm constants with an IANA XML snapshot.                    |
+| `scripts/publish_crates.py`, `scripts/test_publish_crates.py` | Repeatable publishing and mocked release tests.                           |
+| `examples/`, `docs/`                                          | Runnable examples, consumer guide and migration notes.                    |
 
 `sd-cwt` keeps its public API at the crate root; its processing modules are
 private. Preserve the root re-exports when moving code:
 
-| Path | Contents |
-| --- | --- |
-| `sd-cwt/src/lib.rs` | Public exports, constants, header helpers, encrypted-disclosure metadata and shared limits. |
-| `sd-cwt/src/disclosure.rs` | Disclosure encoding/decoding, hashing and plaintext disclosure headers. |
-| `sd-cwt/src/issuance.rs` | Salt provider and pre-issuance redaction/decoy conversion. |
-| `sd-cwt/src/restore.rs` | Disclosure matching, bounded restoration and pruning. |
-| `sd-cwt/src/validation.rs` | Envelope/claim validation and combined signature-verification API. |
-| `sd-cwt/src/tests.rs`, `sd-cwt/tests/hardening.rs` | Unit tests and protocol regressions. |
+| Path                                               | Contents                                                                                    |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `sd-cwt/src/lib.rs`                                | Public exports, constants, header helpers, encrypted-disclosure metadata and shared limits. |
+| `sd-cwt/src/disclosure.rs`                         | Disclosure encoding/decoding, hashing and plaintext disclosure headers.                     |
+| `sd-cwt/src/issuance.rs`                           | Salt provider and pre-issuance redaction/decoy conversion.                                  |
+| `sd-cwt/src/restore.rs`                            | Disclosure matching, bounded restoration and pruning.                                       |
+| `sd-cwt/src/validation.rs`                         | Envelope/claim validation and combined signature-verification API.                          |
+| `sd-cwt/src/tests.rs`, `sd-cwt/tests/hardening.rs` | Unit tests and protocol regressions.                                                        |
 
 ## Invariants to preserve
 
