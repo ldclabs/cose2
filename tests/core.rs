@@ -386,6 +386,7 @@ fn keyset_lookup_and_round_trip() {
 }
 
 #[test]
+#[allow(deprecated)] // Exercises the compatibility alias.
 fn keyset_decode_is_rfc_compliant_by_default_and_has_strict_option() {
     let mut k1 = Key::new();
     k1.set_kty(iana::KeyTypeOKP).set_kid(b"same".to_vec());

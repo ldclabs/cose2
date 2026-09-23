@@ -21,6 +21,7 @@ This guide is for AI coding agents and code-generation tools that need to use
 | Async or remote MAC | `prepare_tag` / `prepare_detached_tag`, then `set_tag` | MAC the returned `MAC_structure` bytes with HSM/KMS/async code. |
 | Async or remote encryption | `prepare_encryption`, then `set_ciphertext` | Encrypt with the returned nonce and `Enc_structure` AAD. |
 | Encode or validate CWT claims | `cwt::Claims`, `cwt::ClaimsMap`, `cwt::Validator` | `Claims::to_vec` emits the untagged payload map; call `message.to_cwt_vec()` after protecting it. |
+| Decode untrusted Sign1 input with custom limits | `Sign1Message::from_slice_with_limits` with `CborLimits` | Set `require_definite` for profiles such as SD-CWT that forbid indefinite-length items. |
 | Store COSE keys | `Key` and `KeySet` | Default decode ignores malformed members per RFC 9052; use `from_slice_strict` for all-or-nothing input. |
 | Verify a legacy countersignature | `Header::counter_signatures`, then `CounterSignature::verify` | Pass the target structure's exact protected bytes and its third body field. Prefer RFC 9338 countersignature V2 in new protocols. |
 

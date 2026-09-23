@@ -11,7 +11,8 @@ use crate::{
     TO_BE_DECOY_TAG, TO_BE_REDACTED_TAG,
 };
 use cbor2::Value;
-use cose2::{Error, Header, Label};
+use cose2::{cwt::NumericDate, Error, Label};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 /// Verifies a definite-length SD-CWT COSE_Sign1, validates its protected
@@ -25,15 +26,7 @@ pub fn verify_and_decode_sd_cwt(
     if data.len() > limits.max_input_bytes {
         return Err(Error::limit("SD-CWT input bytes", limits.max_input_bytes));
     }
-    cose2::validate_cbor(
-        data,
-        cose2::CborLimits {
-            max_depth: limits.max_depth,
-            max_items: limits.max_items,
-            require_definite: true,
-        },
-    )?;
-    let message = cose2::Sign1Message::from_slice(data)?;
+    let message = cose2::Sign1Message::from_slice_with_limits(data, definite_cbor_limits(limits))?;
     validate_sd_headers(&message, limits)?;
     let verifier = SdCriticalVerifier::new(verifier);
     message.verify(&verifier, external_aad)?;
@@ -110,8 +103,18 @@ impl SdCwtValidator {
         message: &cose2::Sign1Message,
         mode: RestoreMode,
     ) -> Result<RestoreReport, Error> {
-        ensure_message_protected_state(message)?;
+        message.validate_headers()?;
         validate_sd_headers(message, self.options.limits)?;
+        self.restore_validated_headers(message, mode)
+    }
+
+    /// Validates claims and disclosures of a message whose SD-CWT headers
+    /// were already validated.
+    fn restore_validated_headers(
+        &self,
+        message: &cose2::Sign1Message,
+        mode: RestoreMode,
+    ) -> Result<RestoreReport, Error> {
         let protected_claims = protected_cwt_claims(message)?;
         let disclosures =
             disclosures_from_unprotected_with_limits(&message.unprotected, self.options.limits)?;
@@ -136,14 +139,7 @@ impl SdCwtValidator {
                 self.options.limits.max_input_bytes,
             ));
         }
-        cose2::validate_cbor(
-            payload,
-            cose2::CborLimits {
-                max_depth: self.options.limits.max_depth,
-                max_items: self.options.limits.max_items,
-                require_definite: true,
-            },
-        )?;
+        cose2::validate_cbor(payload, definite_cbor_limits(self.options.limits))?;
         let value: Value = cbor2::from_slice(payload)?;
         let Value::Map(entries) = &value else {
             return Err(Error::UnexpectedType(
@@ -186,24 +182,13 @@ impl SdCwtValidator {
     }
 }
 
-pub(super) fn ensure_message_protected_state(message: &cose2::Sign1Message) -> Result<(), Error> {
-    let current = message.protected.to_vec()?;
-    if current == message.protected_raw()
-        || (message.protected.is_empty() && message.protected_raw().is_empty())
-    {
-        return Ok(());
+/// Strict CBOR limits for SD-CWT inputs, which must use definite lengths.
+pub(super) fn definite_cbor_limits(limits: ProcessingLimits) -> cose2::CborLimits {
+    cose2::CborLimits {
+        max_depth: limits.max_depth,
+        max_items: limits.max_items,
+        require_definite: true,
     }
-    let authenticated = if message.protected_raw().is_empty() {
-        Header::new()
-    } else {
-        Header::from_slice(message.protected_raw())?
-    };
-    if authenticated.to_vec()? != current {
-        return Err(Error::invalid_state(
-            "SD-CWT protected header differs from authenticated bytes",
-        ));
-    }
-    Ok(())
 }
 
 impl Default for SdCwtValidator {
@@ -222,7 +207,8 @@ pub fn verify_validate_and_restore_sd_cwt(
     options: SdCwtValidationOptions,
 ) -> Result<(cose2::Sign1Message, RestoreReport), Error> {
     let message = verify_and_decode_sd_cwt(verifier, data, external_aad, options.limits)?;
-    let report = SdCwtValidator::new(options).validate_and_restore(&message, mode)?;
+    // `verify_and_decode_sd_cwt` validated the SD-CWT headers of this message.
+    let report = SdCwtValidator::new(options).restore_validated_headers(&message, mode)?;
     Ok((message, report))
 }
 
@@ -233,14 +219,7 @@ fn validate_sd_headers(
     // The protected map is CBOR embedded inside a byte string. Validating the
     // outer message cannot inspect its encoding or apply these limits to it.
     if !message.protected_raw().is_empty() {
-        cose2::validate_cbor(
-            message.protected_raw(),
-            cose2::CborLimits {
-                max_depth: limits.max_depth,
-                max_items: limits.max_items,
-                require_definite: true,
-            },
-        )?;
+        cose2::validate_cbor(message.protected_raw(), definite_cbor_limits(limits))?;
     }
     for label in [HEADER_SD_CLAIMS, HEADER_SD_AEAD_ENCRYPTED_CLAIMS] {
         if message.protected.contains_key(label) {
@@ -768,7 +747,7 @@ fn validate_registered_claim_types(maps: &[&[(Value, Value)]]) -> Result<(), Err
         (cose2::iana::CWTClaimIat, "iat"),
     ] {
         if let Some(value) = claim_value(maps, label) {
-            DateValue::from_value(value, name)?;
+            date_value(value, name)?;
         }
     }
     if claim_value(maps, cose2::iana::CWTClaimCti)
@@ -848,81 +827,42 @@ pub(super) fn validate_root_disclosure_key(key: &Label) -> Result<(), Error> {
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum DateValue {
-    Integer(i128),
-    Float(f64),
-}
-
-impl DateValue {
-    fn from_value(value: &Value, name: &str) -> Result<Self, Error> {
-        match value {
-            Value::Integer(value) => Ok(Self::Integer(i128::from(*value))),
-            Value::Float(value) if value.is_finite() && value.abs() <= 9_007_199_254_740_992.0 => {
-                Ok(Self::Float(*value))
-            }
-            Value::Float(_) => Err(Error::UnexpectedType(format!(
-                "{name} must be a finite float in the inclusive range [-2^53, 2^53]"
-            ))),
-            _ => Err(Error::UnexpectedType(format!("{name} must be numeric"))),
+/// Reads an SD-CWT date, whose floating-point form is limited to [-2^53, 2^53].
+fn date_value(value: &Value, name: &str) -> Result<NumericDate, Error> {
+    match value {
+        Value::Integer(value) => Ok(NumericDate::Integer(i128::from(*value))),
+        Value::Float(value) if value.is_finite() && value.abs() <= 9_007_199_254_740_992.0 => {
+            Ok(NumericDate::Float(*value))
         }
-    }
-
-    fn compare(self, other: Self) -> Option<std::cmp::Ordering> {
-        match (self, other) {
-            (Self::Integer(left), Self::Integer(right)) => left.partial_cmp(&right),
-            (Self::Integer(left), Self::Float(right)) => {
-                compare_f64_to_i128(right, left).map(std::cmp::Ordering::reverse)
-            }
-            (Self::Float(left), Self::Integer(right)) => compare_f64_to_i128(left, right),
-            (Self::Float(left), Self::Float(right)) => left.partial_cmp(&right),
-        }
-    }
-}
-
-fn compare_f64_to_i128(value: f64, other: i128) -> Option<std::cmp::Ordering> {
-    use std::cmp::Ordering;
-
-    if !value.is_finite() {
-        return None;
-    }
-    if value >= i128::MAX as f64 {
-        return Some(Ordering::Greater);
-    }
-    if value < i128::MIN as f64 {
-        return Some(Ordering::Less);
-    }
-    let truncated = value as i128;
-    match truncated.cmp(&other) {
-        Ordering::Equal if value == truncated as f64 => Some(Ordering::Equal),
-        Ordering::Equal if value.is_sign_negative() => Some(Ordering::Less),
-        Ordering::Equal => Some(Ordering::Greater),
-        ordering => Some(ordering),
+        Value::Float(_) => Err(Error::UnexpectedType(format!(
+            "{name} must be a finite float in the inclusive range [-2^53, 2^53]"
+        ))),
+        _ => Err(Error::UnexpectedType(format!("{name} must be numeric"))),
     }
 }
 
 fn validate_time_relationships(maps: &[&[(Value, Value)]]) -> Result<(), Error> {
     let exp = claim_value(maps, 4)
-        .map(|value| DateValue::from_value(value, "exp"))
+        .map(|value| date_value(value, "exp"))
         .transpose()?;
     let nbf = claim_value(maps, 5)
-        .map(|value| DateValue::from_value(value, "nbf"))
+        .map(|value| date_value(value, "nbf"))
         .transpose()?;
     let iat = claim_value(maps, 6)
-        .map(|value| DateValue::from_value(value, "iat"))
+        .map(|value| date_value(value, "iat"))
         .transpose()?;
     if let (Some(nbf), Some(iat)) = (nbf, iat) {
-        if nbf.compare(iat) == Some(std::cmp::Ordering::Greater) {
+        if nbf.compare(iat) == Some(Ordering::Greater) {
             return Err(Error::custom("SD-CWT requires nbf <= iat"));
         }
     }
     if let (Some(nbf), Some(exp)) = (nbf, exp) {
-        if nbf.compare(exp) != Some(std::cmp::Ordering::Less) {
+        if nbf.compare(exp) != Some(Ordering::Less) {
             return Err(Error::custom("SD-CWT requires nbf < exp"));
         }
     }
     if let (Some(iat), Some(exp)) = (iat, exp) {
-        if iat.compare(exp) != Some(std::cmp::Ordering::Less) {
+        if iat.compare(exp) != Some(Ordering::Less) {
             return Err(Error::custom("SD-CWT requires iat < exp"));
         }
     }

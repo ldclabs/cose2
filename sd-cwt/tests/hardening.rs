@@ -2,8 +2,9 @@ use cbor2::Value;
 use cose2::{iana, Error, Label, Sign1Message, Signer, Verifier};
 use sd_cwt::{
     aead_encrypted_disclosures_from_unprotected, disclosures_from_unprotected,
-    disclosures_from_unprotected_with_limits, issue_from_preissuance, redacted_claim_keys_label,
-    redacted_element, restore_for_verifier, set_aead_encrypted_disclosures, set_disclosures,
+    disclosures_from_unprotected_with_limits, issue_from_preissuance,
+    issue_from_preissuance_with_limits, redacted_claim_keys_label, redacted_element,
+    restore_for_verifier, restore_with_limits, set_aead_encrypted_disclosures, set_disclosures,
     set_sd_aead, set_sd_alg, set_sd_cwt_typ, verify_and_decode_sd_cwt,
     verify_validate_and_restore_sd_cwt, AeadEncryptedDisclosure, Disclosure, ProcessingLimits,
     RedactionHasher, RestoreMode, SdCwtValidationOptions, SdCwtValidator, Sha256RedactionHasher,
@@ -791,4 +792,83 @@ fn issuance_and_restoration_share_text_key_limits() {
             assert_eq!(restored.value, Value::Map(vec![(key, Value::from(1))]));
         }
     }
+}
+
+fn counting_salts() -> impl FnMut() -> [u8; 16] {
+    let mut next = 0u8;
+    move || {
+        next = next.wrapping_add(1);
+        [next; 16]
+    }
+}
+
+#[test]
+fn issuance_rejects_redacting_never_redacted_root_claims() {
+    for key in [1i64, 3, 4, 5, 6, 7, 8, 39] {
+        let preissued = Value::Map(vec![(
+            Value::Tag(TO_BE_REDACTED_TAG, Box::new(Value::from(key))),
+            Value::from(1),
+        )]);
+        let error =
+            issue_from_preissuance(preissued, &mut counting_salts(), &Sha256RedactionHasher)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("must not be redacted"),
+            "{error}"
+        );
+    }
+
+    // The same numeric keys are ordinary inside nested application maps.
+    let preissued = Value::Map(vec![(
+        Value::from("address"),
+        Value::Map(vec![(
+            Value::Tag(TO_BE_REDACTED_TAG, Box::new(Value::from(1))),
+            Value::from("street"),
+        )]),
+    )]);
+    let issued =
+        issue_from_preissuance(preissued, &mut counting_salts(), &Sha256RedactionHasher).unwrap();
+    assert_eq!(issued.disclosures.len(), 1);
+}
+
+#[test]
+fn issuance_applies_caller_limits_to_the_disclosures_it_creates() {
+    let mut deep = Value::from(0);
+    for _ in 0..70 {
+        deep = Value::Array(vec![deep]);
+    }
+    let preissued = Value::Map(vec![(
+        Value::Tag(TO_BE_REDACTED_TAG, Box::new(Value::from(2))),
+        deep,
+    )]);
+    assert!(matches!(
+        issue_from_preissuance(
+            preissued.clone(),
+            &mut counting_salts(),
+            &Sha256RedactionHasher
+        ),
+        Err(Error::LimitExceeded { .. })
+    ));
+
+    let limits = ProcessingLimits {
+        max_depth: 200,
+        ..ProcessingLimits::default()
+    };
+    let issued = issue_from_preissuance_with_limits(
+        preissued,
+        &mut counting_salts(),
+        &Sha256RedactionHasher,
+        limits,
+    )
+    .unwrap();
+    assert_eq!(issued.disclosures.len(), 1);
+    let restored = restore_with_limits(
+        issued.value,
+        issued.disclosures,
+        &Sha256RedactionHasher,
+        RestoreMode::Holder,
+        limits,
+    )
+    .unwrap();
+    assert_eq!(restored.disclosed, 1);
 }

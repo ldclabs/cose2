@@ -3,20 +3,22 @@
 use cbor2::Cbor;
 
 use crate::{
-    header::{decode_protected, encode_protected, validate_header_buckets},
+    header::{decode_protected, validate_header_buckets, validate_layer},
     iana,
-    recipient::validate_recipient_list,
+    recipient::{validate_decoded_recipients, validate_message_recipients},
     tag, util, EncryptionContext, Encryptor, Error, Header, Label, Recipient,
 };
 
 /// The on-the-wire COSE_Encrypt array: `[protected, unprotected, ciphertext, recipients]`.
 // Private wire types are decoded only after `tag::message_body` validates
-// their exact field kinds. Decode byte strings directly into their final buffers.
+// their exact field kinds and rejects duplicate map keys. Decode byte strings
+// directly into their final buffers and header maps without a second pass.
 #[derive(Clone, Debug, PartialEq, Cbor)]
 #[cbor(tag = 96, array)]
 struct EncryptWire {
     #[serde(with = "serde_bytes")]
     protected: Vec<u8>,
+    #[serde(deserialize_with = "crate::header::deserialize_checked")]
     unprotected: Header,
     #[serde(with = "serde_bytes")]
     ciphertext: Option<Vec<u8>>,
@@ -83,13 +85,9 @@ impl EncryptMessage {
         base_iv: Option<&[u8]>,
         external_aad: Option<&[u8]>,
     ) -> Result<EncryptionContext, Error> {
-        if self.recipients.is_empty() {
-            return Err(Error::Custom("EncryptMessage has no recipients".into()));
-        }
-        validate_recipient_list(&self.recipients)?;
-        util::ensure_protected_alg(&mut self.protected, &mut self.unprotected, alg)?;
-        util::ensure_unprotected_kid(&self.protected, &mut self.unprotected, kid)?;
-        validate_header_buckets(&self.protected, &self.unprotected)?;
+        validate_message_recipients(&self.recipients, "EncryptMessage")?;
+        let protected_raw =
+            util::prepare_headers(&mut self.protected, &mut self.unprotected, alg, kid)?;
         util::require_plaintext(&self.payload, "EncryptMessage::prepare_encryption")?;
 
         let nonce = util::nonce_from_header_values(
@@ -98,7 +96,6 @@ impl EncryptMessage {
             nonce_size,
             base_iv,
         )?;
-        let protected_raw = encode_protected(&self.protected)?;
         let aad = Self::to_be_encrypted(&protected_raw, external_aad.unwrap_or(&[]))?;
         self.protected_raw = protected_raw;
         self.state = util::OperationState::Prepared;
@@ -132,13 +129,9 @@ impl EncryptMessage {
         external_aad: Option<&[u8]>,
         understood_critical_headers: &[Label],
     ) -> Result<EncryptionContext, Error> {
-        if !self.state.complete() {
-            return Err(Error::InvalidState(
-                "EncryptMessage must be decoded before decrypting".into(),
-            ));
-        }
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        self.state
+            .require_complete("EncryptMessage must be decoded before decrypting")?;
+        validate_layer(&self.protected, &self.unprotected, &self.protected_raw)?;
         self.protected
             .ensure_crit_understood(understood_critical_headers)?;
         util::check_protected_alg(&self.protected, &self.unprotected, alg)?;
@@ -162,15 +155,13 @@ impl EncryptMessage {
         ciphertext: impl Into<Vec<u8>>,
         detached: bool,
     ) -> Result<(), Error> {
-        if self.recipients.is_empty() {
-            return Err(Error::Custom("EncryptMessage has no recipients".into()));
-        }
-        validate_recipient_list(&self.recipients)?;
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        if !self.state.initialized() {
-            self.protected_raw = encode_protected(&self.protected)?;
-        }
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        validate_message_recipients(&self.recipients, "EncryptMessage")?;
+        util::sync_protected_raw(
+            &self.protected,
+            &self.unprotected,
+            &mut self.protected_raw,
+            self.state,
+        )?;
         self.ciphertext = ciphertext.into();
         self.ciphertext_detached = detached;
         self.state = util::OperationState::Complete;
@@ -191,8 +182,10 @@ impl EncryptMessage {
             external_aad,
         )?;
         let plaintext = util::require_plaintext(&self.payload, "EncryptMessage::encrypt")?;
-        let ciphertext = encryptor.encrypt(&context.nonce, plaintext, &context.aad)?;
-        self.set_ciphertext(ciphertext, false)
+        // The recipients and headers were validated by `prepare_encryption`.
+        self.ciphertext = encryptor.encrypt(&context.nonce, plaintext, &context.aad)?;
+        self.state = util::OperationState::Complete;
+        Ok(())
     }
 
     /// Encrypts the payload and marks the ciphertext as detached.
@@ -251,23 +244,16 @@ impl EncryptMessage {
 
     /// Serializes the wire array borrowing this message's buffers.
     fn encode(&self, prefix: &[u8]) -> Result<Vec<u8>, Error> {
-        if !self.state.complete() {
-            return Err(Error::InvalidState(
-                "EncryptMessage must be encrypted before encoding".into(),
-            ));
-        }
-        if self.recipients.is_empty() {
-            return Err(Error::Custom("EncryptMessage has no recipients".into()));
-        }
-        validate_recipient_list(&self.recipients)?;
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        self.state
+            .require_complete("EncryptMessage must be encrypted before encoding")?;
+        validate_message_recipients(&self.recipients, "EncryptMessage")?;
+        validate_layer(&self.protected, &self.unprotected, &self.protected_raw)?;
         let ciphertext = if self.ciphertext_detached {
             None
         } else {
             Some(serde_bytes::Bytes::new(&self.ciphertext))
         };
-        let unprotected = util::canonical_raw(&self.unprotected)?;
+        let unprotected = util::header_raw(&self.unprotected)?;
         let recipients = util::canonical_raw(&self.recipients)?;
         util::encode_prefixed(
             prefix,
@@ -284,10 +270,7 @@ impl EncryptMessage {
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
         let body = tag::message_body(data, Self::TAG)?;
         let wire: EncryptWire = cbor2::from_slice(body)?;
-        if wire.recipients.is_empty() {
-            return Err(Error::Custom("EncryptMessage has no recipients".into()));
-        }
-        validate_recipient_list(&wire.recipients)?;
+        validate_decoded_recipients(&wire.recipients, "EncryptMessage")?;
         let protected = decode_protected(&wire.protected)?;
         validate_header_buckets(&protected, &wire.unprotected)?;
         let (ciphertext, ciphertext_detached) = match wire.ciphertext {
@@ -313,11 +296,8 @@ impl EncryptMessage {
         encryptor: &dyn Encryptor,
         external_aad: Option<&[u8]>,
     ) -> Result<&[u8], Error> {
-        if !self.state.complete() {
-            return Err(Error::InvalidState(
-                "EncryptMessage must be decoded before decrypting".into(),
-            ));
-        }
+        self.state
+            .require_complete("EncryptMessage must be decoded before decrypting")?;
         if self.ciphertext_detached {
             return Err(Error::Custom(
                 "EncryptMessage has detached ciphertext; use decrypt_detached".into(),
@@ -342,11 +322,8 @@ impl EncryptMessage {
         detached_ciphertext: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<&[u8], Error> {
-        if !self.state.complete() {
-            return Err(Error::InvalidState(
-                "EncryptMessage must be decoded before decrypting".into(),
-            ));
-        }
+        self.state
+            .require_complete("EncryptMessage must be decoded before decrypting")?;
         if !self.ciphertext_detached {
             return Err(Error::Custom(
                 "EncryptMessage carries embedded ciphertext; use decrypt".into(),

@@ -169,7 +169,6 @@ impl Recipient {
     }
 
     fn validate_at_depth(&self, depth: usize) -> Result<(), Error> {
-        const MAX_RECIPIENT_DEPTH: usize = 128;
         if depth > MAX_RECIPIENT_DEPTH {
             return Err(Error::limit("COSE recipient nesting", MAX_RECIPIENT_DEPTH));
         }
@@ -405,16 +404,37 @@ fn ecdh_curve(key: &crate::Key, label: i64) -> Result<i64, Error> {
     }
 }
 
-pub(crate) fn validate_recipient_list(recipients: &[Recipient]) -> Result<(), Error> {
-    validate_recipient_list_at_depth(recipients, 0)
+const MAX_RECIPIENT_DEPTH: usize = 128;
+
+/// Fully validates a message's recipient list, which must not be empty.
+pub(crate) fn validate_message_recipients(
+    recipients: &[Recipient],
+    message: &str,
+) -> Result<(), Error> {
+    require_recipients(recipients, message)?;
+    for recipient in recipients {
+        recipient.validate_at_depth(0)?;
+    }
+    validate_recipient_layer_rules(recipients)
 }
 
-fn validate_recipient_list_at_depth(recipients: &[Recipient], depth: usize) -> Result<(), Error> {
-    for recipient in recipients {
-        recipient.validate_at_depth(depth)?;
-    }
-
+/// Validates a decoded message's recipient list. `Recipient`'s deserializer
+/// already validated every recipient and nested layer, and the strict message
+/// pass bounded their nesting, so only the top layer's rules remain.
+pub(crate) fn validate_decoded_recipients(
+    recipients: &[Recipient],
+    message: &str,
+) -> Result<(), Error> {
+    require_recipients(recipients, message)?;
     validate_recipient_layer_rules(recipients)
+}
+
+fn require_recipients(recipients: &[Recipient], message: &str) -> Result<(), Error> {
+    if recipients.is_empty() {
+        Err(Error::Custom(format!("{message} has no recipients")))
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_recipient_layer_rules(recipients: &[Recipient]) -> Result<(), Error> {

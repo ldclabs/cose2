@@ -99,7 +99,7 @@ impl RingMacer {
     /// Note the exported [`Key`] holds an unprotected copy of the secret; it
     /// is the caller's responsibility to handle it carefully.
     pub fn to_cose_key(&self) -> Result<Key, Error> {
-        Ok(symmetric_cose_key(
+        Ok(Key::symmetric(
             self.alg,
             self.raw_key.as_slice(),
             self.kid.as_deref(),
@@ -221,7 +221,7 @@ impl RingEncryptor {
     /// Note the exported [`Key`] holds an unprotected copy of the secret; it
     /// is the caller's responsibility to handle it carefully.
     pub fn to_cose_key(&self) -> Result<Key, Error> {
-        Ok(symmetric_cose_key(
+        Ok(Key::symmetric(
             self.alg,
             self.raw_key.as_slice(),
             self.kid.as_deref(),
@@ -466,8 +466,8 @@ impl RingSigner {
     /// the backends expose no public modulus for them; use the raw modulus and
     /// exponent with [`RingVerifier::rsa_components`] instead.
     pub fn to_cose_key(&self) -> Result<Key, Error> {
-        let mut key = match &self.key {
-            RingSigningKey::Ed25519(key) => Ok(okp_public_cose_key(
+        match &self.key {
+            RingSigningKey::Ed25519(key) => Ok(Key::ed25519_public(
                 self.alg,
                 key.public_key().as_ref(),
                 self.kid.as_deref(),
@@ -478,9 +478,7 @@ impl RingSigner {
             RingSigningKey::Rsa { .. } => Err(Error::custom(
                 "cannot export a COSE_Key from an RSA RingSigner: the backend exposes no public key",
             )),
-        }?;
-        key.set_ops([iana::KeyOperationVerify]);
-        Ok(key)
+        }
     }
 
     /// The configured COSE algorithm.
@@ -759,8 +757,8 @@ impl RingVerifier {
     /// verifiers built from a DER public key have their PKCS#1 `RSAPublicKey`
     /// parsed back into the COSE `n` and `e` parameters.
     pub fn to_cose_key(&self) -> Result<Key, Error> {
-        let mut key = match &self.key {
-            RingVerificationKey::Ed25519(public_key) => Ok(okp_public_cose_key(
+        match &self.key {
+            RingVerificationKey::Ed25519(public_key) => Ok(Key::ed25519_public(
                 self.alg,
                 public_key,
                 self.kid.as_deref(),
@@ -775,9 +773,7 @@ impl RingVerifier {
                 let (n, e) = rsa_public_key_from_der(der)?;
                 Ok(rsa_public_cose_key(self.alg, &n, &e, self.kid.as_deref()))
             }
-        }?;
-        key.set_ops([iana::KeyOperationVerify]);
-        Ok(key)
+        }
     }
 
     /// The configured COSE algorithm.
@@ -907,44 +903,9 @@ fn ec2_uncompressed_public_key(key: &Key, coordinate_len: usize) -> Result<Vec<u
     Ok(out)
 }
 
-/// Builds a symmetric COSE_Key (`kty` = Symmetric) carrying `alg`, `k`, an
-/// optional `kid` and an optional Base IV.
-fn symmetric_cose_key(
-    alg: i64,
-    k: &[u8],
-    kid: Option<&[u8]>,
-    base_iv: Option<&[u8]>,
-    key_ops: &Option<Vec<Label>>,
-) -> Key {
-    let mut key = Key::new();
-    key.set_kty(iana::KeyTypeSymmetric).set_alg(alg);
-    if let Some(kid) = kid {
-        key.set_kid(kid.to_vec());
-    }
-    key.insert(iana::SymmetricKeyParameterK, k.to_vec());
-    if let Some(base_iv) = base_iv {
-        key.insert(iana::KeyParameterBaseIV, base_iv.to_vec());
-    }
-    crate::util::set_key_ops(&mut key, key_ops);
-    key
-}
-
-/// Builds an Ed25519 OKP public COSE_Key carrying `alg`, `crv`, `x` and an
-/// optional `kid`.
-fn okp_public_cose_key(alg: i64, x: &[u8], kid: Option<&[u8]>) -> Key {
-    let mut key = Key::new();
-    key.set_kty(iana::KeyTypeOKP).set_alg(alg);
-    if let Some(kid) = kid {
-        key.set_kid(kid.to_vec());
-    }
-    key.insert(iana::OKPKeyParameterCrv, iana::EllipticCurveEd25519);
-    key.insert(iana::OKPKeyParameterX, x.to_vec());
-    key
-}
-
 /// Builds an EC2 public COSE_Key from an uncompressed SEC1 point
 /// (`0x04 || x || y`), selecting the curve and fixed coordinate length from the
-/// ECDSA `alg`.
+/// ECDSA `alg`. The key permits only verification.
 fn ec2_public_cose_key(alg: i64, point: &[u8], kid: Option<&[u8]>) -> Result<Key, Error> {
     let (curve, coord_len) = match alg {
         iana::AlgorithmES256 | iana::AlgorithmESP256 => (iana::EllipticCurveP_256, 32),
@@ -956,26 +917,21 @@ fn ec2_public_cose_key(alg: i64, point: &[u8], kid: Option<&[u8]>) -> Result<Key
     if point.first() != Some(&0x04) || point.len() != 1 + 2 * coord_len {
         return Err(Error::custom("invalid uncompressed EC public key"));
     }
-    let mut key = Key::new();
-    key.set_kty(iana::KeyTypeEC2).set_alg(alg);
-    if let Some(kid) = kid {
-        key.set_kid(kid.to_vec());
-    }
+    let mut key = Key::with_kty_alg(iana::KeyTypeEC2, alg, kid);
     key.insert(iana::EC2KeyParameterCrv, curve);
     key.insert(iana::EC2KeyParameterX, point[1..1 + coord_len].to_vec());
     key.insert(iana::EC2KeyParameterY, point[1 + coord_len..].to_vec());
+    key.set_ops([iana::KeyOperationVerify]);
     Ok(key)
 }
 
-/// Builds an RSA public COSE_Key carrying `alg`, `n`, `e` and an optional `kid`.
+/// Builds an RSA public COSE_Key carrying `alg`, `n`, `e` and an optional
+/// `kid`. The key permits only verification.
 fn rsa_public_cose_key(alg: i64, n: &[u8], e: &[u8], kid: Option<&[u8]>) -> Key {
-    let mut key = Key::new();
-    key.set_kty(iana::KeyTypeRSA).set_alg(alg);
-    if let Some(kid) = kid {
-        key.set_kid(kid.to_vec());
-    }
+    let mut key = Key::with_kty_alg(iana::KeyTypeRSA, alg, kid);
     key.insert(iana::RSAKeyParameterN, n.to_vec());
     key.insert(iana::RSAKeyParameterE, e.to_vec());
+    key.set_ops([iana::KeyOperationVerify]);
     key
 }
 

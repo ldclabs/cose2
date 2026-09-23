@@ -52,6 +52,18 @@ pub fn remove_cbor_tag(data: &[u8]) -> &[u8] {
 }
 
 /// Validates semantic wrapper tags and returns the untagged COSE array body.
+///
+/// The strict pass rejects duplicate map keys at every depth, so wire decoders
+/// may read header maps from the returned body without validating them again.
 pub(crate) fn message_body(data: &[u8], expected_tag: u64) -> Result<&[u8], crate::Error> {
-    crate::strict::message_body(data, expected_tag)
+    message_body_with_limits(data, expected_tag, crate::CborLimits::default())
+}
+
+/// [`message_body`] with caller-selected parser limits.
+pub(crate) fn message_body_with_limits(
+    data: &[u8],
+    expected_tag: u64,
+    limits: crate::CborLimits,
+) -> Result<&[u8], crate::Error> {
+    crate::strict::message_body(data, expected_tag, limits)
 }

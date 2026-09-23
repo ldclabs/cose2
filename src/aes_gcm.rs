@@ -104,20 +104,13 @@ impl AesGcmEncryptor {
     /// Note the exported [`Key`] holds an unprotected copy of the secret; it
     /// is the caller's responsibility to handle it carefully.
     pub fn to_cose_key(&self) -> Result<Key, Error> {
-        let mut key = Key::new();
-        key.set_kty(iana::KeyTypeSymmetric).set_alg(self.alg);
-        if let Some(kid) = &self.kid {
-            key.set_kid(kid.clone());
-        }
-        key.insert(
-            iana::SymmetricKeyParameterK,
-            self.raw_key.as_slice().to_vec(),
-        );
-        if let Some(base_iv) = &self.base_iv {
-            key.insert(iana::KeyParameterBaseIV, base_iv.clone());
-        }
-        crate::util::set_key_ops(&mut key, &self.key_ops);
-        Ok(key)
+        Ok(Key::symmetric(
+            self.alg,
+            self.raw_key.as_slice(),
+            self.kid.as_deref(),
+            self.base_iv.as_deref(),
+            &self.key_ops,
+        ))
     }
 
     /// The configured COSE algorithm.

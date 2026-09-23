@@ -77,13 +77,11 @@ impl Ed25519Signer {
     /// the public parameter `x` and round-trips through
     /// [`Ed25519Verifier::from_cose_key`].
     pub fn to_cose_key(&self) -> Result<Key, Error> {
-        let mut key = okp_public_cose_key(
+        Ok(Key::ed25519_public(
             self.alg,
             self.key.verifying_key().as_bytes(),
             self.kid.as_deref(),
-        );
-        key.set_ops([iana::KeyOperationVerify]);
-        Ok(key)
+        ))
     }
 
     /// The configured COSE algorithm (`Ed25519` by default).
@@ -164,9 +162,11 @@ impl Ed25519Verifier {
     ///
     /// The result round-trips through [`Ed25519Verifier::from_cose_key`].
     pub fn to_cose_key(&self) -> Result<Key, Error> {
-        let mut key = okp_public_cose_key(self.alg, self.key.as_bytes(), self.kid.as_deref());
-        key.set_ops([iana::KeyOperationVerify]);
-        Ok(key)
+        Ok(Key::ed25519_public(
+            self.alg,
+            self.key.as_bytes(),
+            self.kid.as_deref(),
+        ))
     }
 
     /// The configured COSE algorithm (`Ed25519` by default).
@@ -192,19 +192,6 @@ impl Verifier for Ed25519Verifier {
             .verify_strict(data, &signature)
             .map_err(|_| Error::verify("Ed25519 signature mismatch"))
     }
-}
-
-/// Builds an Ed25519 OKP public COSE_Key carrying `alg`, `crv`, `x` and an
-/// optional `kid`.
-fn okp_public_cose_key(alg: i64, x: &[u8], kid: Option<&[u8]>) -> Key {
-    let mut key = Key::new();
-    key.set_kty(iana::KeyTypeOKP).set_alg(alg);
-    if let Some(kid) = kid {
-        key.set_kid(kid.to_vec());
-    }
-    key.insert(iana::OKPKeyParameterCrv, iana::EllipticCurveEd25519);
-    key.insert(iana::OKPKeyParameterX, x.to_vec());
-    key
 }
 
 /// Accepts a COSE_Key whose `alg` is absent, Ed25519, or legacy EdDSA.

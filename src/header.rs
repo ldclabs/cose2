@@ -408,6 +408,17 @@ impl<'de> Deserialize<'de> for Header {
     }
 }
 
+/// Deserializes a header from a message body that `tag::message_body`
+/// already validated strictly, including duplicate keys at every depth.
+pub(crate) fn deserialize_checked<'de, D>(deserializer: D) -> Result<Header, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let header = Header(CoseMap::deserialize_checked(deserializer)?);
+    header.validate_common().map_err(serde::de::Error::custom)?;
+    Ok(header)
+}
+
 /// Encodes a header as the `protected` byte string used inside COSE messages.
 ///
 /// Per RFC 9052, an empty protected header is encoded as a zero-length byte
@@ -416,7 +427,7 @@ pub(crate) fn encode_protected(header: &Header) -> Result<Vec<u8>, Error> {
     if header.is_empty() {
         Ok(Vec::new())
     } else {
-        Ok(cbor2::to_canonical_vec(header)?)
+        header.to_vec()
     }
 }
 
@@ -462,6 +473,18 @@ pub(crate) fn validate_header_buckets(
     }
 
     Ok(())
+}
+
+/// Rechecks one security layer at a cryptographic entry point: its mutable
+/// header buckets must still be valid, and its protected view must still
+/// denote the exact bytes used by the cryptographic operation.
+pub(crate) fn validate_layer(
+    protected: &Header,
+    unprotected: &Header,
+    protected_raw: &[u8],
+) -> Result<(), Error> {
+    validate_header_buckets(protected, unprotected)?;
+    validate_protected_state(protected, protected_raw)
 }
 
 /// Ensures that a public protected-header view still denotes the exact raw

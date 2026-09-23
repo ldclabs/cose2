@@ -1,11 +1,11 @@
 //! Disclosure matching, bounded restoration and removal of undisclosed claims.
 
 use crate::validation::{
-    claim_maps, ensure_message_protected_state, protected_cwt_claims,
-    remove_undisclosed_redactions, validate_matching_claims, validate_root_disclosure_key,
+    claim_maps, definite_cbor_limits, protected_cwt_claims, remove_undisclosed_redactions,
+    validate_matching_claims, validate_root_disclosure_key,
 };
 use crate::{
-    default_hasher_for_sd_alg, disclosures_from_unprotected, expect_bytes, expect_owned_bytes,
+    default_hasher_for_sd_alg, disclosures_from_unprotected, expect_owned_bytes,
     is_redacted_claim_keys_label, label_from_value, redacted_claim_keys_label, redacted_element,
     sd_alg, Disclosure, DisclosureKind, ProcessingLimits, RedactionHasher, TraversalBudget,
     REDACTED_CLAIM_KEYS_SIMPLE, REDACTED_ELEMENT_TAG, TO_BE_DECOY_TAG, TO_BE_REDACTED_TAG,
@@ -204,7 +204,7 @@ pub fn restore_payload_with_disclosures_and_limits<I>(
 where
     I: IntoIterator<Item = Disclosure>,
 {
-    ensure_message_protected_state(message)?;
+    message.validate_headers()?;
     let payload = message
         .payload
         .as_deref()
@@ -212,14 +212,7 @@ where
     if payload.len() > limits.max_input_bytes {
         return Err(Error::limit("SD-CWT payload bytes", limits.max_input_bytes));
     }
-    cose2::validate_cbor(
-        payload,
-        cose2::CborLimits {
-            max_depth: limits.max_depth,
-            max_items: limits.max_items,
-            require_definite: true,
-        },
-    )?;
+    cose2::validate_cbor(payload, definite_cbor_limits(limits))?;
     let value: Value = cbor2::from_slice(payload)?;
     if !matches!(value, Value::Map(_)) {
         return Err(Error::UnexpectedType(
@@ -254,7 +247,7 @@ impl DisclosureMap {
         I: IntoIterator<Item = Disclosure>,
     {
         let mut entries = HashMap::new();
-        let mut salts = HashSet::new();
+        let mut salts = HashSet::<[u8; 16]>::new();
         let mut total_bytes = 0usize;
         for (index, disclosure) in disclosures.into_iter().enumerate() {
             if index >= budget.limits.max_disclosures {
@@ -280,12 +273,7 @@ impl DisclosureMap {
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => entry,
             };
-            let salt = match disclosure.kind() {
-                DisclosureKind::Claim { salt, .. }
-                | DisclosureKind::Element { salt, .. }
-                | DisclosureKind::Decoy { salt } => salt,
-            };
-            if !salts.insert(salt.clone()) {
+            if !salts.insert(disclosure.salt()) {
                 return Err(Error::verify("duplicate SD-CWT disclosure salt"));
             }
             entry.insert(disclosure);
@@ -458,7 +446,7 @@ fn restore_array(
             Value::Tag(tag, inner) if tag == REDACTED_ELEMENT_TAG => {
                 budget.enter(depth + 1)?;
                 budget.enter(depth + 2)?;
-                let hash = expect_bytes(&inner, "redacted array element hash")?.to_vec();
+                let hash = expect_owned_bytes(*inner, "redacted array element hash must be bytes")?;
                 match pending.remove(&hash) {
                     Some(disclosure) => match disclosure.kind {
                         DisclosureKind::Element { value, .. } => {

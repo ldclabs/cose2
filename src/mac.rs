@@ -3,20 +3,22 @@
 use cbor2::Cbor;
 
 use crate::{
-    header::{decode_protected, encode_protected, validate_header_buckets},
+    header::{decode_protected, validate_header_buckets, validate_layer},
     iana,
-    recipient::validate_recipient_list,
+    recipient::{validate_decoded_recipients, validate_message_recipients},
     tag, util, Error, Header, Label, Macer, Recipient,
 };
 
 /// The on-the-wire COSE_Mac array: `[protected, unprotected, payload, tag, recipients]`.
 // Private wire types are decoded only after `tag::message_body` validates
-// their exact field kinds. Decode byte strings directly into their final buffers.
+// their exact field kinds and rejects duplicate map keys. Decode byte strings
+// directly into their final buffers and header maps without a second pass.
 #[derive(Clone, Debug, PartialEq, Cbor)]
 #[cbor(tag = 97, array)]
 struct MacWire {
     #[serde(with = "serde_bytes")]
     protected: Vec<u8>,
+    #[serde(deserialize_with = "crate::header::deserialize_checked")]
     unprotected: Header,
     #[serde(with = "serde_bytes")]
     payload: Option<Vec<u8>>,
@@ -109,15 +111,9 @@ impl MacMessage {
     }
 
     fn prepare_tag_headers(&mut self, alg: Option<Label>, kid: Option<&[u8]>) -> Result<(), Error> {
-        if self.recipients.is_empty() {
-            return Err(Error::Custom("MacMessage has no recipients".into()));
-        }
-        validate_recipient_list(&self.recipients)?;
-        util::ensure_protected_alg(&mut self.protected, &mut self.unprotected, alg)?;
-        util::ensure_unprotected_kid(&self.protected, &mut self.unprotected, kid)?;
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        let protected_raw = encode_protected(&self.protected)?;
-        self.protected_raw = protected_raw;
+        validate_message_recipients(&self.recipients, "MacMessage")?;
+        self.protected_raw =
+            util::prepare_headers(&mut self.protected, &mut self.unprotected, alg, kid)?;
         self.state = util::OperationState::Prepared;
         self.tag.clear();
         Ok(())
@@ -125,15 +121,13 @@ impl MacMessage {
 
     /// Stores externally produced tag bytes on this message.
     pub fn set_tag(&mut self, tag: impl Into<Vec<u8>>) -> Result<(), Error> {
-        if self.recipients.is_empty() {
-            return Err(Error::Custom("MacMessage has no recipients".into()));
-        }
-        validate_recipient_list(&self.recipients)?;
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        if !self.state.initialized() {
-            self.protected_raw = encode_protected(&self.protected)?;
-        }
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        validate_message_recipients(&self.recipients, "MacMessage")?;
+        util::sync_protected_raw(
+            &self.protected,
+            &self.unprotected,
+            &mut self.protected_raw,
+            self.state,
+        )?;
         self.tag = tag.into();
         self.state = util::OperationState::Complete;
         Ok(())
@@ -144,8 +138,10 @@ impl MacMessage {
         self.prepare_tag_headers(macer.alg(), macer.kid())?;
         let payload = util::require_embedded_payload(&self.payload, "MacMessage::compute")?;
         let tbm = Self::to_be_maced(&self.protected_raw, external_aad.unwrap_or(&[]), payload)?;
-        let tag = macer.mac_create(&tbm)?;
-        self.set_tag(tag)
+        // The recipients and headers were validated just above.
+        self.tag = macer.mac_create(&tbm)?;
+        self.state = util::OperationState::Complete;
+        Ok(())
     }
 
     /// Computes the authentication tag over a detached payload.
@@ -164,8 +160,8 @@ impl MacMessage {
             external_aad.unwrap_or(&[]),
             detached_payload,
         )?;
-        let tag = macer.mac_create(&tbm)?;
-        self.set_tag(tag)?;
+        self.tag = macer.mac_create(&tbm)?;
+        self.state = util::OperationState::Complete;
         self.payload = None;
         Ok(())
     }
@@ -208,18 +204,11 @@ impl MacMessage {
 
     /// Serializes the wire array borrowing this message's buffers.
     fn encode(&self, prefix: &[u8]) -> Result<Vec<u8>, Error> {
-        if !self.state.complete() {
-            return Err(Error::InvalidState(
-                "MacMessage must be computed before encoding".into(),
-            ));
-        }
-        if self.recipients.is_empty() {
-            return Err(Error::Custom("MacMessage has no recipients".into()));
-        }
-        validate_recipient_list(&self.recipients)?;
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
-        let unprotected = util::canonical_raw(&self.unprotected)?;
+        self.state
+            .require_complete("MacMessage must be computed before encoding")?;
+        validate_message_recipients(&self.recipients, "MacMessage")?;
+        validate_layer(&self.protected, &self.unprotected, &self.protected_raw)?;
+        let unprotected = util::header_raw(&self.unprotected)?;
         let recipients = util::canonical_raw(&self.recipients)?;
         util::encode_prefixed(
             prefix,
@@ -237,10 +226,7 @@ impl MacMessage {
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
         let body = tag::message_body(data, Self::TAG)?;
         let wire: MacWire = cbor2::from_slice(body)?;
-        if wire.recipients.is_empty() {
-            return Err(Error::Custom("MacMessage has no recipients".into()));
-        }
-        validate_recipient_list(&wire.recipients)?;
+        validate_decoded_recipients(&wire.recipients, "MacMessage")?;
         let protected = decode_protected(&wire.protected)?;
         validate_header_buckets(&protected, &wire.unprotected)?;
         Ok(MacMessage {
@@ -256,11 +242,8 @@ impl MacMessage {
 
     /// Verifies the authentication tag with `macer`.
     pub fn verify(&self, macer: &dyn Macer, external_aad: Option<&[u8]>) -> Result<(), Error> {
-        if !self.state.complete() {
-            return Err(Error::InvalidState(
-                "MacMessage must be decoded before verifying".into(),
-            ));
-        }
+        self.state
+            .require_complete("MacMessage must be decoded before verifying")?;
         let payload = util::require_embedded_payload(&self.payload, "MacMessage::verify")?;
         self.verify_payload(macer, payload, external_aad.unwrap_or(&[]))
     }
@@ -272,11 +255,8 @@ impl MacMessage {
         detached_payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        if !self.state.complete() {
-            return Err(Error::InvalidState(
-                "MacMessage must be decoded before verifying".into(),
-            ));
-        }
+        self.state
+            .require_complete("MacMessage must be decoded before verifying")?;
         if self.payload.is_some() {
             return Err(Error::Custom(
                 "MacMessage carries an embedded payload; use verify".into(),
@@ -291,8 +271,7 @@ impl MacMessage {
         payload: &[u8],
         external_aad: &[u8],
     ) -> Result<(), Error> {
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        validate_layer(&self.protected, &self.unprotected, &self.protected_raw)?;
         self.protected
             .ensure_crit_understood(macer.understood_critical_headers())?;
         util::check_protected_alg(&self.protected, &self.unprotected, macer.alg())?;

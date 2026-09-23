@@ -181,8 +181,19 @@ are load-bearing for cryptographic soundness:
 ## Performance and code structure
 
 - Keep private message Wire decoders behind `tag::message_body`'s strict shape
-  validation. Their direct `serde_bytes` decoding avoids an intermediate copy;
+  validation, which also rejects duplicate map keys at every depth. Their
+  direct `serde_bytes` decoding avoids an intermediate copy, and their header
+  maps use `header::deserialize_checked` instead of a second strict pass;
   independently deserializable types still need strict byte-string handling.
+- `CoseMap::to_vec` writes deterministic CBOR without copying the map into a
+  dynamic `Value`. Its output must stay byte-identical to
+  `cbor2::to_canonical_vec`; extend
+  `tests/hardening.rs::map_encoding_matches_cbor2_deterministic_encoding` when
+  changing it.
+- Message modules share `util::prepare_headers`, `util::sync_protected_raw`
+  and `header::validate_layer` for the prepare, attach-result and recheck
+  steps. One-step operations store their result directly after `prepare_*`
+  instead of repeating the validation in `set_*`.
 - Protected-state checks compare canonical bytes first and retain a semantic
   fallback for decoded nonpreferred encodings. Never replace authenticated raw
   bytes as part of this optimization.

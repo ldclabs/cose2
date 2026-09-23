@@ -46,11 +46,22 @@ impl NumericDate {
         }
     }
 
-    fn partial_cmp_integer(self, other: i128) -> Option<Ordering> {
-        match self {
-            Self::Integer(value) => value.partial_cmp(&other),
-            Self::Float(value) => compare_f64_to_i128(value, other),
+    /// Compares two dates numerically across the integer and floating-point
+    /// forms, so `Integer(1)` and `Float(1.0)` compare equal. Returns `None`
+    /// only when a floating-point value is not finite.
+    pub fn compare(self, other: Self) -> Option<Ordering> {
+        match (self, other) {
+            (Self::Integer(left), Self::Integer(right)) => left.partial_cmp(&right),
+            (Self::Integer(left), Self::Float(right)) => {
+                compare_f64_to_i128(right, left).map(Ordering::reverse)
+            }
+            (Self::Float(left), Self::Integer(right)) => compare_f64_to_i128(left, right),
+            (Self::Float(left), Self::Float(right)) => left.partial_cmp(&right),
         }
+    }
+
+    fn partial_cmp_integer(self, other: i128) -> Option<Ordering> {
+        self.compare(Self::Integer(other))
     }
 }
 
@@ -426,8 +437,7 @@ impl Claims {
 
     /// Decodes an untagged CWT Claims Set map.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
-        crate::strict::validate_map(data)?;
-        Ok(cbor2::from_slice(data)?)
+        Self::from_map(CoseMap::from_slice(data)?)
     }
 
     /// Decodes the legacy `61(claims-map)` representation emitted by cose2 0.4.
@@ -438,18 +448,18 @@ impl Claims {
 
     /// Encodes the untagged CWT Claims Set map canonically.
     pub fn to_vec(&self) -> Result<Vec<u8>, Error> {
-        Ok(cbor2::to_canonical_vec(self)?)
+        self.to_map()?.to_vec()
     }
 
     /// Alias for [`Claims::to_vec`], retained for source compatibility.
+    #[deprecated(note = "Claims encode untagged; use `Claims::to_vec`")]
     pub fn to_untagged_vec(&self) -> Result<Vec<u8>, Error> {
         self.to_vec()
     }
 
     /// Encodes the legacy `61(claims-map)` representation emitted by cose2 0.4.
     pub fn to_legacy_tagged_vec(&self) -> Result<Vec<u8>, Error> {
-        let claims = crate::util::canonical_raw(self)?;
-        crate::util::encode_prefixed(tag::CWT_PREFIX, &claims)
+        Ok(tag::with_tag(tag::CWT_PREFIX, &self.to_vec()?))
     }
 
     /// The CBOR tag used around a complete tagged COSE CWT message.
@@ -490,6 +500,10 @@ impl<'de> Deserialize<'de> for Claims {
 }
 
 /// Serde helpers for `Option<NumericDate>` fields in application structs.
+///
+/// `Option<NumericDate>` implements `Serialize` and `Deserialize` itself, so
+/// these helpers are no longer needed.
+#[deprecated(note = "`Option<NumericDate>` is serializable; remove the `serde(with)` attribute")]
 pub mod numeric_date {
     use super::NumericDate;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};

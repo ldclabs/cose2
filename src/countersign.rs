@@ -1,7 +1,7 @@
 //! Legacy RFC 8152 full countersignatures (header parameter label 7).
 
 use crate::{
-    header::{decode_protected, encode_protected, validate_header_buckets},
+    header::{decode_protected, validate_header_buckets, validate_layer},
     util, Error, Header, Label, Signer, Value, Verifier,
 };
 
@@ -53,10 +53,8 @@ impl CounterSignature {
         payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, Error> {
-        util::ensure_protected_alg(&mut self.protected, &mut self.unprotected, alg)?;
-        util::ensure_unprotected_kid(&self.protected, &mut self.unprotected, kid)?;
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        self.protected_raw = encode_protected(&self.protected)?;
+        self.protected_raw =
+            util::prepare_headers(&mut self.protected, &mut self.unprotected, alg, kid)?;
         self.signature.clear();
         self.state = util::OperationState::Prepared;
         Self::to_be_signed(
@@ -69,11 +67,12 @@ impl CounterSignature {
 
     /// Stores an externally produced countersignature value.
     pub fn set_signature(&mut self, signature: impl Into<Vec<u8>>) -> Result<(), Error> {
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        if !self.state.initialized() {
-            self.protected_raw = encode_protected(&self.protected)?;
-        }
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        util::sync_protected_raw(
+            &self.protected,
+            &self.unprotected,
+            &mut self.protected_raw,
+            self.state,
+        )?;
         self.signature = signature.into();
         self.state = util::OperationState::Complete;
         Ok(())
@@ -95,7 +94,10 @@ impl CounterSignature {
             payload,
             external_aad,
         )?;
-        self.set_signature(signer.sign(&to_be_signed)?)
+        // The headers were validated and encoded just above.
+        self.signature = signer.sign(&to_be_signed)?;
+        self.state = util::OperationState::Complete;
+        Ok(())
     }
 
     /// Verifies this legacy countersignature over a target structure's
@@ -111,13 +113,9 @@ impl CounterSignature {
         payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        if !self.state.complete() {
-            return Err(Error::invalid_state(
-                "CounterSignature must be signed or decoded before verifying",
-            ));
-        }
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        self.state
+            .require_complete("CounterSignature must be signed or decoded before verifying")?;
+        validate_layer(&self.protected, &self.unprotected, &self.protected_raw)?;
         self.protected
             .ensure_crit_understood(verifier.understood_critical_headers())?;
         util::check_protected_alg(&self.protected, &self.unprotected, verifier.alg())?;
@@ -183,13 +181,9 @@ impl CounterSignature {
 
     /// Converts this countersignature to its header value.
     pub fn to_value(&self) -> Result<Value, Error> {
-        if !self.state.complete() {
-            return Err(Error::invalid_state(
-                "CounterSignature must be signed before encoding",
-            ));
-        }
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        self.state
+            .require_complete("CounterSignature must be signed before encoding")?;
+        validate_layer(&self.protected, &self.unprotected, &self.protected_raw)?;
         let unprotected = Value::Map(
             self.unprotected
                 .iter()

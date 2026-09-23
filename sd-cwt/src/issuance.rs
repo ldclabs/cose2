@@ -1,8 +1,9 @@
 //! Conversion of pre-issuance redaction and decoy requests.
 
+use crate::validation::validate_root_disclosure_key;
 use crate::{
     is_redacted_claim_keys_label, label_from_value, redacted_claim_keys_label, redacted_element,
-    Disclosure, DisclosureSet, ProcessingLimits, RedactionHasher, TraversalBudget,
+    Disclosure, DisclosureKind, DisclosureSet, ProcessingLimits, RedactionHasher, TraversalBudget,
     REDACTED_CLAIM_KEYS_SIMPLE, REDACTED_ELEMENT_TAG, TO_BE_DECOY_TAG, TO_BE_REDACTED_TAG,
 };
 use cbor2::Value;
@@ -42,7 +43,9 @@ pub struct IssueResult {
 /// Tag 58 around a map key redacts that key/value pair. Tag 58 around an
 /// array element redacts that element. Tag 62 inserts a decoy redaction at
 /// that map or array position; the tag payload must be a positive integer
-/// that is unique within the SD-CWT being issued.
+/// that is unique within the SD-CWT being issued. Registered claims that
+/// SD-CWT forbids redacting (such as `iss`, `exp` and `cnf`) are rejected at
+/// the root of the claims map, matching restoration.
 pub fn issue_from_preissuance(
     value: Value,
     salts: &mut dyn SaltGenerator,
@@ -100,7 +103,8 @@ impl IssueContext<'_> {
         Ok(salt)
     }
 
-    fn add_disclosure(&mut self, disclosure: Disclosure) -> Result<Vec<u8>, Error> {
+    fn add_disclosure(&mut self, kind: DisclosureKind) -> Result<Vec<u8>, Error> {
+        let disclosure = Disclosure::from_kind_with_limits(kind, self.budget.limits)?;
         if self.disclosures.len() >= self.budget.limits.max_disclosures {
             return Err(Error::limit(
                 "SD-CWT disclosure",
@@ -170,11 +174,18 @@ fn issue_map(
             Value::Tag(tag, inner) if tag == TO_BE_REDACTED_TAG => {
                 context.budget.enter(depth + 2)?;
                 let claim_key = label_from_value(&inner)?;
+                if depth == 0 {
+                    validate_root_disclosure_key(&claim_key)?;
+                }
                 let normalized_key = Value::from(claim_key.clone());
                 insert_normalized_key(&mut normalized_keys, &normalized_key)?;
 
                 let issued_value = issue_value(value, context, depth + 1)?;
-                let disclosure = Disclosure::claim(context.next_salt()?, claim_key, issued_value)?;
+                let disclosure = DisclosureKind::Claim {
+                    salt: context.next_salt()?.to_vec(),
+                    key: claim_key,
+                    value: issued_value,
+                };
                 redacted_hashes.push(Value::Bytes(context.add_disclosure(disclosure)?));
             }
             Value::Tag(tag, inner) if tag == TO_BE_DECOY_TAG => {
@@ -188,7 +199,9 @@ fn issue_map(
                     ));
                 }
                 context.budget.enter(depth + 1)?;
-                let disclosure = Disclosure::decoy(context.next_salt()?)?;
+                let disclosure = DisclosureKind::Decoy {
+                    salt: context.next_salt()?.to_vec(),
+                };
                 redacted_hashes.push(Value::Bytes(context.add_disclosure(disclosure)?));
             }
             key if is_redacted_claim_keys_label(&key) => {
@@ -223,7 +236,10 @@ fn issue_array(
             Value::Tag(tag, inner) if tag == TO_BE_REDACTED_TAG => {
                 context.budget.enter(depth + 1)?;
                 let issued = issue_value(*inner, context, depth + 2)?;
-                let disclosure = Disclosure::element(context.next_salt()?, issued)?;
+                let disclosure = DisclosureKind::Element {
+                    salt: context.next_salt()?.to_vec(),
+                    value: issued,
+                };
                 let hash = context.add_disclosure(disclosure)?;
                 output.push(redacted_element(hash));
             }
@@ -231,7 +247,9 @@ fn issue_array(
                 context.budget.enter(depth + 1)?;
                 context.budget.enter(depth + 2)?;
                 record_decoy_id(&inner, context)?;
-                let disclosure = Disclosure::decoy(context.next_salt()?)?;
+                let disclosure = DisclosureKind::Decoy {
+                    salt: context.next_salt()?.to_vec(),
+                };
                 let hash = context.add_disclosure(disclosure)?;
                 output.push(redacted_element(hash));
             }

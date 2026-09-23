@@ -1,6 +1,9 @@
 //! Internal helpers shared by the message modules.
 
-use crate::{Error, Header, Label};
+use crate::{
+    header::{encode_protected, validate_header_buckets, validate_layer},
+    Error, Header, Label,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum OperationState {
@@ -17,6 +20,46 @@ impl OperationState {
 
     pub(crate) fn complete(self) -> bool {
         self == Self::Complete
+    }
+
+    /// Returns [`Error::InvalidState`] with `message` unless complete.
+    pub(crate) fn require_complete(self, message: &str) -> Result<(), Error> {
+        if self.complete() {
+            Ok(())
+        } else {
+            Err(Error::InvalidState(message.into()))
+        }
+    }
+}
+
+/// Fills in `alg`/`kid`, validates both buckets and returns the canonical
+/// protected bytes that the cryptographic operation will authenticate.
+pub(crate) fn prepare_headers(
+    protected: &mut Header,
+    unprotected: &mut Header,
+    alg: Option<Label>,
+    kid: Option<&[u8]>,
+) -> Result<Vec<u8>, Error> {
+    ensure_protected_alg(protected, unprotected, alg)?;
+    ensure_unprotected_kid(protected, unprotected, kid)?;
+    validate_header_buckets(protected, unprotected)?;
+    encode_protected(protected)
+}
+
+/// Readies a layer to store an externally produced result: rechecks prepared
+/// protected bytes, or encodes them canonically for a newly built layer.
+pub(crate) fn sync_protected_raw(
+    protected: &Header,
+    unprotected: &Header,
+    protected_raw: &mut Vec<u8>,
+    state: OperationState,
+) -> Result<(), Error> {
+    if state.initialized() {
+        validate_layer(protected, unprotected, protected_raw)
+    } else {
+        validate_header_buckets(protected, unprotected)?;
+        *protected_raw = encode_protected(protected)?;
+        Ok(())
     }
 }
 
@@ -48,17 +91,6 @@ pub(crate) fn require_key_ops(
         Err(Error::key_operation(format!(
             "COSE_Key key_ops does not permit {operation}"
         )))
-    }
-}
-
-#[cfg(any(
-    feature = "crypto-ring",
-    feature = "crypto-aws-lc-rs",
-    feature = "crypto-aes-gcm"
-))]
-pub(crate) fn set_key_ops(key: &mut crate::Key, ops: &Option<Vec<Label>>) {
-    if let Some(ops) = ops {
-        key.set_ops(ops.clone());
     }
 }
 
@@ -104,9 +136,10 @@ pub(crate) fn encode_structure<T: serde::Serialize>(parts: &T) -> Result<Vec<u8>
 /// `prefix` (a COSE tag prefix from [`tag`](crate::tag), or empty for untagged
 /// output).
 ///
-/// Message modules pre-encode map-containing fragments with [`canonical_raw`]
-/// so the ordinary streaming encoder still produces canonical output without
-/// copying large payload or ciphertext byte strings through a dynamic value.
+/// Message modules pre-encode map-containing fragments with [`header_raw`] or
+/// [`canonical_raw`] so the ordinary streaming encoder still produces
+/// canonical output without copying large payload or ciphertext byte strings
+/// through a dynamic value.
 pub(crate) fn encode_prefixed<T: serde::Serialize>(
     prefix: &[u8],
     body: &T,
@@ -123,6 +156,12 @@ pub(crate) fn encode_prefixed<T: serde::Serialize>(
     Ok(out)
 }
 
+/// Canonically encodes a header for splicing into a streamed message, using
+/// the header's own encoder instead of copying it into a dynamic value.
+pub(crate) fn header_raw(header: &Header) -> Result<cbor2::RawValue, Error> {
+    Ok(cbor2::RawValue::new(header.to_vec()?)?)
+}
+
 /// Canonically encodes a map-containing fragment for zero-copy splicing into
 /// an otherwise streaming CBOR message.
 pub(crate) fn canonical_raw<T: serde::Serialize>(value: &T) -> Result<cbor2::RawValue, Error> {
@@ -131,8 +170,7 @@ pub(crate) fn canonical_raw<T: serde::Serialize>(value: &T) -> Result<cbor2::Raw
 
 /// On the signing/encrypting/MACing side: writes `alg` into the protected
 /// header if absent, or checks it matches when already present.
-///
-pub(crate) fn ensure_protected_alg(
+fn ensure_protected_alg(
     protected: &mut Header,
     unprotected: &mut Header,
     alg: Option<Label>,
@@ -199,7 +237,7 @@ pub(crate) fn kid_match_rank(
 }
 
 /// Writes `kid` into the unprotected header if absent.
-pub(crate) fn ensure_unprotected_kid(
+fn ensure_unprotected_kid(
     protected: &Header,
     unprotected: &mut Header,
     kid: Option<&[u8]>,

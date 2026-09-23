@@ -47,6 +47,96 @@ fn nested_duplicate_map_keys_are_rejected() {
 }
 
 #[test]
+fn duplicate_map_keys_are_detected_across_encodings_of_one_key() {
+    // {1: 1, 1: 2}, the second key with a non-preferred argument.
+    assert!(CoseMap::from_slice(&[0xa2, 0x01, 0x01, 0x18, 0x01, 0x02]).is_err());
+    // {"a": 1, (_ "a"): 2}
+    let indefinite_text = [0xa2, 0x61, b'a', 0x01, 0x7f, 0x61, b'a', 0xff, 0x02];
+    assert!(CoseMap::from_slice(&indefinite_text).is_err());
+    // {h'00': 1, h'00': 2}, the second length with a non-preferred argument.
+    assert!(CoseMap::from_slice(&[0xa2, 0x41, 0x00, 0x01, 0x58, 0x01, 0x00, 0x02]).is_err());
+    // A text key that is not valid UTF-8 is still rejected.
+    assert!(CoseMap::from_slice(&[0xa1, 0x61, 0xff, 0x01]).is_err());
+    // Distinct keys sharing an encoding prefix remain distinct: {1: 1, 24: 2}.
+    assert_eq!(
+        CoseMap::from_slice(&[0xa2, 0x01, 0x01, 0x18, 0x18, 0x02])
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Message decoding reads header maps after one strict pass over the
+    // message, which must still reject a duplicate unprotected key:
+    // [h'', {4: h'01', 4: h'02'}, h'', h'']
+    let input = [
+        0x84, 0x40, 0xa2, 0x04, 0x41, 0x01, 0x04, 0x41, 0x02, 0x40, 0x40,
+    ];
+    assert!(Sign1Message::from_slice(&input).is_err());
+}
+
+#[test]
+fn map_encoding_matches_cbor2_deterministic_encoding() {
+    let mut map = CoseMap::new();
+    for key in [
+        0i64,
+        1,
+        23,
+        24,
+        100,
+        255,
+        256,
+        65_536,
+        -1,
+        -24,
+        -25,
+        -256,
+        -257,
+        i64::MIN,
+        i64::MAX,
+    ] {
+        map.insert(key, key);
+    }
+    map.insert(
+        "z",
+        Value::Map(vec![
+            (Value::from("bb"), Value::from(1)),
+            (Value::from("a"), Value::Float(f64::NAN)),
+        ]),
+    );
+    map.insert(
+        "aa",
+        Value::Array(vec![
+            Value::Tag(2, Box::new(Value::Bytes(vec![0, 0, 1]))),
+            Value::Float(-0.0),
+            Value::Float(1.5),
+            Value::Float(1e300),
+        ]),
+    );
+    map.insert(
+        "",
+        Value::Tag(
+            1,
+            Box::new(Value::Map(vec![
+                (Value::from(2), Value::Null),
+                (Value::from(1), Value::Bool(true)),
+            ])),
+        ),
+    );
+    map.insert("nan", Value::Float(f64::NAN));
+    map.insert("bytes", vec![7u8; 300]);
+    map.insert("text", "t".repeat(70_000));
+
+    assert_eq!(
+        map.to_vec().unwrap(),
+        cbor2::to_canonical_vec(&map).unwrap()
+    );
+    assert_eq!(
+        CoseMap::new().to_vec().unwrap(),
+        cbor2::to_canonical_vec(&CoseMap::new()).unwrap()
+    );
+}
+
+#[test]
 fn kdf_structures_do_not_coerce_integer_arrays_to_bytes() {
     let party = cbor2::to_vec(&Value::Array(vec![
         Value::Array(vec![Value::from(1)]),

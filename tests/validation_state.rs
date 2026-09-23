@@ -2,8 +2,8 @@ mod common;
 
 use common::{MockEncryptor, MockMacer, MockSigner, MockVerifier};
 use cose2::{
-    iana, Encrypt0Message, EncryptMessage, Error, Header, Mac0Message, MacMessage, Recipient,
-    Sign1Message, SignMessage, Value,
+    iana, CborLimits, Encrypt0Message, EncryptMessage, Error, Header, Mac0Message, MacMessage,
+    Recipient, Sign1Message, SignMessage, Value,
 };
 
 fn direct_recipient() -> Recipient {
@@ -284,4 +284,46 @@ fn indefinite_byte_strings_still_decode_into_final_buffers() {
     assert_eq!(message.protected_raw(), &[0xa1, 0x01, 0x32]);
     assert_eq!(message.payload.as_deref(), Some(b"abc".as_slice()));
     assert_eq!(message.signature(), b"de");
+}
+
+#[test]
+fn sign1_decode_limits_cover_the_whole_message_and_headers_can_be_rechecked() {
+    let signer = MockSigner::new(iana::AlgorithmEdDSA, b"key");
+    let mut message = Sign1Message::new(Some(b"payload".to_vec()));
+    message.unprotected.insert(
+        "nested",
+        Value::Array(vec![Value::Array(vec![Value::from(1)])]),
+    );
+    let encoded = message.sign_and_encode(&signer, None).unwrap();
+
+    let decoded = Sign1Message::from_slice_with_limits(&encoded, CborLimits::default()).unwrap();
+    assert_eq!(decoded, Sign1Message::from_slice(&encoded).unwrap());
+    decoded.validate_headers().unwrap();
+    let shallow = CborLimits {
+        max_depth: 2,
+        ..CborLimits::default()
+    };
+    assert!(matches!(
+        Sign1Message::from_slice_with_limits(&encoded, shallow),
+        Err(Error::LimitExceeded { .. })
+    ));
+
+    // [h'', {}, (_ h'01'), h'']
+    let indefinite = [0x84, 0x40, 0xa0, 0x5f, 0x41, 0x01, 0xff, 0x40];
+    assert!(Sign1Message::from_slice(&indefinite).is_ok());
+    let definite = CborLimits {
+        require_definite: true,
+        ..CborLimits::default()
+    };
+    assert!(Sign1Message::from_slice_with_limits(&indefinite, definite).is_err());
+
+    let mut changed = decoded.clone();
+    changed.protected.set_alg(iana::AlgorithmES256);
+    assert!(matches!(
+        changed.validate_headers(),
+        Err(Error::InvalidState(_))
+    ));
+    let mut collision = decoded;
+    collision.unprotected.set_alg(iana::AlgorithmEdDSA);
+    assert!(collision.validate_headers().is_err());
 }

@@ -84,3 +84,24 @@ Regression coverage is in `tests/validation_state.rs` and
 `sd-cwt/tests/hardening.rs`. Release publishing now declares its configured
 environment and skips existing package versions when rerun; the publisher is
 tested with simulated registry and Cargo responses, without uploading crates.
+
+A second pass fixes two SD-CWT issuance inconsistencies. Issuance now rejects
+redaction of registered claims that restoration forbids at the Claims Map root,
+so the issuer can no longer produce tokens that the crate's own validator
+rejects. Disclosures created during issuance now honor caller-supplied
+`ProcessingLimits` instead of the defaults. Regressions:
+`sd-cwt/tests/hardening.rs::issuance_rejects_redacting_never_redacted_root_claims`
+and `issuance_applies_caller_limits_to_the_disclosures_it_creates`.
+
+The same pass removes redundant work. Duplicate-key detection compares
+preferred-form integer and string keys in place. Claims and message header maps
+are no longer strictly validated twice. Header maps are encoded
+deterministically without a dynamic `Value` copy. SD-CWT verification makes one
+strict pass over its input. On the review host the encoding probe measured a
+Sign1 message with 2,000 disclosures in its unprotected header at about 2.6x
+faster to encode and 2x faster to decode, and a 20,000-claim Claims Set at
+about 2.5x faster to decode. SD-CWT restoration timings were unchanged.
+`Sign1Message::from_slice_with_limits`, `Sign1Message::validate_headers` and
+`cwt::NumericDate::compare` were added for the SD-CWT crate. The compatibility
+aliases `KeySet::from_slice_lenient`, `Claims::to_untagged_vec` and
+`cwt::numeric_date` are deprecated.

@@ -305,7 +305,7 @@ pub fn aead_encrypted_disclosures_from_unprotected_with_limits(
     let mut nonces = HashSet::with_capacity(disclosures.len());
     if disclosures
         .iter()
-        .any(|disclosure| !nonces.insert(disclosure.nonce.clone()))
+        .any(|disclosure| !nonces.insert(disclosure.nonce.as_slice()))
     {
         return Err(Error::verify(
             "duplicate nonce in SD-CWT encrypted disclosures",

@@ -198,6 +198,62 @@ impl Key {
         Ok(self.kid()?.map(ToOwned::to_owned))
     }
 
+    /// Builds a key carrying `kty`, `alg` and an optional `kid`.
+    #[cfg(any(
+        feature = "crypto-ring",
+        feature = "crypto-aws-lc-rs",
+        feature = "crypto-ed25519-dalek",
+        feature = "crypto-aes-gcm"
+    ))]
+    pub(crate) fn with_kty_alg(kty: i64, alg: i64, kid: Option<&[u8]>) -> Self {
+        let mut key = Key::new();
+        key.set_kty(kty).set_alg(alg);
+        if let Some(kid) = kid {
+            key.set_kid(kid.to_vec());
+        }
+        key
+    }
+
+    /// Builds a symmetric key carrying `alg`, `k`, and optionally a `kid`,
+    /// a Base IV and `key_ops`.
+    #[cfg(any(
+        feature = "crypto-ring",
+        feature = "crypto-aws-lc-rs",
+        feature = "crypto-aes-gcm"
+    ))]
+    pub(crate) fn symmetric(
+        alg: i64,
+        k: &[u8],
+        kid: Option<&[u8]>,
+        base_iv: Option<&[u8]>,
+        key_ops: &Option<Vec<Label>>,
+    ) -> Self {
+        let mut key = Self::with_kty_alg(iana::KeyTypeSymmetric, alg, kid);
+        key.insert(iana::SymmetricKeyParameterK, k.to_vec());
+        if let Some(base_iv) = base_iv {
+            key.insert(iana::KeyParameterBaseIV, base_iv.to_vec());
+        }
+        if let Some(ops) = key_ops {
+            key.set_ops(ops.clone());
+        }
+        key
+    }
+
+    /// Builds a public Ed25519 OKP key carrying `alg`, `crv`, `x`, an
+    /// optional `kid` and `key_ops` = verify.
+    #[cfg(any(
+        feature = "crypto-ring",
+        feature = "crypto-aws-lc-rs",
+        feature = "crypto-ed25519-dalek"
+    ))]
+    pub(crate) fn ed25519_public(alg: i64, x: &[u8], kid: Option<&[u8]>) -> Self {
+        let mut key = Self::with_kty_alg(iana::KeyTypeOKP, alg, kid);
+        key.insert(iana::OKPKeyParameterCrv, iana::EllipticCurveEd25519);
+        key.insert(iana::OKPKeyParameterX, x.to_vec());
+        key.set_ops([iana::KeyOperationVerify]);
+        key
+    }
+
     /// Sets the key operations.
     pub fn set_ops<I, L>(&mut self, ops: I) -> &mut Self
     where
@@ -299,6 +355,7 @@ impl KeySet {
     }
 
     /// Compatibility alias for the RFC-compliant [`KeySet::from_slice`].
+    #[deprecated(note = "`KeySet::from_slice` has the same behavior")]
     pub fn from_slice_lenient(data: &[u8]) -> Result<Self, Error> {
         Self::from_slice(data)
     }

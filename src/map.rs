@@ -135,7 +135,84 @@ impl CoseMap {
 
     /// Encodes the map to canonical (deterministic) CBOR bytes.
     pub fn to_vec(&self) -> Result<Vec<u8>, Error> {
-        Ok(cbor2::to_canonical_vec(self)?)
+        // Produces exactly `cbor2::to_canonical_vec(self)`. That function first
+        // copies the whole map into a dynamic `Value`, which dominates the cost
+        // for large headers such as SD-CWT disclosure lists. Only the entry
+        // order and values containing maps, NaNs or bignums need normalizing;
+        // the ordinary encoder already writes every other value canonically.
+        let mut keys = Vec::new();
+        let mut entries = Vec::with_capacity(self.0.len());
+        for (label, value) in &self.0 {
+            let start = keys.len();
+            match label {
+                Label::Int(value) if *value >= 0 => write_head(&mut keys, 0, value.unsigned_abs()),
+                Label::Int(value) => write_head(&mut keys, 1, (-1 - *value).unsigned_abs()),
+                Label::Text(text) => {
+                    write_head(&mut keys, 3, text.len() as u64);
+                    keys.extend_from_slice(text.as_bytes());
+                }
+            }
+            entries.push((start..keys.len(), value));
+        }
+        entries.sort_unstable_by(|(a, _), (b, _)| keys[a.clone()].cmp(&keys[b.clone()]));
+
+        let mut out = Vec::new();
+        write_head(&mut out, 5, self.0.len() as u64);
+        for (key, value) in entries {
+            out.extend_from_slice(&keys[key]);
+            if needs_canonicalization(value, cbor2::de::DEFAULT_RECURSION_LIMIT) {
+                out.extend_from_slice(&cbor2::to_canonical_vec(value)?);
+            } else {
+                cbor2::to_writer(value, &mut out)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Deserializes a map whose encoding a strict pass already checked for
+    /// duplicate keys at every depth, skipping the second strict pass.
+    pub(crate) fn deserialize_checked<'de, D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        BTreeMap::<Label, Value>::deserialize(deserializer).map(CoseMap)
+    }
+}
+
+/// Writes a CBOR head in its preferred (shortest) form.
+fn write_head(out: &mut Vec<u8>, major: u8, argument: u64) {
+    let major = major << 5;
+    if argument < 24 {
+        out.push(major | argument as u8);
+    } else if argument <= 0xff {
+        out.extend_from_slice(&[major | 24, argument as u8]);
+    } else if argument <= 0xffff {
+        out.push(major | 25);
+        out.extend_from_slice(&(argument as u16).to_be_bytes());
+    } else if argument <= 0xffff_ffff {
+        out.push(major | 26);
+        out.extend_from_slice(&(argument as u32).to_be_bytes());
+    } else {
+        out.push(major | 27);
+        out.extend_from_slice(&argument.to_be_bytes());
+    }
+}
+
+/// Returns whether deterministic encoding of `value` can differ from its
+/// ordinary encoding: maps need sorting, NaNs and bignums normalizing.
+/// Values nested beyond `depth` defer to the deterministic encoder.
+fn needs_canonicalization(value: &Value, depth: usize) -> bool {
+    if depth == 0 {
+        return true;
+    }
+    match value {
+        Value::Map(_) | Value::Tag(2 | 3, _) => true,
+        Value::Float(value) => value.is_nan(),
+        Value::Tag(_, inner) => needs_canonicalization(inner, depth - 1),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| needs_canonicalization(item, depth - 1)),
+        _ => false,
     }
 }
 

@@ -160,11 +160,14 @@ subset.
 - The protected header is captured as raw bytes on decode and reused verbatim
   in the `Sig_structure`/`MAC_structure`/`Enc_structure`, so signatures made
   with non-canonical encodings still verify. Mutating the public protected
-  header after those bytes are prepared invalidates the message state.
+  header after those bytes are prepared invalidates the message state;
+  `Sign1Message::validate_headers` rechecks it explicitly.
 - Decoders enforce protocol wire types, reject duplicate map keys recursively,
   accept semantically equivalent CBOR tag encodings, and require a CWT tag to
   wrap a tagged COSE message. The old `61(claims-map)` form can be read only
   through `Claims::from_slice_legacy_tagged`.
+  `Sign1Message::from_slice_with_limits` applies caller-selected depth, item
+  and definite-length limits to the whole input.
 - Detached payloads are explicit: use `sign_detached*`,
   `compute_detached*`, `verify_detached*`, or `verify_detached_and_decode`.
 - Detached ciphertext is explicit: use `encrypt_detached*` and

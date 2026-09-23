@@ -3,18 +3,20 @@
 use cbor2::Cbor;
 
 use crate::{
-    header::{decode_protected, encode_protected, validate_header_buckets},
+    header::{decode_protected, encode_protected, validate_header_buckets, validate_layer},
     iana, tag, util, Error, Header, Label, Signer, Verifier,
 };
 
 /// The on-the-wire COSE_Signature array: `[protected, unprotected, signature]`.
 // Private wire types are decoded only after `tag::message_body` validates
-// their exact field kinds. Decode byte strings directly into their final buffers.
+// their exact field kinds and rejects duplicate map keys. Decode byte strings
+// directly into their final buffers and header maps without a second pass.
 #[derive(Clone, Debug, PartialEq, Cbor)]
 #[cbor(array)]
 struct SignatureWire {
     #[serde(with = "serde_bytes")]
     protected: Vec<u8>,
+    #[serde(deserialize_with = "crate::header::deserialize_checked")]
     unprotected: Header,
     #[serde(with = "serde_bytes")]
     signature: Vec<u8>,
@@ -26,6 +28,7 @@ struct SignatureWire {
 struct SignWire {
     #[serde(with = "serde_bytes")]
     protected: Vec<u8>,
+    #[serde(deserialize_with = "crate::header::deserialize_checked")]
     unprotected: Header,
     #[serde(with = "serde_bytes")]
     payload: Option<Vec<u8>>,
@@ -114,11 +117,12 @@ impl Signature {
     /// current protected header canonically, which is valid for newly built
     /// signatures.
     pub fn set_signature(&mut self, signature: impl Into<Vec<u8>>) -> Result<(), Error> {
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        if !self.state.initialized() {
-            self.protected_raw = encode_protected(&self.protected)?;
-        }
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        util::sync_protected_raw(
+            &self.protected,
+            &self.unprotected,
+            &mut self.protected_raw,
+            self.state,
+        )?;
         self.signature = signature.into();
         self.state = util::OperationState::Complete;
         Ok(())
@@ -266,11 +270,12 @@ impl SignMessage {
                 signatures.len()
             )));
         }
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        if !self.state.initialized() {
-            self.protected_raw = encode_protected(&self.protected)?;
-        }
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        util::sync_protected_raw(
+            &self.protected,
+            &self.unprotected,
+            &mut self.protected_raw,
+            self.state,
+        )?;
         for (slot, signature) in self.signatures.iter_mut().zip(signatures) {
             slot.set_signature(signature)?;
         }
@@ -335,7 +340,13 @@ impl SignMessage {
                 signer.sign(&tbs)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        self.set_signatures(signatures)
+        // Every header bucket was validated and encoded just above.
+        for (slot, signature) in self.signatures.iter_mut().zip(signatures) {
+            slot.signature = signature;
+            slot.state = util::OperationState::Complete;
+        }
+        self.state = util::OperationState::Complete;
+        Ok(())
     }
 
     /// Signs and encodes the message to tagged COSE_Sign bytes.
@@ -376,21 +387,16 @@ impl SignMessage {
 
     /// Serializes the wire array borrowing this message's buffers.
     fn encode(&self, prefix: &[u8]) -> Result<Vec<u8>, Error> {
-        if !self.state.complete() {
-            return Err(Error::InvalidState(
-                "SignMessage must be signed before encoding".into(),
-            ));
-        }
+        self.state
+            .require_complete("SignMessage must be signed before encoding")?;
         if self.signatures.is_empty() {
             return Err(Error::Custom("SignMessage has no signatures".into()));
         }
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        validate_layer(&self.protected, &self.unprotected, &self.protected_raw)?;
         for sig in &self.signatures {
-            validate_header_buckets(&sig.protected, &sig.unprotected)?;
-            crate::header::validate_protected_state(&sig.protected, &sig.protected_raw)?;
+            validate_layer(&sig.protected, &sig.unprotected, &sig.protected_raw)?;
         }
-        let unprotected = util::canonical_raw(&self.unprotected)?;
+        let unprotected = util::header_raw(&self.unprotected)?;
         let signatures = util::canonical_raw(&SignaturesRef(&self.signatures))?;
         util::encode_prefixed(
             prefix,
@@ -467,11 +473,8 @@ impl SignMessage {
         payload: &[u8],
         external_aad: &[u8],
     ) -> Result<(), Error> {
-        if !self.state.complete() {
-            return Err(Error::InvalidState(
-                "SignMessage must be decoded before verifying".into(),
-            ));
-        }
+        self.state
+            .require_complete("SignMessage must be decoded before verifying")?;
         if verifiers.is_empty() {
             return Err(Error::Custom(
                 "SignMessage requires at least one verifier".into(),
@@ -480,12 +483,10 @@ impl SignMessage {
         if self.signatures.is_empty() {
             return Err(Error::Custom("SignMessage has no signatures".into()));
         }
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        validate_layer(&self.protected, &self.unprotected, &self.protected_raw)?;
 
         for sig in &self.signatures {
-            validate_header_buckets(&sig.protected, &sig.unprotected)?;
-            crate::header::validate_protected_state(&sig.protected, &sig.protected_raw)?;
+            validate_layer(&sig.protected, &sig.unprotected, &sig.protected_raw)?;
             let kid = sig.kid()?;
             let tbs = Self::to_be_signed(
                 &self.protected_raw,

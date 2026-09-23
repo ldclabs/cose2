@@ -1,6 +1,6 @@
 //! Strict CBOR helpers for protocol fields whose wire type matters.
 
-use std::collections::HashSet;
+use std::{borrow::Cow, collections::HashSet};
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -207,9 +207,7 @@ impl<'a> Parser<'a> {
                     Some(length) => Some(self.length(length)?),
                     None => None,
                 };
-                if let Some(pairs) = pairs {
-                    children.reserve(pairs.saturating_mul(2).min(2048));
-                }
+                // Map entries are not retained: no caller inspects them.
                 let mut canonical_keys = self.reject_duplicate_keys.then(HashSet::new);
                 let mut parsed = 0usize;
                 loop {
@@ -222,17 +220,14 @@ impl<'a> Parser<'a> {
                     }
                     let key = self.parse(depth + 1)?;
                     if let Some(canonical_keys) = &mut canonical_keys {
-                        let key_value: Value = cbor2::from_slice(&self.data[key.start..key.end])?;
-                        let canonical = cbor2::to_canonical_vec(&key_value)?;
-                        if !canonical_keys.insert(canonical) {
+                        if !canonical_keys.insert(self.canonical_key(&key)?) {
                             return Err(self.err("duplicate CBOR map key"));
                         }
                     }
-                    children.push(key);
                     if pairs.is_none() && self.data.get(self.pos) == Some(&0xff) {
                         return Err(self.err("indefinite CBOR map has a key without a value"));
                     }
-                    children.push(self.parse(depth + 1)?);
+                    self.parse(depth + 1)?;
                     parsed += 1;
                 }
                 Kind::Map
@@ -262,6 +257,39 @@ impl<'a> Parser<'a> {
             indefinite,
             children,
         })
+    }
+
+    /// Returns the deterministic encoding used to compare map keys.
+    ///
+    /// Integers and definite-length strings whose head is already in preferred
+    /// form are their own deterministic encoding, so they are compared in
+    /// place. Every other key is decoded and re-encoded deterministically.
+    fn canonical_key(&self, key: &Item) -> Result<Cow<'a, [u8]>, Error> {
+        let data: &'a [u8] = self.data;
+        let raw = &data[key.start..key.end];
+        let scalar = matches!(key.kind, Kind::Unsigned | Kind::Negative)
+            || (matches!(key.kind, Kind::Bytes | Kind::Text) && !key.indefinite);
+        if scalar {
+            let head = &raw[..key.content_start - key.start];
+            let argument = match head[0] & 0x1f {
+                additional @ 0..=23 => u64::from(additional),
+                _ => head[1..]
+                    .iter()
+                    .fold(0u64, |value, byte| (value << 8) | u64::from(*byte)),
+            };
+            let preferred_len = match argument {
+                0..=23 => 1,
+                24..=0xff => 2,
+                0x100..=0xffff => 3,
+                0x1_0000..=0xffff_ffff => 5,
+                _ => 9,
+            };
+            if head.len() == preferred_len {
+                return Ok(Cow::Borrowed(raw));
+            }
+        }
+        let value: Value = cbor2::from_slice(raw)?;
+        Ok(Cow::Owned(cbor2::to_canonical_vec(&value)?))
     }
 }
 
@@ -357,8 +385,12 @@ pub(crate) fn decode_optional_bytes(data: &[u8]) -> Result<Option<Vec<u8>>, Erro
     Ok(Some(output))
 }
 
-pub(crate) fn message_body(data: &[u8], expected_tag: u64) -> Result<&[u8], Error> {
-    let item = root(data, CborLimits::default())?;
+pub(crate) fn message_body(
+    data: &[u8],
+    expected_tag: u64,
+    limits: CborLimits,
+) -> Result<&[u8], Error> {
+    let item = root(data, limits)?;
     let mut current = &item;
     if current.kind == Kind::Tag(55799) {
         current = &current.children[0];

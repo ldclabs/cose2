@@ -160,6 +160,7 @@ fn kdf_context_decode_errors_on_truncated_arrays() {
 // ----------------------------------------------------------------------------
 
 #[test]
+#[allow(deprecated)] // Exercises the compatibility alias.
 fn claims_round_trip_integer_keys() {
     let claims = Claims {
         issuer: Some("ldc:ca".into()),
@@ -193,6 +194,7 @@ fn claims_round_trip_integer_keys() {
 }
 
 #[test]
+#[allow(deprecated)] // Exercises the compatibility alias.
 fn claims_omit_absent_fields_and_json() {
     let claims = Claims {
         issuer: Some("iss".into()),
@@ -478,4 +480,31 @@ fn validator_uses_system_clock_when_now_unset() {
         ..Default::default()
     };
     assert!(v.validate(&claims).is_ok());
+}
+
+#[test]
+fn numeric_dates_compare_across_integer_and_float_forms() {
+    use std::cmp::Ordering;
+
+    let compare = |left: NumericDate, right: NumericDate| left.compare(right);
+    assert_eq!(
+        compare(NumericDate::Integer(1), NumericDate::Float(1.0)),
+        Some(Ordering::Equal)
+    );
+    assert_eq!(
+        compare(NumericDate::Float(1.5), NumericDate::Integer(1)),
+        Some(Ordering::Greater)
+    );
+    assert_eq!(
+        compare(NumericDate::Integer(-1), NumericDate::Float(-0.5)),
+        Some(Ordering::Less)
+    );
+    assert_eq!(
+        compare(NumericDate::Float(2.0), NumericDate::Float(3.0)),
+        Some(Ordering::Less)
+    );
+    assert_eq!(
+        compare(NumericDate::Float(f64::NAN), NumericDate::Integer(0)),
+        None
+    );
 }

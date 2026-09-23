@@ -14,7 +14,9 @@ with `cose2::Sign1Message`:
 - `simple(59)` for `redacted_claim_keys`, using `cbor2::Value::Simple`;
 - tag 60 redacted array elements;
 - tag 58 / tag 62 pre-issuance conversion into issued redactions and
-  disclosures;
+  disclosures, rejecting redaction of the registered claims that must stay
+  visible at the claims root (`iss`, `aud`, `exp`, `nbf`, `iat`, `cti`, `cnf`
+  and `cnonce`);
 - Salted Disclosed Claim encoding, decoding, and SHA-256 hashing;
 - Holder and Verifier restoration modes;
 - strict draft-08 validation with configurable input, depth, item, disclosure,

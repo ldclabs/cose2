@@ -1,6 +1,6 @@
 //! Salted disclosures, redaction hashing and plaintext disclosure headers.
 
-use crate::validation::{validate_disclosure_value, validate_text_label};
+use crate::validation::{definite_cbor_limits, validate_disclosure_value, validate_text_label};
 use crate::{
     expect_owned_bytes, label_from_value, value_item_count, ProcessingLimits, ALG_SHA_256,
     HEADER_SD_CLAIMS,
@@ -120,14 +120,7 @@ impl Disclosure {
                 limits.max_disclosure_bytes,
             ));
         }
-        cose2::validate_cbor(
-            &encoded,
-            cose2::CborLimits {
-                max_depth: limits.max_depth,
-                max_items: limits.max_items,
-                require_definite: true,
-            },
-        )?;
+        cose2::validate_cbor(&encoded, definite_cbor_limits(limits))?;
         let value: Value = cbor2::from_slice(&encoded)?;
         let kind = decode_disclosure_value(value)?;
         validate_disclosure_kind(&kind)?;
@@ -152,7 +145,7 @@ impl Disclosure {
 
     /// Encodes the decoded disclosure value canonically.
     pub fn to_canonical_vec(&self) -> Result<Vec<u8>, Error> {
-        Ok(cbor2::to_canonical_vec(&self.to_value())?)
+        encode_kind(&self.kind)
     }
 
     /// Converts this disclosure to its decoded CBOR value.
@@ -161,10 +154,28 @@ impl Disclosure {
     }
 
     fn from_kind(kind: DisclosureKind) -> Result<Self, Error> {
+        Self::from_kind_with_limits(kind, ProcessingLimits::default())
+    }
+
+    /// Validates and canonically encodes a new disclosure under `limits`.
+    pub(super) fn from_kind_with_limits(
+        kind: DisclosureKind,
+        limits: ProcessingLimits,
+    ) -> Result<Self, Error> {
         validate_disclosure_kind(&kind)?;
-        validate_disclosure_value(&kind, ProcessingLimits::default())?;
-        let encoded = cbor2::to_canonical_vec(&kind_to_value(&kind))?;
+        validate_disclosure_value(&kind, limits)?;
+        let encoded = encode_kind(&kind)?;
         Ok(Self { kind, encoded })
+    }
+
+    /// Returns the salt, which construction and decoding validate as 16 bytes.
+    pub(super) fn salt(&self) -> [u8; 16] {
+        let (DisclosureKind::Claim { salt, .. }
+        | DisclosureKind::Element { salt, .. }
+        | DisclosureKind::Decoy { salt }) = &self.kind;
+        salt.as_slice()
+            .try_into()
+            .expect("disclosure salts are validated to 16 bytes")
     }
 
     pub(super) fn item_count(&self) -> Result<usize, Error> {
@@ -293,7 +304,7 @@ pub fn disclosures_from_unprotected_with_limits(
     }
 
     let mut disclosures = Vec::with_capacity(items.len());
-    let mut salts = HashSet::with_capacity(items.len());
+    let mut salts = HashSet::<[u8; 16]>::with_capacity(items.len());
     let mut total_bytes = 0usize;
     let mut remaining_items = limits.max_items - envelope_items;
     for item in items {
@@ -314,12 +325,7 @@ pub fn disclosures_from_unprotected_with_limits(
         let mut disclosure_limits = limits;
         disclosure_limits.max_items = remaining_items;
         let disclosure = Disclosure::from_encoded_with_limits(encoded.clone(), disclosure_limits)?;
-        let salt = match disclosure.kind() {
-            DisclosureKind::Claim { salt, .. }
-            | DisclosureKind::Element { salt, .. }
-            | DisclosureKind::Decoy { salt } => salt,
-        };
-        if !salts.insert(salt.clone()) {
+        if !salts.insert(disclosure.salt()) {
             return Err(Error::verify("duplicate SD-CWT disclosure salt"));
         }
         remaining_items = remaining_items
@@ -342,6 +348,20 @@ pub fn set_disclosures(header: &mut Header, disclosures: &[Disclosure]) {
         .map(|disclosure| Value::Bytes(disclosure.encoded().to_vec()))
         .collect::<Vec<_>>();
     header.insert(HEADER_SD_CLAIMS, Value::Array(values));
+}
+
+/// Encodes a disclosure array canonically without first cloning its value.
+fn encode_kind(kind: &DisclosureKind) -> Result<Vec<u8>, Error> {
+    let encoded = match kind {
+        DisclosureKind::Claim { salt, key, value } => {
+            cbor2::to_canonical_vec(&(Value::Bytes(salt.clone()), value, key))
+        }
+        DisclosureKind::Element { salt, value } => {
+            cbor2::to_canonical_vec(&(Value::Bytes(salt.clone()), value))
+        }
+        DisclosureKind::Decoy { salt } => cbor2::to_canonical_vec(&[Value::Bytes(salt.clone())]),
+    };
+    Ok(encoded?)
 }
 
 fn kind_to_value(kind: &DisclosureKind) -> Value {

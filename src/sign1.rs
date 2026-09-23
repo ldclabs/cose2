@@ -3,18 +3,20 @@
 use cbor2::Cbor;
 
 use crate::{
-    header::{decode_protected, encode_protected, validate_header_buckets},
-    iana, tag, util, Error, Header, Label, Signer, Verifier,
+    header::{decode_protected, validate_header_buckets, validate_layer},
+    iana, tag, util, CborLimits, Error, Header, Label, Signer, Verifier,
 };
 
 /// The on-the-wire COSE_Sign1 array: `[protected, unprotected, payload, signature]`.
 // Private wire types are decoded only after `tag::message_body` validates
-// their exact field kinds. Decode byte strings directly into their final buffers.
+// their exact field kinds and rejects duplicate map keys. Decode byte strings
+// directly into their final buffers and header maps without a second pass.
 #[derive(Clone, Debug, PartialEq, Cbor)]
 #[cbor(tag = 18, array)]
 struct Sign1Wire {
     #[serde(with = "serde_bytes")]
     protected: Vec<u8>,
+    #[serde(deserialize_with = "crate::header::deserialize_checked")]
     unprotected: Header,
     #[serde(with = "serde_bytes")]
     payload: Option<Vec<u8>>,
@@ -114,11 +116,8 @@ impl Sign1Message {
         alg: Option<Label>,
         kid: Option<&[u8]>,
     ) -> Result<(), Error> {
-        util::ensure_protected_alg(&mut self.protected, &mut self.unprotected, alg)?;
-        util::ensure_unprotected_kid(&self.protected, &mut self.unprotected, kid)?;
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        let protected_raw = encode_protected(&self.protected)?;
-        self.protected_raw = protected_raw;
+        self.protected_raw =
+            util::prepare_headers(&mut self.protected, &mut self.unprotected, alg, kid)?;
         self.state = util::OperationState::Prepared;
         self.signature.clear();
         Ok(())
@@ -132,11 +131,12 @@ impl Sign1Message {
     /// protected bytes were prepared yet, this method serializes the current
     /// protected header canonically, which is valid for newly built messages.
     pub fn set_signature(&mut self, signature: impl Into<Vec<u8>>) -> Result<(), Error> {
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        if !self.state.initialized() {
-            self.protected_raw = encode_protected(&self.protected)?;
-        }
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        util::sync_protected_raw(
+            &self.protected,
+            &self.unprotected,
+            &mut self.protected_raw,
+            self.state,
+        )?;
         self.signature = signature.into();
         self.state = util::OperationState::Complete;
         Ok(())
@@ -147,8 +147,10 @@ impl Sign1Message {
         self.prepare_signature_headers(signer.alg(), signer.kid())?;
         let payload = util::require_embedded_payload(&self.payload, "Sign1Message::sign")?;
         let tbs = Self::to_be_signed(&self.protected_raw, external_aad.unwrap_or(&[]), payload)?;
-        let signature = signer.sign(&tbs)?;
-        self.set_signature(signature)
+        // The headers were validated and encoded just above.
+        self.signature = signer.sign(&tbs)?;
+        self.state = util::OperationState::Complete;
+        Ok(())
     }
 
     /// Signs a detached payload.
@@ -167,8 +169,8 @@ impl Sign1Message {
             external_aad.unwrap_or(&[]),
             detached_payload,
         )?;
-        let signature = signer.sign(&tbs)?;
-        self.set_signature(signature)?;
+        self.signature = signer.sign(&tbs)?;
+        self.state = util::OperationState::Complete;
         self.payload = None;
         Ok(())
     }
@@ -211,14 +213,10 @@ impl Sign1Message {
 
     /// Serializes the wire array borrowing this message's buffers.
     fn encode(&self, prefix: &[u8]) -> Result<Vec<u8>, Error> {
-        if !self.state.complete() {
-            return Err(Error::InvalidState(
-                "Sign1Message must be signed before encoding".into(),
-            ));
-        }
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
-        let unprotected = util::canonical_raw(&self.unprotected)?;
+        self.state
+            .require_complete("Sign1Message must be signed before encoding")?;
+        self.validate_headers()?;
+        let unprotected = util::header_raw(&self.unprotected)?;
         util::encode_prefixed(
             prefix,
             &(
@@ -232,7 +230,16 @@ impl Sign1Message {
 
     /// Decodes a COSE_Sign1 message (tagged or untagged) without verifying it.
     pub fn from_slice(data: &[u8]) -> Result<Self, Error> {
-        let body = tag::message_body(data, Self::TAG)?;
+        Self::from_slice_with_limits(data, CborLimits::default())
+    }
+
+    /// Decodes a COSE_Sign1 message with caller-selected CBOR limits.
+    ///
+    /// `limits` applies to the strict pass over the complete input; set
+    /// [`CborLimits::require_definite`] to reject indefinite-length items.
+    /// The embedded protected header is always decoded with default limits.
+    pub fn from_slice_with_limits(data: &[u8], limits: CborLimits) -> Result<Self, Error> {
+        let body = tag::message_body_with_limits(data, Self::TAG, limits)?;
         let wire: Sign1Wire = cbor2::from_slice(body)?;
         let protected = decode_protected(&wire.protected)?;
         validate_header_buckets(&protected, &wire.unprotected)?;
@@ -255,11 +262,8 @@ impl Sign1Message {
         verifier: &dyn Verifier,
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        if !self.state.complete() {
-            return Err(Error::InvalidState(
-                "Sign1Message must be decoded before verifying".into(),
-            ));
-        }
+        self.state
+            .require_complete("Sign1Message must be decoded before verifying")?;
         let payload = util::require_embedded_payload(&self.payload, "Sign1Message::verify")?;
         self.verify_payload(verifier, payload, external_aad.unwrap_or(&[]))
     }
@@ -271,11 +275,8 @@ impl Sign1Message {
         detached_payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        if !self.state.complete() {
-            return Err(Error::InvalidState(
-                "Sign1Message must be decoded before verifying".into(),
-            ));
-        }
+        self.state
+            .require_complete("Sign1Message must be decoded before verifying")?;
         if self.payload.is_some() {
             return Err(Error::Custom(
                 "Sign1Message carries an embedded payload; use verify".into(),
@@ -290,8 +291,7 @@ impl Sign1Message {
         payload: &[u8],
         external_aad: &[u8],
     ) -> Result<(), Error> {
-        validate_header_buckets(&self.protected, &self.unprotected)?;
-        crate::header::validate_protected_state(&self.protected, &self.protected_raw)?;
+        self.validate_headers()?;
         self.protected
             .ensure_crit_understood(verifier.understood_critical_headers())?;
         util::check_protected_alg(&self.protected, &self.unprotected, verifier.alg())?;
@@ -330,6 +330,18 @@ impl Sign1Message {
     /// Returns the protected-header bytes used in the signature structure.
     pub fn protected_raw(&self) -> &[u8] {
         &self.protected_raw
+    }
+
+    /// Rechecks the public header buckets of a signed or decoded message.
+    ///
+    /// Header fields are public and may change after decoding or signing.
+    /// This fails when the buckets are no longer valid together, or when
+    /// [`protected`](Self::protected) no longer denotes
+    /// [`protected_raw`](Self::protected_raw). Verification and encoding
+    /// perform the same check; call this before reading headers of a message
+    /// that was verified earlier and may have been modified since.
+    pub fn validate_headers(&self) -> Result<(), Error> {
+        validate_layer(&self.protected, &self.unprotected, &self.protected_raw)
     }
 
     /// Re-exports the on-the-wire CBOR tag for COSE_Sign1.
