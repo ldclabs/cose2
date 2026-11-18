@@ -1,6 +1,6 @@
 //! Conversion of pre-issuance redaction and decoy requests.
 
-use crate::validation::{validate_root_disclosure_key, validate_safe_value};
+use crate::validation::{validate_confirmation_key, validate_root_disclosure_key};
 use crate::{
     is_redacted_claim_keys_label, label_from_value, redacted_claim_keys_label, redacted_element,
     Disclosure, DisclosureKind, DisclosureSet, ProcessingLimits, RedactionHasher, TraversalBudget,
@@ -218,7 +218,7 @@ fn issue_map(
                     )));
                 }
                 let value = if depth == 0 && key == Value::from(iana::CWTClaimCnf) {
-                    validate_safe_value(&value, &mut context.budget, depth + 1)?;
+                    validate_confirmation_key(&value, &mut context.budget, depth + 1)?;
                     value
                 } else {
                     issue_value(value, context, depth + 1)?

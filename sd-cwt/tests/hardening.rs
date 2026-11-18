@@ -616,6 +616,11 @@ fn verifier_requires_a_subject_when_no_root_claim_remains_hidden() {
 fn confirmation_key_contents_must_stay_visible() {
     let marker = Value::Tag(TO_BE_REDACTED_TAG, Box::new(Value::from("key")));
     let cnf = Value::from(iana::CWTClaimCnf);
+    let malformed = Value::Map(vec![(cnf.clone(), Value::Null)]);
+    assert!(matches!(
+        issue_from_preissuance(malformed, &mut counting_salts(), &Sha256RedactionHasher),
+        Err(Error::UnexpectedType(_))
+    ));
     let preissued = Value::Map(vec![(
         cnf.clone(),
         Value::Map(vec![(marker, Value::from(1))]),

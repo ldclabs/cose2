@@ -437,7 +437,18 @@ fn validate_safe_headers(
     Ok(())
 }
 
-pub(super) fn validate_safe_value(
+pub(super) fn validate_confirmation_key(
+    value: &Value,
+    budget: &mut TraversalBudget,
+    depth: usize,
+) -> Result<(), Error> {
+    if !matches!(value, Value::Map(_)) {
+        return Err(Error::UnexpectedType("SD-CWT cnf must be a map".into()));
+    }
+    validate_safe_value(value, budget, depth)
+}
+
+fn validate_safe_value(
     value: &Value,
     budget: &mut TraversalBudget,
     depth: usize,
@@ -701,9 +712,16 @@ fn claim_values_match(
         (Value::Bytes(_), Value::Bytes(_))
         | (Value::Text(_), Value::Text(_))
         | (Value::Integer(_), Value::Integer(_)) => Ok(left == right),
-        (Value::Tag(left_tag, left), Value::Tag(right_tag, right)) if left_tag == right_tag => {
+        (Value::Tag(left_tag, left), Value::Tag(right_tag, right)) => {
+            if left_tag != right_tag {
+                return Ok(false);
+            }
             claim_values_match(left, right, budget)
         }
+        // Different shapes cannot match. Avoid encoding large values at each
+        // possible alignment in a partially disclosed array.
+        (Value::Map(_) | Value::Array(_) | Value::Bytes(_) | Value::Text(_), _)
+        | (_, Value::Map(_) | Value::Array(_) | Value::Bytes(_) | Value::Text(_)) => Ok(false),
         _ => Ok(cbor2::to_canonical_vec(left)? == cbor2::to_canonical_vec(right)?),
     }
 }
@@ -845,11 +863,6 @@ fn validate_registered_claim_types(maps: &[&[(Value, Value)]]) -> Result<(), Err
             "SD-CWT cti must be a byte string".into(),
         ));
     }
-    if claim_value(maps, cose2::iana::CWTClaimCnf)
-        .is_some_and(|value| !matches!(value, Value::Map(_)))
-    {
-        return Err(Error::UnexpectedType("SD-CWT cnf must be a map".into()));
-    }
     if claim_value(maps, CWT_CLAIM_CNONCE).is_some_and(|value| !matches!(value, Value::Bytes(_))) {
         return Err(Error::UnexpectedType(
             "SD-CWT cnonce must be a byte string".into(),
@@ -881,10 +894,8 @@ fn validate_required_claims(
             None => return Err(Error::custom("SD-CWT is missing required iss claim")),
         }
     }
-    match claim_value(maps, cose2::iana::CWTClaimCnf) {
-        Some(Value::Map(_)) => {}
-        Some(_) => return Err(Error::UnexpectedType("SD-CWT cnf must be a map".into())),
-        None => return Err(Error::custom("SD-CWT is missing required cnf claim")),
+    if claim_value(maps, cose2::iana::CWTClaimCnf).is_none() {
+        return Err(Error::custom("SD-CWT is missing required cnf claim"));
     }
     if !matches!(
         claim_value(maps, cose2::iana::CWTClaimSub),

@@ -34,16 +34,16 @@ policy for you. Issuers provide 16-byte salts; applications still use
 
 ```toml
 [dependencies]
-cbor2 = "1.1.5"
-cose2 = "0.5.2"
-sd-cwt = "0.3.1"
+cbor2 = "1.2"
+cose2 = "0.6"
+sd-cwt = "0.4"
 ```
 
 When working from this repository:
 
 ```toml
 [dependencies]
-cbor2 = "1.1.5"
+cbor2 = "1.2"
 cose2 = { path = ".." }
 sd-cwt = { path = "../sd-cwt" }
 ```

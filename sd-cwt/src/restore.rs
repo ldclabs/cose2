@@ -1,8 +1,8 @@
 //! Disclosure matching, bounded restoration and removal of undisclosed claims.
 
 use crate::validation::{
-    definite_cbor_limits, protected_cwt_claims, validate_protected_encoding,
-    validate_root_disclosure_key, validate_safe_value,
+    definite_cbor_limits, protected_cwt_claims, validate_confirmation_key,
+    validate_protected_encoding, validate_root_disclosure_key,
 };
 use crate::{
     default_hasher_for_sd_alg, disclosures_from_unprotected, expect_owned_bytes,
@@ -383,8 +383,7 @@ fn restore_map(
             && depth == 0
             && key == Value::from(cose2::iana::CWTClaimCnf)
         {
-            // The confirmation key is a draft-08 safe_map at both claims roots.
-            validate_safe_value(&value, budget, depth + 1)?;
+            validate_confirmation_key(&value, budget, depth + 1)?;
             value
         } else {
             restore_value(value, pending, mode, stats, budget, depth + 1)?

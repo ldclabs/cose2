@@ -88,6 +88,25 @@ fn external_multisignatures_bind_payload_mode_and_signer_order() {
 }
 
 #[test]
+fn external_multisignatures_bind_unprotected_signer_algorithms() {
+    let mut first = cose2::Signature::new();
+    first.unprotected.set_alg(iana::AlgorithmEd25519);
+    let mut second = cose2::Signature::new();
+    second.unprotected.set_alg(iana::AlgorithmESP256);
+    let mut msg = SignMessage::new(Some(vec![1]));
+    msg.prepare_signatures(vec![first, second], None).unwrap();
+
+    let results = || [vec![1], vec![2]];
+    msg.signatures.swap(0, 1);
+    assert!(matches!(
+        msg.set_signatures(results()),
+        Err(Error::InvalidState(_))
+    ));
+    msg.signatures.swap(0, 1);
+    msg.set_signatures(results()).unwrap();
+}
+
+#[test]
 fn external_encryption_binds_plaintext_and_nonce_headers() {
     macro_rules! check {
         ($message:expr) => {{

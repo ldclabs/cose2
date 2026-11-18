@@ -137,6 +137,7 @@ impl Signature {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PreparedSigner {
     protected: Vec<u8>,
+    unprotected_alg: Option<Label>,
     kid: Option<Vec<u8>>,
 }
 
@@ -157,6 +158,7 @@ impl PreparedSignatures {
         for (expected, slot) in self.signers.iter().zip(&message.signatures) {
             if !slot.state.initialized()
                 || expected.protected != slot.protected_raw
+                || expected.unprotected_alg != slot.unprotected.alg()?
                 || expected.kid.as_deref() != slot.kid()?
             {
                 return Err(Error::invalid_state(
@@ -268,6 +270,7 @@ impl SignMessage {
             )?);
             signers.push(PreparedSigner {
                 protected: signature.protected_raw.clone(),
+                unprotected_alg: signature.unprotected.alg()?,
                 kid: signature.kid()?.map(ToOwned::to_owned),
             });
         }

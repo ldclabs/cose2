@@ -20,7 +20,7 @@ string and array forms. Time fields use `Option<NumericDate>`, retaining
 integer, fractional, and pre-epoch values. Integer construction uses
 `NumericDate::from(value)`; finite floats use `NumericDate::from_f64(value)?`.
 
-In 0.5.2, JSON reserves the seven registered claim names and canonical decimal
+Starting in 0.6, JSON reserves the seven registered claim names and canonical decimal
 integer names. For example, CBOR can carry both claim 4 and a private text
 label `"exp"`. Serializing this pair as JSON returns an error. Numeric JSON
 object names decode to integer labels, and numeric aliases for registered
