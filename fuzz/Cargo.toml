@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-cose2 = { path = "..", features = ["crypto-ring", "crypto-ed25519-dalek", "crypto-aes-gcm"] }
+cose2 = { path = ".." }
 sd-cwt = { path = "../sd-cwt" }
 
 [[bin]]

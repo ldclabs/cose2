@@ -29,6 +29,7 @@ use backend::{
     signature::{KeyPair, RsaParameters},
 };
 
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::{iana, Encryptor, Error, Key, Label, Macer, Signer, Verifier};
@@ -76,20 +77,18 @@ impl RingMacer {
     pub fn from_cose_key(key: &Key) -> Result<Self, Error> {
         key.require_integer_kty(iana::KeyTypeSymmetric)?;
         let alg = key.required_integer_alg("crypto backend")?;
+        let ops = key.ops()?;
+        crate::util::require_key_ops(
+            &ops,
+            &[iana::KeyOperationMacCreate, iana::KeyOperationMacVerify],
+            "MAC creation or verification",
+        )?;
         let mut macer = Self::new(
             alg,
             key.required_bytes(iana::SymmetricKeyParameterK, "k")?,
             key.kid_owned()?,
         )?;
-        macer.key_ops = key.ops()?;
-        if !crate::util::key_ops_allow(
-            &macer.key_ops,
-            &[iana::KeyOperationMacCreate, iana::KeyOperationMacVerify],
-        ) {
-            return Err(Error::custom(
-                "COSE_Key key_ops permits neither MAC create nor MAC verify",
-            ));
-        }
+        macer.key_ops = ops;
         Ok(macer)
     }
 
@@ -135,7 +134,7 @@ impl Macer for RingMacer {
             return Err(Error::verify("HMAC tag length mismatch"));
         }
         let expected = hmac::sign(self.key.as_ref(), data);
-        if constant_time_eq(&expected.as_ref()[..self.tag_len], tag) {
+        if bool::from(expected.as_ref()[..self.tag_len].ct_eq(tag)) {
             Ok(())
         } else {
             Err(Error::verify("HMAC tag mismatch"))
@@ -190,21 +189,19 @@ impl RingEncryptor {
     pub fn from_cose_key(key: &Key) -> Result<Self, Error> {
         key.require_integer_kty(iana::KeyTypeSymmetric)?;
         let alg = key.required_integer_alg("crypto backend")?;
+        let ops = key.ops()?;
+        crate::util::require_key_ops(
+            &ops,
+            &[iana::KeyOperationEncrypt, iana::KeyOperationDecrypt],
+            "encryption or decryption",
+        )?;
         let mut encryptor = Self::new(
             alg,
             key.required_bytes(iana::SymmetricKeyParameterK, "k")?,
             key.kid_owned()?,
         )?;
         encryptor.base_iv = key.base_iv()?.map(ToOwned::to_owned);
-        encryptor.key_ops = key.ops()?;
-        if !crate::util::key_ops_allow(
-            &encryptor.key_ops,
-            &[iana::KeyOperationEncrypt, iana::KeyOperationDecrypt],
-        ) {
-            return Err(Error::custom(
-                "COSE_Key key_ops permits neither encryption nor decryption",
-            ));
-        }
+        encryptor.key_ops = ops;
         Ok(encryptor)
     }
 
@@ -449,22 +446,20 @@ impl RingSigner {
         })
     }
 
-    /// Returns the public key bytes for Ed25519 and ECDSA signers.
+    /// Returns the public key as raw Ed25519 bytes, an uncompressed SEC1
+    /// point for ECDSA, or a PKCS#1 DER `RSAPublicKey` for RSA.
     pub fn public_key(&self) -> Option<&[u8]> {
         match &self.key {
             RingSigningKey::Ed25519(key) => Some(key.public_key().as_ref()),
             RingSigningKey::Ecdsa(key) => Some(key.public_key().as_ref()),
-            RingSigningKey::Rsa { .. } => None,
+            RingSigningKey::Rsa { key_pair, .. } => Some(key_pair.public_key().as_ref()),
         }
     }
 
     /// Exports the *public* COSE_Key for this signer.
     ///
-    /// The backends do not expose the private scalar, so the result carries
-    /// only public parameters (`x`, and for EC2 also `y`) and can be consumed
-    /// by [`RingVerifier::from_cose_key`]. RSA signers are unsupported because
-    /// the backends expose no public modulus for them; use the raw modulus and
-    /// exponent with [`RingVerifier::rsa_components`] instead.
+    /// The result carries the public parameters and permits verification with
+    /// [`RingVerifier::from_cose_key`].
     pub fn to_cose_key(&self) -> Result<Key, Error> {
         match &self.key {
             RingSigningKey::Ed25519(key) => Ok(Key::ed25519_public(
@@ -475,9 +470,10 @@ impl RingSigner {
             RingSigningKey::Ecdsa(key) => {
                 ec2_public_cose_key(self.alg, key.public_key().as_ref(), self.kid.as_deref())
             }
-            RingSigningKey::Rsa { .. } => Err(Error::custom(
-                "cannot export a COSE_Key from an RSA RingSigner: the backend exposes no public key",
-            )),
+            RingSigningKey::Rsa { key_pair, .. } => {
+                let (n, e) = rsa_public_key_from_der(key_pair.public_key().as_ref())?;
+                Ok(rsa_public_cose_key(self.alg, n, e, self.kid.as_deref()))
+            }
         }
     }
 
@@ -753,9 +749,7 @@ impl RingVerifier {
 
     /// Exports this verifier as a public COSE_Key.
     ///
-    /// The result round-trips through [`RingVerifier::from_cose_key`]. RSA
-    /// verifiers built from a DER public key have their PKCS#1 `RSAPublicKey`
-    /// parsed back into the COSE `n` and `e` parameters.
+    /// The result round-trips through [`RingVerifier::from_cose_key`].
     pub fn to_cose_key(&self) -> Result<Key, Error> {
         match &self.key {
             RingVerificationKey::Ed25519(public_key) => Ok(Key::ed25519_public(
@@ -771,7 +765,7 @@ impl RingVerifier {
             }
             RingVerificationKey::RsaDer(der) => {
                 let (n, e) = rsa_public_key_from_der(der)?;
-                Ok(rsa_public_cose_key(self.alg, &n, &e, self.kid.as_deref()))
+                Ok(rsa_public_cose_key(self.alg, n, e, self.kid.as_deref()))
             }
         }
     }
@@ -972,7 +966,7 @@ fn der_unsigned_integer(value: &[u8], out: &mut Vec<u8>) {
         magnitude = &magnitude[1..];
     }
     out.push(0x02); // INTEGER
-                    // Prepend 0x00 when the high bit is set so the value stays positive.
+                    // A leading zero keeps magnitudes with the high bit set positive.
     if magnitude.first().is_some_and(|&b| b & 0x80 != 0) {
         der_length(magnitude.len() + 1, out);
         out.push(0x00);
@@ -998,7 +992,7 @@ fn der_length(len: usize, out: &mut Vec<u8>) {
 /// Parses a PKCS#1 `RSAPublicKey` DER (RFC 8017 §A.1.1),
 /// `SEQUENCE { modulus INTEGER, publicExponent INTEGER }`, returning the
 /// unsigned big-endian magnitudes of `n` and `e`.
-fn rsa_public_key_from_der(der: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Error> {
+fn rsa_public_key_from_der(der: &[u8]) -> Result<(&[u8], &[u8]), Error> {
     let invalid = || Error::custom("invalid RSA public key DER");
     let (seq, trailing) = der_take_tlv(der, 0x30).ok_or_else(invalid)?;
     if !trailing.is_empty() {
@@ -1010,8 +1004,8 @@ fn rsa_public_key_from_der(der: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Error> {
         return Err(invalid());
     }
     Ok((
-        der_integer_magnitude(n).to_vec(),
-        der_integer_magnitude(e).to_vec(),
+        der_integer_magnitude(n).ok_or_else(invalid)?,
+        der_integer_magnitude(e).ok_or_else(invalid)?,
     ))
 }
 
@@ -1042,6 +1036,9 @@ fn der_read_length(input: &[u8]) -> Option<(usize, &[u8])> {
         return None;
     }
     let (bytes, rest) = rest.split_at(count);
+    if bytes[0] == 0 || (count == 1 && bytes[0] < 0x80) {
+        return None;
+    }
     let mut len = 0usize;
     for &b in bytes {
         len = (len << 8) | b as usize;
@@ -1051,22 +1048,12 @@ fn der_read_length(input: &[u8]) -> Option<(usize, &[u8])> {
 
 /// Strips a DER sign byte (a single leading `0x00`) to yield the unsigned
 /// big-endian magnitude used by COSE RSA parameters.
-fn der_integer_magnitude(bytes: &[u8]) -> &[u8] {
-    match bytes.split_first() {
-        Some((&0x00, rest)) if !rest.is_empty() => rest,
-        _ => bytes,
+fn der_integer_magnitude(bytes: &[u8]) -> Option<&[u8]> {
+    match bytes {
+        [0, 0x80..=0xff, ..] => Some(&bytes[1..]),
+        [1..=0x7f, ..] => Some(bytes),
+        _ => None,
     }
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 fn unsupported_alg(operation: &str, alg: i64) -> Error {
@@ -1182,6 +1169,17 @@ mod tests {
         assert!(rsa_public_key_from_der(&trailing).is_err());
         assert!(rsa_public_key_from_der(&[0x31, 0x00]).is_err());
         assert!(rsa_public_key_from_der(&[0x30, 0x05, 0x02, 0x02, 0x00]).is_err());
+        for invalid in [
+            "3006020180020103",   // negative modulus
+            "3006020100020103",   // zero modulus
+            "30050200020103",     // empty modulus
+            "300702020001020103", // redundant sign byte
+            "308106020101020103", // non-minimal length
+        ] {
+            let der = hex::decode(invalid).unwrap();
+            let verifier = super::RingVerifier::rsa_der(iana::AlgorithmRS256, &der, None).unwrap();
+            assert!(verifier.to_cose_key().is_err());
+        }
     }
 
     #[test]

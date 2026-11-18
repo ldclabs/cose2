@@ -23,6 +23,7 @@ def is_published(name: str, version: str) -> bool:
             published = json.load(response)["version"]
     except HTTPError as error:
         if error.code == 404:
+            error.close()
             return False
         raise
     if published["crate"] != name or published["num"] != version:
@@ -37,15 +38,17 @@ def publish(name: str, version: str, dry_run: bool = False) -> None:
         if is_published(name, version):
             print(f"Skipping {name}@{version}: already published", flush=True)
             return
-        print(f"Publishing {name}@{version} (attempt {attempt}/5)", flush=True)
         if dry_run:
+            print(f"Would publish {name}@{version}", flush=True)
             return
+        print(f"Publishing {name}@{version} (attempt {attempt}/5)", flush=True)
         result = subprocess.run(["cargo", "publish", "--locked", "-p", name], cwd=ROOT)
         if result.returncode == 0:
             return
         if attempt < 5:
             time.sleep(20)
-    raise RuntimeError(f"failed to publish {name}@{version}")
+    if not is_published(name, version):
+        raise RuntimeError(f"failed to publish {name}@{version}")
 
 
 def main() -> None:

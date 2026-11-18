@@ -274,13 +274,15 @@ fn profile_content_type_and_sd_critical_headers_are_processed() {
 
 #[test]
 fn validator_rejects_wrong_algorithm_unsafe_headers_and_weak_aead() {
-    let mut nonsignature = message(valid_claims());
-    nonsignature.protected.set_alg(iana::AlgorithmA128GCM);
-    nonsignature.set_signature(vec![0u8; 16]).unwrap();
-    let decoded = Sign1Message::from_slice(&nonsignature.to_vec().unwrap()).unwrap();
-    assert!(SdCwtValidator::default()
-        .validate_and_restore(&decoded, RestoreMode::Holder)
-        .is_err());
+    for alg in [iana::AlgorithmA128GCM, iana::AlgorithmHSS_LMS] {
+        let mut msg = message(valid_claims());
+        msg.protected.set_alg(alg);
+        msg.set_signature(vec![0u8; 16]).unwrap();
+        let decoded = Sign1Message::from_slice(&msg.to_vec().unwrap()).unwrap();
+        assert!(SdCwtValidator::default()
+            .validate_and_restore(&decoded, RestoreMode::Holder)
+            .is_err());
+    }
 
     let mut unsafe_header = message(valid_claims());
     unsafe_header.protected.insert(
@@ -581,6 +583,180 @@ fn hidden_claim(disclosure: &Disclosure) -> Value {
 }
 
 #[test]
+fn verifier_requires_a_subject_when_no_root_claim_remains_hidden() {
+    let Value::Map(mut claims) = valid_claims() else {
+        unreachable!()
+    };
+    claims.retain(|(key, _)| *key != Value::from(iana::CWTClaimSub));
+    for disclosure in [
+        Disclosure::claim(vec![1; 16], "name", "Alice").unwrap(),
+        Disclosure::decoy(vec![2; 16]).unwrap(),
+        Disclosure::claim(vec![3; 16], iana::CWTClaimSub, "subject").unwrap(),
+    ] {
+        for in_header in [false, true] {
+            let markers = hidden_claim(&disclosure);
+            let mut msg = message(Value::Map(claims.clone()));
+            if in_header {
+                msg.protected.insert(HEADER_CWT_CLAIMS, markers);
+            } else if let Value::Map(mut root) = markers {
+                root.extend_from_slice(&claims);
+                msg.payload = Some(cbor2::to_vec(&Value::Map(root)).unwrap());
+            }
+            validate_message(msg.clone(), RestoreMode::Verifier).unwrap();
+            set_disclosures(&mut msg.unprotected, std::slice::from_ref(&disclosure));
+            let is_subject = matches!(disclosure.kind(), sd_cwt::DisclosureKind::Claim { key, .. } if key == &Label::Int(iana::CWTClaimSub));
+            for mode in [RestoreMode::Holder, RestoreMode::Verifier] {
+                assert_eq!(validate_message(msg.clone(), mode).is_ok(), is_subject);
+            }
+        }
+    }
+}
+
+#[test]
+fn confirmation_key_contents_must_stay_visible() {
+    let marker = Value::Tag(TO_BE_REDACTED_TAG, Box::new(Value::from("key")));
+    let cnf = Value::from(iana::CWTClaimCnf);
+    let preissued = Value::Map(vec![(
+        cnf.clone(),
+        Value::Map(vec![(marker, Value::from(1))]),
+    )]);
+    assert!(
+        issue_from_preissuance(preissued, &mut counting_salts(), &Sha256RedactionHasher).is_err()
+    );
+
+    let disclosure = Disclosure::claim(vec![1; 16], "key", 1).unwrap();
+    let Value::Map(mut claims) = valid_claims() else {
+        unreachable!()
+    };
+    claims.retain(|(key, _)| key != &cnf);
+    for in_header in [false, true] {
+        let mut msg = message(Value::Map(claims.clone()));
+        let nested = (cnf.clone(), hidden_claim(&disclosure));
+        if in_header {
+            msg.protected
+                .insert(HEADER_CWT_CLAIMS, Value::Map(vec![nested]));
+        } else {
+            let mut payload = claims.clone();
+            payload.push(nested);
+            msg.payload = Some(cbor2::to_vec(&Value::Map(payload)).unwrap());
+        }
+        set_disclosures(&mut msg.unprotected, std::slice::from_ref(&disclosure));
+        assert!(validate_message(msg, RestoreMode::Holder).is_err());
+    }
+}
+
+#[test]
+fn disclosure_bounds_cover_headers_and_reassembled_maps() {
+    let a = Disclosure::claim(vec![1; 16], "a", 1).unwrap();
+    let b = Disclosure::claim(vec![2; 16], "b", 2).unwrap();
+    let markers = Value::Array(vec![
+        a.redacted_hash(&Sha256RedactionHasher).into(),
+        b.redacted_hash(&Sha256RedactionHasher).into(),
+    ]);
+    let issued = Value::Map(vec![
+        (Value::from("visible"), Value::Null),
+        (redacted_claim_keys_label(), markers),
+    ]);
+    let limits = ProcessingLimits {
+        max_container_entries: 2,
+        ..Default::default()
+    };
+    assert!(matches!(
+        restore_with_limits(
+            issued,
+            [a.clone(), b.clone()],
+            &Sha256RedactionHasher,
+            RestoreMode::Holder,
+            limits
+        ),
+        Err(Error::LimitExceeded { .. })
+    ));
+    assert!(matches!(
+        Disclosure::from_encoded_with_limits(a.encoded(), limits),
+        Err(Error::LimitExceeded { .. })
+    ));
+
+    let mut msg = message(valid_claims());
+    let Value::Map(mut claims) = valid_claims() else {
+        unreachable!()
+    };
+    let Value::Map(hidden) = hidden_claim(&a) else {
+        unreachable!()
+    };
+    claims.extend(hidden);
+    msg.payload = Some(cbor2::to_vec(&Value::Map(claims)).unwrap());
+    set_disclosures(&mut msg.unprotected, std::slice::from_ref(&a));
+    let encrypted = AeadEncryptedDisclosure {
+        nonce: vec![1; 12],
+        ciphertext: vec![2; 1],
+        tag: vec![3; 16],
+        key_context: None,
+    };
+    set_aead_encrypted_disclosures(&mut msg.unprotected, &[encrypted]);
+    let encoded = msg.sign_and_encode(&Toy, None).unwrap();
+    for limits in [
+        ProcessingLimits {
+            max_disclosures: 1,
+            ..Default::default()
+        },
+        ProcessingLimits {
+            max_disclosure_bytes: a.encoded().len() + 28,
+            ..Default::default()
+        },
+    ] {
+        let options = SdCwtValidationOptions {
+            limits,
+            ..Default::default()
+        };
+        assert!(matches!(
+            verify_validate_and_restore_sd_cwt(
+                &Toy,
+                &encoded,
+                None,
+                RestoreMode::Verifier,
+                options
+            ),
+            Err(Error::LimitExceeded { .. })
+        ));
+    }
+    let limits = ProcessingLimits {
+        max_disclosures: 2,
+        max_disclosure_bytes: a.encoded().len() + 29,
+        ..Default::default()
+    };
+    let opts = SdCwtValidationOptions {
+        limits,
+        ..Default::default()
+    };
+    verify_validate_and_restore_sd_cwt(&Toy, &encoded, None, RestoreMode::Verifier, opts).unwrap();
+}
+
+#[test]
+fn declared_hash_algorithm_and_unmatched_hash_lengths_are_checked() {
+    let mut msg = message(valid_claims());
+    set_sd_alg(&mut msg.protected, iana::AlgorithmSHA_512);
+    msg.sign(&Toy, None).unwrap();
+    assert!(matches!(
+        sd_cwt::restore_payload_with_disclosures(
+            &msg,
+            [],
+            &Sha256RedactionHasher,
+            RestoreMode::Verifier
+        ),
+        Err(Error::AlgorithmMismatch { .. })
+    ));
+    for value in [
+        Value::Map(vec![(
+            redacted_claim_keys_label(),
+            Value::Array(vec![Value::Bytes(vec![1])]),
+        )]),
+        Value::Array(vec![redacted_element(vec![1])]),
+    ] {
+        assert!(restore_for_verifier(value, [], &Sha256RedactionHasher).is_err());
+    }
+}
+
+#[test]
 fn matching_claims_are_compared_after_nested_disclosures_are_restored() {
     let first = Disclosure::claim(vec![31; 16], "name", "Alice").unwrap();
     let second = Disclosure::claim(vec![32; 16], "name", "Alice").unwrap();
@@ -625,6 +801,17 @@ fn partial_duplicate_claims_keep_unknown_fields_until_comparison() {
     let Value::Map(mut left) = hidden_claim(&name) else {
         unreachable!()
     };
+    // One unmatched hash can conceal at most one additional key.
+    let two_keys = Value::Map(vec![
+        (Value::from("x"), 1.into()),
+        (Value::from("y"), 2.into()),
+    ]);
+    for (a, b) in [
+        (hidden_claim(&name), two_keys.clone()),
+        (two_keys, hidden_claim(&name)),
+    ] {
+        assert!(validate_message(profile_message(a, b, &[]), RestoreMode::Verifier).is_err());
+    }
     left.push((Value::from("age"), Value::from(30)));
     let Value::Map(mut right) = hidden_claim(&age) else {
         unreachable!()
@@ -676,6 +863,24 @@ fn duplicate_array_claims_support_disclosures_and_detect_visible_conflicts() {
         Value::from("tail"),
     ]);
     let plain = Value::Array(vec![Value::from("Alice"), Value::from("tail")]);
+    let hidden_slot = redacted_element(item.redacted_hash(&Sha256RedactionHasher));
+    let middle = Value::Array(vec![
+        redacted_element(vec![0xa5; 32]),
+        Value::from("middle"),
+        hidden_slot,
+    ]);
+    let full = Value::Array(vec!["start".into(), "different".into(), "end".into()]);
+    for full in [full, Value::Array(vec!["start".into(), "end".into()])] {
+        for (a, b) in [(middle.clone(), full.clone()), (full, middle.clone())] {
+            assert!(validate_message(profile_message(a, b, &[]), RestoreMode::Verifier).is_err());
+        }
+    }
+    let with_decoy = Value::Array(vec!["start".into(), "middle".into()]);
+    validate_message(
+        profile_message(middle, with_decoy, &[]),
+        RestoreMode::Verifier,
+    )
+    .unwrap();
     for disclosures in [vec![], vec![item.clone()]] {
         let report = validate_message(
             profile_message(hidden.clone(), plain.clone(), &disclosures),
@@ -698,6 +903,84 @@ fn duplicate_array_claims_support_disclosures_and_detect_visible_conflicts() {
         RestoreMode::Verifier
     )
     .is_err());
+}
+
+#[test]
+fn duplicate_partial_arrays_must_have_a_common_disclosure_order() {
+    let hidden = |id| redacted_element(vec![id; 32]);
+    let pattern = |s: &str, id| {
+        Value::Array(vec![
+            hidden(id),
+            s.into(),
+            s.into(),
+            s.into(),
+            hidden(id + 1),
+        ])
+    };
+    let red = pattern("red", 1);
+    let blue = pattern("blue", 3);
+    for (a, b) in [(red.clone(), blue.clone()), (blue, red)] {
+        let error =
+            validate_message(profile_message(a, b, &[]), RestoreMode::Verifier).unwrap_err();
+        assert!(error.to_string().contains("disagree"));
+    }
+    let left = Value::Array(vec![hidden(1), "a".into(), "b".into(), hidden(2)]);
+    let right = Value::Array(vec!["x".into(), hidden(3), "b".into(), hidden(4)]);
+    validate_message(profile_message(left, right, &[]), RestoreMode::Verifier).unwrap();
+
+    // One hidden slot cannot supply both leading values.
+    let partial = Value::Array(vec![
+        hidden(1),
+        "a".into(),
+        hidden(2),
+        "b".into(),
+        hidden(3),
+    ]);
+    let full = Value::Array(vec!["x".into(), "y".into(), "a".into(), "b".into()]);
+    assert!(validate_message(profile_message(partial, full, &[]), RestoreMode::Verifier).is_err());
+}
+
+#[test]
+fn partial_array_alignment_obeys_the_validation_work_budget() {
+    let partial = |id: u8| {
+        Value::Array(
+            (0u8..17)
+                .map(|n| {
+                    if n % 2 == 0 {
+                        redacted_element(vec![id + n; 32])
+                    } else {
+                        Value::from(n)
+                    }
+                })
+                .collect(),
+        )
+    };
+    let mut msg = profile_message(partial(1), partial(30), &[]);
+    let encoded = msg.sign_and_encode(&Toy, None).unwrap();
+    for (max_items, should_pass) in [(150, false), (1_000, true)] {
+        let options = SdCwtValidationOptions {
+            limits: ProcessingLimits {
+                max_items,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = verify_validate_and_restore_sd_cwt(
+            &Toy,
+            &encoded,
+            None,
+            RestoreMode::Verifier,
+            options,
+        );
+        if should_pass {
+            result.unwrap();
+        } else {
+            assert!(matches!(
+                result,
+                Err(Error::LimitExceeded { limit: 150, .. })
+            ));
+        }
+    }
 }
 
 #[test]
@@ -724,6 +1007,7 @@ fn strict_sd_decoding_checks_the_embedded_protected_encoding_and_limits() {
     let encoded = wire(&raw);
     let decoded = Sign1Message::verify_and_decode(&Toy, &encoded, None).unwrap();
     assert!(verify_and_decode_sd_cwt(&Toy, &encoded, None, ProcessingLimits::default()).is_err());
+    assert!(sd_cwt::restore_payload_from_message(&decoded, RestoreMode::Holder).is_err());
     assert!(SdCwtValidator::default()
         .validate_and_restore(&decoded, RestoreMode::Holder)
         .is_err());

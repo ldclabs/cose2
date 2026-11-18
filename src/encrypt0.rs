@@ -40,7 +40,7 @@ pub struct Encrypt0Message {
     ciphertext: Vec<u8>,
     ciphertext_detached: bool,
     protected_raw: Vec<u8>,
-    state: util::OperationState,
+    state: util::OperationState<util::PreparedEncryption>,
 }
 
 impl Encrypt0Message {
@@ -74,6 +74,20 @@ impl Encrypt0Message {
     /// [`to_vec`](Self::to_vec). Passing `None` for `external_aad` is the same
     /// as an empty byte string.
     pub fn prepare_encryption(
+        &mut self,
+        alg: Option<Label>,
+        kid: Option<&[u8]>,
+        nonce_size: usize,
+        base_iv: Option<&[u8]>,
+        external_aad: Option<&[u8]>,
+    ) -> Result<EncryptionContext, Error> {
+        let context = self.encryption_context(alg, kid, nonce_size, base_iv, external_aad)?;
+        let inputs = util::PreparedEncryption::new(self.payload.as_deref(), &self.unprotected)?;
+        self.state = util::OperationState::Awaiting(inputs);
+        Ok(context)
+    }
+
+    fn encryption_context(
         &mut self,
         alg: Option<Label>,
         kid: Option<&[u8]>,
@@ -150,11 +164,14 @@ impl Encrypt0Message {
         ciphertext: impl Into<Vec<u8>>,
         detached: bool,
     ) -> Result<(), Error> {
+        if let util::OperationState::Awaiting(inputs) = &self.state {
+            inputs.check(self.payload.as_deref(), &self.unprotected)?;
+        }
         util::sync_protected_raw(
             &self.protected,
             &self.unprotected,
             &mut self.protected_raw,
-            self.state,
+            &self.state,
         )?;
         self.ciphertext = ciphertext.into();
         self.ciphertext_detached = detached;
@@ -168,7 +185,7 @@ impl Encrypt0Message {
         encryptor: &dyn Encryptor,
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        let context = self.prepare_encryption(
+        let context = self.encryption_context(
             encryptor.alg(),
             encryptor.kid(),
             encryptor.nonce_size(),
@@ -176,7 +193,6 @@ impl Encrypt0Message {
             external_aad,
         )?;
         let plaintext = util::require_plaintext(&self.payload, "Encrypt0Message::encrypt")?;
-        // The headers were validated and encoded by `prepare_encryption`.
         self.ciphertext = encryptor.encrypt(&context.nonce, plaintext, &context.aad)?;
         self.state = util::OperationState::Complete;
         Ok(())

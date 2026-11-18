@@ -31,13 +31,13 @@ impl Ed25519Signer {
         kid: Option<Vec<u8>>,
     ) -> Result<Self, Error> {
         require_supported_alg(alg)?;
-        let seed: [u8; SECRET_KEY_LENGTH] = secret_key
+        let seed: &[u8; SECRET_KEY_LENGTH] = secret_key
             .try_into()
             .map_err(|_| Error::custom("Ed25519 private key must be 32 bytes"))?;
         Ok(Self {
             alg,
             kid,
-            key: SigningKey::from_bytes(&seed),
+            key: SigningKey::from_bytes(seed),
         })
     }
 

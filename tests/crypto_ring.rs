@@ -2,7 +2,7 @@
 
 use cose2::{
     crypto::{RingEncryptor, RingMacer, RingSigner, RingVerifier},
-    iana, Encrypt0Message, Encryptor, Key, Mac0Message, Macer, Sign1Message,
+    iana, Encrypt0Message, Encryptor, Key, Mac0Message, Macer, Sign1Message, Signer, Verifier,
 };
 use ring::{rand::SystemRandom, signature, signature::KeyPair};
 
@@ -274,7 +274,7 @@ fn ring_rsa_pkcs8_der_and_cose_key_round_trips() {
     // rsa_from_pkcs8 (signer) verified by rsa_der (PKCS#1 public DER).
     let signer = RingSigner::rsa_from_pkcs8(iana::AlgorithmRS256, &hx(RSA_PKCS8), None).unwrap();
     assert_eq!(signer.algorithm(), iana::AlgorithmRS256);
-    assert!(signer.public_key().is_none());
+    assert_eq!(signer.public_key().unwrap(), hx(RSA_PKCS1_PUB));
     let verifier = RingVerifier::rsa_der(iana::AlgorithmRS256, &hx(RSA_PKCS1_PUB), None).unwrap();
     let mut msg = Sign1Message::new(Some(payload.clone()));
     let encoded = msg.sign_and_encode(&signer, None).unwrap();
@@ -429,8 +429,6 @@ fn ring_provider_error_paths() {
 
 #[test]
 fn ring_accessor_and_debug_and_error_paths() {
-    use cose2::{Signer, Verifier};
-
     // Ed25519 signer public_key() arm + Debug for an ECDSA signing key.
     let ed = RingSigner::ed25519_from_pkcs8(
         signature::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
@@ -584,7 +582,11 @@ fn ring_rsa_verifier_exports_n_and_e() {
         Some(&hx(RSA_E)[..])
     );
 
-    // An RSA signer exposes no public modulus, so it cannot export a COSE_Key.
+    // A signer's exported key has exactly the verifier's public parameters.
     let signer = RingSigner::rsa_from_der(iana::AlgorithmRS256, &hx(RSA_PKCS1_PRIV), None).unwrap();
-    assert!(signer.to_cose_key().is_err());
+    assert_eq!(signer.to_cose_key().unwrap(), exported);
+    let verifier = RingVerifier::from_cose_key(&exported).unwrap();
+    verifier
+        .verify(b"rsa export", &signer.sign(b"rsa export").unwrap())
+        .unwrap();
 }

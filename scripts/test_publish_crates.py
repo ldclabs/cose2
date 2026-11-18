@@ -14,7 +14,7 @@ class PublishTests(unittest.TestCase):
             self.assertTrue(publish_crates.is_published("cose2", "0.5.0"))
         with patch.object(publish_crates, "urlopen", side_effect=HTTPError("url", 404, "missing", {}, None)):
             self.assertFalse(publish_crates.is_published("cose2", "0.5.0"))
-        with patch.object(publish_crates, "urlopen", side_effect=HTTPError("url", 503, "unavailable", {}, None)):
+        with HTTPError("url", 503, "unavailable", {}, None) as error, patch.object(publish_crates, "urlopen", side_effect=error):
             with self.assertRaises(HTTPError):
                 publish_crates.is_published("cose2", "0.5.0")
         with patch.object(publish_crates, "urlopen", return_value=io.BytesIO(
@@ -30,6 +30,15 @@ class PublishTests(unittest.TestCase):
         with patch.object(publish_crates, "is_published", return_value=False):
             publish_crates.publish("sd-cwt", "0.3.0", dry_run=True)
         run.assert_not_called()
+
+    @patch.object(publish_crates.time, "sleep")
+    @patch.object(publish_crates.subprocess, "run")
+    def test_last_upload_can_succeed_after_cargo_reports_failure(self, run, sleep):
+        run.return_value.returncode = 1
+        with patch.object(publish_crates, "is_published", side_effect=[False] * 5 + [True]):
+            publish_crates.publish("cose2", "0.5.0")
+        self.assertEqual(run.call_count, 5)
+        self.assertEqual(sleep.call_count, 4)
 
     @patch.object(publish_crates.time, "sleep")
     @patch.object(publish_crates.subprocess, "run")

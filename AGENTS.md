@@ -236,10 +236,9 @@ dalek importer can derive an omitted `x`.
 - `python3 scripts/publish_crates.py --dry-run` reads registry state without
   uploading. Running it without `--dry-run` publishes packages. Script tests
   mock both the registry and Cargo and perform no uploads.
-- `cargo package -p cose2` verifies the main package. CI uses
-  `cargo package -p sd-cwt --list` to check its archive contents while the
-  required `cose2` version may not yet be available in the registry; that list
-  check does not verify the packaged companion crate's build.
+- On stable Cargo, `cargo package --workspace --locked` builds and verifies
+  both archives. Its temporary registry supplies the packaged `cose2` version
+  to `sd-cwt`, including before the release reaches crates.io.
 
 [cose]: https://datatracker.ietf.org/doc/html/rfc9052
 [cwt]: https://datatracker.ietf.org/doc/html/rfc8392

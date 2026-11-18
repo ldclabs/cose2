@@ -1,6 +1,9 @@
 //! COSE_Key objects and key sets (RFC 9052 §7).
 
-use std::ops::{Deref, DerefMut};
+use std::{
+    fmt,
+    ops::{Deref, DerefMut},
+};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -9,8 +12,18 @@ use crate::{iana, CoseMap, Error, Label, Value};
 /// A COSE_Key object: a [`CoseMap`] with key-specific accessors.
 ///
 /// Reference: <https://datatracker.ietf.org/doc/html/rfc9052#name-key-objects>.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct Key(pub CoseMap);
+
+impl fmt::Debug for Key {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Algorithm-specific and private-use parameters can contain secrets.
+        f.debug_struct("Key")
+            .field("kty", &self.kty().ok().flatten())
+            .field("alg", &self.alg().ok().flatten())
+            .finish_non_exhaustive()
+    }
+}
 
 impl Key {
     /// Creates an empty key.
@@ -96,12 +109,10 @@ impl Key {
         if operations.is_empty() {
             return Ok(false);
         }
-        let Some(configured) = self.ops()? else {
-            return Ok(true);
-        };
-        Ok(configured
-            .iter()
-            .any(|operation| matches!(operation, Label::Int(value) if operations.contains(value))))
+        Ok(crate::util::key_ops_allow(
+            self.ops()?.as_deref(),
+            operations,
+        ))
     }
 
     /// Requires `key_ops`, when present, to permit one of `operations`.
@@ -322,10 +333,7 @@ impl TryFrom<Value> for Key {
     type Error = Error;
 
     fn try_from(value: Value) -> Result<Self, Self::Error> {
-        let bytes = cbor2::to_canonical_vec(&value)?;
-        let key = Key(CoseMap::from_slice(&bytes)?);
-        key.validate()?;
-        Ok(key)
+        Self::from_slice(&cbor2::to_canonical_vec(&value)?)
     }
 }
 

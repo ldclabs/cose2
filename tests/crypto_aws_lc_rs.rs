@@ -8,7 +8,7 @@
 use aws_lc_rs::{rand::SystemRandom, signature};
 use cose2::{
     crypto::{RingEncryptor, RingMacer, RingSigner, RingVerifier},
-    iana, Encrypt0Message, Key, Mac0Message, Macer, Sign1Message,
+    iana, Encrypt0Message, Key, Mac0Message, Macer, Sign1Message, Signer, Verifier,
 };
 
 // A static P-256 key (SEC1 uncompressed public point `04 || x || y`).
@@ -301,7 +301,11 @@ fn aws_lc_rs_rsa_verifier_exports_n_and_e() {
         Some(&hx(RSA_E)[..])
     );
 
-    // An RSA signer exposes no public modulus, so it cannot export a COSE_Key.
     let signer = RingSigner::rsa_from_pkcs8(iana::AlgorithmRS256, &hx(RSA_PKCS8), None).unwrap();
-    assert!(signer.to_cose_key().is_err());
+    assert_eq!(signer.public_key().unwrap(), hx(RSA_PKCS1_PUB));
+    assert_eq!(signer.to_cose_key().unwrap(), exported);
+    let verifier = RingVerifier::from_cose_key(&exported).unwrap();
+    verifier
+        .verify(b"rsa export", &signer.sign(b"rsa export").unwrap())
+        .unwrap();
 }

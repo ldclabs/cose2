@@ -254,6 +254,52 @@ fn header_content_type_accepts_text_and_uint() {
     header.set_content_type(" invalid ");
     assert!(header.content_type().is_err());
     assert!(header.to_vec().is_err());
+    for invalid in [
+        "-app/json".to_owned(),
+        format!("application/{}", "a".repeat(128)),
+    ] {
+        header.set_content_type(invalid);
+        assert!(header.to_vec().is_err());
+    }
+}
+
+#[test]
+fn content_type_parameters_are_validated_and_preserved() {
+    for valid in [
+        "application/json; charset=UTF-8",
+        "text/plain \t; charset=utf-8;\tmode=flowed",
+        r#"multipart/mixed; boundary="a;b=\"quoted\"\\c"; empty="""#,
+    ] {
+        let mut header = Header::new();
+        header.set_content_type(valid);
+        let decoded = Header::from_slice(&header.to_vec().unwrap()).unwrap();
+        assert_eq!(decoded.content_type().unwrap(), Some(valid.into()));
+    }
+    for invalid in [
+        "text/plain;broken",
+        "text/plain;",
+        "text/plain;;charset=utf-8",
+        "text/plain;=x",
+        "text/plain;v=",
+        "text/plain;v=a b",
+        "text/plain;v =x",
+        "text/plain;v=a;V=b",
+        "text/plain;v=\"open",
+        "text/plain;v=\"x\"junk",
+        "text/plain;v=\"x\\",
+        "text/plain;v=\"x\r\ny\"",
+        "text/plain;v=x ",
+    ] {
+        let mut raw = CoseMap::new();
+        raw.insert(iana::HeaderParameterContentType, invalid);
+        assert!(
+            Header::from_slice(&raw.to_vec().unwrap()).is_err(),
+            "{invalid:?}"
+        );
+        let mut built = Header::new();
+        built.set_content_type(invalid);
+        assert!(built.to_vec().is_err(), "{invalid:?}");
+    }
 }
 
 #[test]
@@ -345,6 +391,19 @@ fn key_rejects_missing_kty() {
     let empty = Key::new();
     assert!(empty.to_vec().is_err());
     assert!(Key::from_slice(&CoseMap::new().to_vec().unwrap()).is_err());
+}
+
+#[test]
+fn key_and_keyset_debug_omit_secret_parameters() {
+    let mut key = Key::new();
+    key.set_kty(iana::KeyTypeSymmetric);
+    key.insert(iana::SymmetricKeyParameterK, b"private material".to_vec());
+    key.insert("extension", "private material");
+    let set = KeySet(vec![key]);
+    let debug = format!("{set:?}");
+    assert!(debug.contains("kty"));
+    assert!(!debug.contains("private material"));
+    assert!(!debug.contains("Bytes("));
 }
 
 #[test]
@@ -575,6 +634,11 @@ fn tag_with_and_skip() {
 
 #[test]
 fn tag_remove_cbor_tag_variants() {
+    // A tag followed by invalid UTF-8 is malformed and must be left intact.
+    assert_eq!(
+        tag::remove_cbor_tag(&[0xd2, 0x61, 0xff]),
+        &[0xd2, 0x61, 0xff]
+    );
     let body = [0x80u8];
     // single-byte message tags
     for prefix in [tag::SIGN1_PREFIX, tag::MAC0_PREFIX, tag::ENCRYPT0_PREFIX] {

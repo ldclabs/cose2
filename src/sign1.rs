@@ -37,7 +37,7 @@ pub struct Sign1Message {
     pub payload: Option<Vec<u8>>,
     signature: Vec<u8>,
     protected_raw: Vec<u8>,
-    state: util::OperationState,
+    state: util::OperationState<util::PreparedPayload>,
 }
 
 impl Sign1Message {
@@ -83,10 +83,10 @@ impl Sign1Message {
         kid: Option<&[u8]>,
         external_aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, Error> {
-        self.prepare_signature_headers(alg, kid)?;
-        let payload =
-            util::require_embedded_payload(&self.payload, "Sign1Message::prepare_signature")?;
-        Self::to_be_signed(&self.protected_raw, external_aad.unwrap_or(&[]), payload)
+        let input = self.prepare_signature_input(alg, kid, None, external_aad)?;
+        self.state =
+            util::OperationState::Awaiting(util::PreparedPayload::new(self.payload.as_deref()));
+        Ok(input)
     }
 
     /// Prepares this detached-payload message for an external signature.
@@ -101,26 +101,31 @@ impl Sign1Message {
         detached_payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, Error> {
-        self.prepare_signature_headers(alg, kid)?;
-        let tbs = Self::to_be_signed(
-            &self.protected_raw,
-            external_aad.unwrap_or(&[]),
-            detached_payload,
-        )?;
+        let input = self.prepare_signature_input(alg, kid, Some(detached_payload), external_aad)?;
         self.payload = None;
-        Ok(tbs)
+        self.state = util::OperationState::Awaiting(util::PreparedPayload::new(None));
+        Ok(input)
     }
 
-    fn prepare_signature_headers(
+    fn prepare_signature_input(
         &mut self,
         alg: Option<Label>,
         kid: Option<&[u8]>,
-    ) -> Result<(), Error> {
-        self.protected_raw =
-            util::prepare_headers(&mut self.protected, &mut self.unprotected, alg, kid)?;
-        self.state = util::OperationState::Prepared;
+        detached_payload: Option<&[u8]>,
+        external_aad: Option<&[u8]>,
+    ) -> Result<Vec<u8>, Error> {
+        let payload = match detached_payload {
+            Some(bytes) => bytes,
+            None => {
+                util::require_embedded_payload(&self.payload, "Sign1Message::prepare_signature")?
+            }
+        };
+        let raw = util::prepare_headers(&mut self.protected, &mut self.unprotected, alg, kid)?;
+        let input = Self::to_be_signed(&raw, external_aad.unwrap_or_default(), payload)?;
+        self.protected_raw = raw;
         self.signature.clear();
-        Ok(())
+        self.state = util::OperationState::Prepared;
+        Ok(input)
     }
 
     /// Stores externally produced signature bytes on this message.
@@ -131,11 +136,14 @@ impl Sign1Message {
     /// protected bytes were prepared yet, this method serializes the current
     /// protected header canonically, which is valid for newly built messages.
     pub fn set_signature(&mut self, signature: impl Into<Vec<u8>>) -> Result<(), Error> {
+        if let util::OperationState::Awaiting(inputs) = &self.state {
+            inputs.check(self.payload.as_deref())?;
+        }
         util::sync_protected_raw(
             &self.protected,
             &self.unprotected,
             &mut self.protected_raw,
-            self.state,
+            &self.state,
         )?;
         self.signature = signature.into();
         self.state = util::OperationState::Complete;
@@ -144,11 +152,8 @@ impl Sign1Message {
 
     /// Signs the message with `signer`, filling in `alg`/`kid` headers as needed.
     pub fn sign(&mut self, signer: &dyn Signer, external_aad: Option<&[u8]>) -> Result<(), Error> {
-        self.prepare_signature_headers(signer.alg(), signer.kid())?;
-        let payload = util::require_embedded_payload(&self.payload, "Sign1Message::sign")?;
-        let tbs = Self::to_be_signed(&self.protected_raw, external_aad.unwrap_or(&[]), payload)?;
-        // The headers were validated and encoded just above.
-        self.signature = signer.sign(&tbs)?;
+        let input = self.prepare_signature_input(signer.alg(), signer.kid(), None, external_aad)?;
+        self.signature = signer.sign(&input)?;
         self.state = util::OperationState::Complete;
         Ok(())
     }
@@ -163,15 +168,15 @@ impl Sign1Message {
         detached_payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        self.prepare_signature_headers(signer.alg(), signer.kid())?;
-        let tbs = Self::to_be_signed(
-            &self.protected_raw,
-            external_aad.unwrap_or(&[]),
-            detached_payload,
+        let input = self.prepare_signature_input(
+            signer.alg(),
+            signer.kid(),
+            Some(detached_payload),
+            external_aad,
         )?;
-        self.signature = signer.sign(&tbs)?;
-        self.state = util::OperationState::Complete;
+        self.signature = signer.sign(&input)?;
         self.payload = None;
+        self.state = util::OperationState::Complete;
         Ok(())
     }
 

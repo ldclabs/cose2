@@ -71,7 +71,7 @@ impl CounterSignature {
             &self.protected,
             &self.unprotected,
             &mut self.protected_raw,
-            self.state,
+            &self.state,
         )?;
         self.signature = signature.into();
         self.state = util::OperationState::Complete;

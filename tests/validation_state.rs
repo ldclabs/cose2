@@ -13,6 +13,169 @@ fn direct_recipient() -> Recipient {
     recipient
 }
 
+#[test]
+fn external_signatures_and_tags_require_the_prepared_payload() {
+    macro_rules! check {
+        ($message:expr, $prepare:ident, $detached:ident, $set:ident) => {{
+            let mut msg = $message;
+            msg.$prepare(None, None, None).unwrap();
+            msg.payload.as_mut().unwrap()[0] += 1;
+            assert!(matches!(msg.$set(vec![1]), Err(Error::InvalidState(_))));
+            assert!(msg.to_vec().is_err());
+            msg.$prepare(None, None, None).unwrap();
+            msg.unprotected.insert("transport", true);
+            msg.$set(vec![2]).unwrap();
+            assert!(msg.to_vec().is_ok());
+
+            msg.$detached(None, None, b"external", None).unwrap();
+            msg.payload = Some(Vec::new());
+            assert!(matches!(msg.$set(vec![3]), Err(Error::InvalidState(_))));
+            msg.payload = None;
+            msg.$set(vec![3]).unwrap();
+        }};
+    }
+    check!(
+        Sign1Message::new(Some(vec![0])),
+        prepare_signature,
+        prepare_detached_signature,
+        set_signature
+    );
+    check!(
+        Mac0Message::new(Some(vec![0])),
+        prepare_tag,
+        prepare_detached_tag,
+        set_tag
+    );
+    let mut mac = MacMessage::new(Some(vec![0]));
+    mac.recipients.push(direct_recipient());
+    check!(mac, prepare_tag, prepare_detached_tag, set_tag);
+}
+
+#[test]
+fn external_multisignatures_bind_payload_mode_and_signer_order() {
+    let mut msg = SignMessage::new(Some(vec![1]));
+    let slots = || {
+        vec![
+            cose2::Signature::with_alg_kid(None, Some(b"a")),
+            cose2::Signature::with_alg_kid(None, Some(b"b")),
+        ]
+    };
+    let results = || [vec![1], vec![2]];
+    msg.prepare_signatures(slots(), None).unwrap();
+    msg.payload = Some(vec![2]);
+    assert!(matches!(
+        msg.set_signatures(results()),
+        Err(Error::InvalidState(_))
+    ));
+    msg.payload = Some(vec![1]);
+    msg.signatures.swap(0, 1);
+    assert!(matches!(
+        msg.set_signatures(results()),
+        Err(Error::InvalidState(_))
+    ));
+    msg.signatures.swap(0, 1);
+    msg.set_signatures(results()).unwrap();
+
+    msg.prepare_detached_signatures(slots(), b"external", None)
+        .unwrap();
+    msg.payload = Some(Vec::new());
+    assert!(matches!(
+        msg.set_signatures(results()),
+        Err(Error::InvalidState(_))
+    ));
+    msg.payload = None;
+    msg.set_signatures(results()).unwrap();
+}
+
+#[test]
+fn external_encryption_binds_plaintext_and_nonce_headers() {
+    macro_rules! check {
+        ($message:expr) => {{
+            let mut msg = $message;
+            msg.unprotected.set_iv(vec![7; 12]);
+            msg.prepare_encryption(None, None, 12, None, None).unwrap();
+            msg.payload = Some(vec![2]);
+            assert!(matches!(
+                msg.set_ciphertext(vec![1], false),
+                Err(Error::InvalidState(_))
+            ));
+            msg.payload = Some(vec![1]);
+            msg.unprotected.set_iv(vec![8; 12]);
+            assert!(matches!(
+                msg.set_ciphertext(vec![1], true),
+                Err(Error::InvalidState(_))
+            ));
+            msg.unprotected.remove(iana::HeaderParameterIV);
+            msg.unprotected.set_partial_iv(vec![8]);
+            assert!(matches!(
+                msg.set_ciphertext(vec![1], false),
+                Err(Error::InvalidState(_))
+            ));
+            msg.prepare_encryption(None, None, 12, Some(&[0; 12]), None)
+                .unwrap();
+            msg.unprotected.set_partial_iv(vec![9]);
+            assert!(matches!(
+                msg.set_ciphertext(vec![2], true),
+                Err(Error::InvalidState(_))
+            ));
+            msg.unprotected.set_partial_iv(vec![8]);
+            msg.unprotected.insert("transport", true);
+            msg.set_ciphertext(vec![2], true).unwrap();
+            assert!(msg.to_vec().is_ok());
+        }};
+    }
+    check!(Encrypt0Message::new(Some(vec![1])));
+    let mut msg = EncryptMessage::new(Some(vec![1]));
+    msg.recipients.push(direct_recipient());
+    check!(msg);
+}
+
+#[test]
+fn signature_batches_commit_together_and_require_completed_slots() {
+    let signer = MockSigner::new(iana::AlgorithmEd25519, b"key");
+    let verifier = MockVerifier::new(iana::AlgorithmEd25519, b"key");
+    let mut msg = SignMessage::new(Some(b"payload".to_vec()));
+    msg.sign(&[&signer, &signer], None).unwrap();
+    let encoded = msg.to_vec().unwrap();
+    msg.signatures[1].protected.insert("changed", true);
+    assert!(msg
+        .set_signatures([b"first".to_vec(), b"other".to_vec()])
+        .is_err());
+    msg.signatures[1].protected.remove("changed");
+    assert_eq!(msg.to_vec().unwrap(), encoded);
+    msg.verify(&[&verifier], None).unwrap();
+
+    msg.signatures.push(cose2::Signature::new());
+    assert!(matches!(msg.to_vec(), Err(Error::InvalidState(_))));
+    assert!(matches!(
+        msg.verify(&[&verifier], None),
+        Err(Error::InvalidState(_))
+    ));
+}
+
+#[test]
+fn recipient_edits_are_rechecked_before_using_the_content_key() {
+    let macer = MockMacer::new(iana::AlgorithmHMAC_256_256, b"key");
+    let mut mac = MacMessage::new(Some(vec![1]));
+    mac.recipients.push(direct_recipient());
+    mac.compute(&macer, None).unwrap();
+    mac.recipients.clear();
+    assert!(mac.verify(&macer, None).is_err());
+
+    let encryptor = MockEncryptor::new(iana::AlgorithmA128GCM, b"key", 12);
+    let mut msg = EncryptMessage::new(Some(vec![1]));
+    msg.unprotected.set_iv(vec![0; 12]);
+    msg.recipients.push(direct_recipient());
+    let encoded = msg.encrypt_and_encode(&encryptor, None).unwrap();
+    let mut decoded = EncryptMessage::from_slice(&encoded).unwrap();
+    decoded.recipients[0]
+        .protected
+        .set_alg(iana::AlgorithmDirect);
+    assert!(decoded.prepare_decryption(None, 12, None, None).is_err());
+    assert!(decoded.decrypt(&encryptor, None).is_err());
+    assert!(decoded.payload.is_none());
+}
+
 fn check_mutations<M: Clone>(
     message: &M,
     alg: i64,

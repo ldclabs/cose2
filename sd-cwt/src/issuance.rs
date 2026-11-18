@@ -1,13 +1,13 @@
 //! Conversion of pre-issuance redaction and decoy requests.
 
-use crate::validation::validate_root_disclosure_key;
+use crate::validation::{validate_root_disclosure_key, validate_safe_value};
 use crate::{
     is_redacted_claim_keys_label, label_from_value, redacted_claim_keys_label, redacted_element,
     Disclosure, DisclosureKind, DisclosureSet, ProcessingLimits, RedactionHasher, TraversalBudget,
     REDACTED_CLAIM_KEYS_SIMPLE, REDACTED_ELEMENT_TAG, TO_BE_DECOY_TAG, TO_BE_REDACTED_TAG,
 };
 use cbor2::Value;
-use cose2::Error;
+use cose2::{iana, Error, Label};
 use std::collections::HashSet;
 
 /// Source of 128-bit salts for issuance helpers.
@@ -122,6 +122,7 @@ impl IssueContext<'_> {
             ));
         }
         let digest = disclosure.redacted_hash(self.hasher);
+        crate::disclosure::validate_hash_length(self.hasher.algorithm(), &digest)?;
         if !self.digests_used.insert(digest.clone()) {
             return Err(Error::verify(
                 "redaction hash collision while issuing SD-CWT disclosures",
@@ -165,7 +166,7 @@ fn issue_map(
 ) -> Result<Value, Error> {
     context.budget.container(entries.len())?;
     let mut output = Vec::with_capacity(entries.len());
-    let mut normalized_keys = HashSet::<Vec<u8>>::with_capacity(entries.len());
+    let mut normalized_keys = HashSet::<Label>::with_capacity(entries.len());
     let mut redacted_hashes = Vec::<Value>::new();
 
     for (key, value) in entries {
@@ -177,8 +178,11 @@ fn issue_map(
                 if depth == 0 {
                     validate_root_disclosure_key(&claim_key)?;
                 }
-                let normalized_key = Value::from(claim_key.clone());
-                insert_normalized_key(&mut normalized_keys, &normalized_key)?;
+                if !normalized_keys.insert(claim_key.clone()) {
+                    return Err(Error::verify(format!(
+                        "duplicate pre-issuance map key {claim_key}"
+                    )));
+                }
 
                 let issued_value = issue_value(value, context, depth + 1)?;
                 let disclosure = DisclosureKind::Claim {
@@ -190,8 +194,6 @@ fn issue_map(
             }
             Value::Tag(tag, inner) if tag == TO_BE_DECOY_TAG => {
                 context.budget.enter(depth + 2)?;
-                let decoy_key = Value::Tag(tag, inner.clone());
-                insert_normalized_key(&mut normalized_keys, &decoy_key)?;
                 record_decoy_id(&inner, context)?;
                 if !matches!(value, Value::Null) {
                     return Err(Error::custom(
@@ -210,9 +212,18 @@ fn issue_map(
                 ));
             }
             key => {
-                ensure_preissuance_key(&key)?;
-                insert_normalized_key(&mut normalized_keys, &key)?;
-                output.push((key, issue_value(value, context, depth + 1)?));
+                if !normalized_keys.insert(label_from_value(&key)?) {
+                    return Err(Error::verify(format!(
+                        "duplicate pre-issuance map key {key}"
+                    )));
+                }
+                let value = if depth == 0 && key == Value::from(iana::CWTClaimCnf) {
+                    validate_safe_value(&value, &mut context.budget, depth + 1)?;
+                    value
+                } else {
+                    issue_value(value, context, depth + 1)?
+                };
+                output.push((key, value));
             }
         }
     }
@@ -275,20 +286,6 @@ fn record_decoy_id(value: &Value, context: &mut IssueContext<'_>) -> Result<(), 
     }
     if !context.decoy_ids.insert(id) {
         return Err(Error::verify("duplicate tag 62 decoy identifier"));
-    }
-    Ok(())
-}
-
-fn ensure_preissuance_key(key: &Value) -> Result<(), Error> {
-    label_from_value(key).map(|_| ())
-}
-
-fn insert_normalized_key(keys: &mut HashSet<Vec<u8>>, key: &Value) -> Result<(), Error> {
-    let encoded = cbor2::to_canonical_vec(key)?;
-    if !keys.insert(encoded) {
-        return Err(Error::verify(format!(
-            "duplicate pre-issuance map key {key}"
-        )));
     }
     Ok(())
 }

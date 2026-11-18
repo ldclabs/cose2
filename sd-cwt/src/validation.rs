@@ -118,9 +118,15 @@ impl SdCwtValidator {
         let protected_claims = protected_cwt_claims(message)?;
         let disclosures =
             disclosures_from_unprotected_with_limits(&message.unprotected, self.options.limits)?;
+        // The plaintext reader has already bounded both totals.
+        let mut encrypted_limits = self.options.limits;
+        encrypted_limits.max_disclosures -= disclosures.len();
+        for disclosure in &disclosures {
+            encrypted_limits.max_disclosure_bytes -= disclosure.encoded().len();
+        }
         let encrypted = aead_encrypted_disclosures_from_unprotected_with_limits(
             &message.unprotected,
-            self.options.limits,
+            encrypted_limits,
         )?;
         let aead_algorithm = sd_aead(&message.protected)?.unwrap_or(1);
         validate_aead_disclosure_dimensions(
@@ -141,22 +147,14 @@ impl SdCwtValidator {
         }
         cose2::validate_cbor(payload, definite_cbor_limits(self.options.limits))?;
         let value: Value = cbor2::from_slice(payload)?;
-        let Value::Map(entries) = &value else {
+        if !matches!(value, Value::Map(_)) {
             return Err(Error::UnexpectedType(
                 "SD-CWT payload must be a claims map".into(),
             ));
-        };
-        let maps = claim_maps(entries, protected_claims.as_ref());
-        validate_registered_claim_types(&maps)?;
-        validate_required_claims(
-            &maps,
-            self.options.issuer_identified_by_protected_header,
-            true,
-        )?;
-        validate_time_relationships(&maps)?;
+        }
 
         let hasher = default_hasher_for_sd_alg(sd_alg(&message.protected)?)?;
-        let report = restore_with_protected_claims(
+        let mut report = restore_with_protected_claims(
             value,
             protected_claims,
             disclosures,
@@ -168,15 +166,25 @@ impl SdCwtValidator {
         let Value::Map(entries) = &report.value else {
             unreachable!();
         };
-        let restored_maps = claim_maps(entries, report.protected_claims.as_ref());
-        validate_registered_claim_types(&restored_maps)?;
-        validate_time_relationships(&restored_maps)?;
-        if mode == RestoreMode::Holder {
-            validate_required_claims(
-                &restored_maps,
-                self.options.issuer_identified_by_protected_header,
-                false,
-            )?;
+        let mut maps = vec![entries.as_slice()];
+        if let Some(Value::Map(header)) = &report.protected_claims {
+            validate_matching_claims(entries, header, self.options.limits)?;
+            maps.push(header);
+        }
+        // A remaining root hash can still hide sub. After all root hashes
+        // have been matched, both modes can determine whether sub is absent.
+        validate_registered_claim_types(&maps)?;
+        validate_required_claims(
+            &maps,
+            self.options.issuer_identified_by_protected_header,
+            mode == RestoreMode::Verifier,
+        )?;
+        validate_time_relationships(&maps)?;
+        if report.removed_redactions > 0 {
+            remove_undisclosed_redactions(&mut report.value);
+            if let Some(header) = &mut report.protected_claims {
+                remove_undisclosed_redactions(header);
+            }
         }
         Ok(report)
     }
@@ -212,7 +220,7 @@ pub fn verify_validate_and_restore_sd_cwt(
     Ok((message, report))
 }
 
-fn validate_sd_headers(
+pub(super) fn validate_protected_encoding(
     message: &cose2::Sign1Message,
     limits: ProcessingLimits,
 ) -> Result<(), Error> {
@@ -221,6 +229,14 @@ fn validate_sd_headers(
     if !message.protected_raw().is_empty() {
         cose2::validate_cbor(message.protected_raw(), definite_cbor_limits(limits))?;
     }
+    Ok(())
+}
+
+fn validate_sd_headers(
+    message: &cose2::Sign1Message,
+    limits: ProcessingLimits,
+) -> Result<(), Error> {
+    validate_protected_encoding(message, limits)?;
     for label in [HEADER_SD_CLAIMS, HEADER_SD_AEAD_ENCRYPTED_CLAIMS] {
         if message.protected.contains_key(label) {
             return Err(Error::custom(format!(
@@ -270,8 +286,7 @@ fn validate_sd_headers(
 }
 
 fn is_sd_cwt_content_type(value: &str) -> bool {
-    let value = value.to_ascii_lowercase();
-    if value == "application/sd-cwt" {
+    if value.eq_ignore_ascii_case("application/sd-cwt") {
         return true;
     }
     let Some((type_name, subtype)) = value.split_once('/') else {
@@ -279,12 +294,17 @@ fn is_sd_cwt_content_type(value: &str) -> bool {
     };
     is_media_type_token(type_name)
         && is_media_type_token(subtype)
-        && !subtype.starts_with('+')
-        && subtype.ends_with("+sd-cwt")
+        && subtype
+            .rsplit_once('+')
+            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("sd-cwt"))
 }
 
 fn is_media_type_token(value: &str) -> bool {
-    !value.is_empty()
+    value.len() <= 127
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
                 || matches!(
@@ -312,7 +332,6 @@ fn is_fully_specified_signature_algorithm(algorithm: i64) -> bool {
             | cose2::iana::AlgorithmML_DSA_65
             | cose2::iana::AlgorithmML_DSA_44
             | cose2::iana::AlgorithmES256K
-            | cose2::iana::AlgorithmHSS_LMS
             | cose2::iana::AlgorithmPS512
             | cose2::iana::AlgorithmPS384
             | cose2::iana::AlgorithmPS256
@@ -418,7 +437,7 @@ fn validate_safe_headers(
     Ok(())
 }
 
-fn validate_safe_value(
+pub(super) fn validate_safe_value(
     value: &Value,
     budget: &mut TraversalBudget,
     depth: usize,
@@ -450,13 +469,13 @@ fn validate_safe_value(
             ) =>
         {
             return Err(Error::UnexpectedType(format!(
-                "SD-CWT reserved tag {tag} is not permitted in this header value"
+                "SD-CWT reserved tag {tag} is not permitted in a safe value"
             )));
         }
         Value::Tag(_, inner) => validate_safe_value(inner, budget, depth + 1)?,
         Value::Simple(simple) if simple.value() == REDACTED_CLAIM_KEYS_SIMPLE => {
             return Err(Error::UnexpectedType(
-                "simple(59) is not permitted in this header value".into(),
+                "simple(59) is not permitted in an SD-CWT safe value".into(),
             ));
         }
         _ => {}
@@ -468,14 +487,22 @@ pub(super) fn validate_disclosure_value(
     disclosure: &DisclosureKind,
     limits: ProcessingLimits,
 ) -> Result<(), Error> {
-    let (value, fixed_items) = match disclosure {
-        DisclosureKind::Claim { value, .. } => (value, 3),
-        DisclosureKind::Element { value, .. } => (value, 2),
-        DisclosureKind::Decoy { .. } => return Ok(()),
+    let (arity, value) = match disclosure {
+        DisclosureKind::Claim { value, .. } => (3, Some(value)),
+        DisclosureKind::Element { value, .. } => (2, Some(value)),
+        DisclosureKind::Decoy { .. } => (1, None),
     };
     let mut budget = TraversalBudget::new(limits);
-    budget.consume(fixed_items)?;
-    validate_issued_value(value, &mut budget, 0)
+    budget.enter(0)?;
+    budget.container(arity)?;
+    budget.enter(1)?; // salt
+    if arity == 3 {
+        budget.enter(1)?; // claim key
+    }
+    if let Some(value) = value {
+        validate_issued_value(value, &mut budget, 1)?;
+    }
+    Ok(())
 }
 
 fn validate_issued_value(
@@ -488,13 +515,14 @@ fn validate_issued_value(
         Value::Map(entries) => {
             budget.container(entries.len())?;
             let mut keys = HashSet::with_capacity(entries.len());
+            let mut saw_markers = false;
             for (key, value) in entries {
                 budget.enter(depth + 1)?;
-                let canonical = cbor2::to_canonical_vec(key)?;
-                if !keys.insert(canonical) {
-                    return Err(Error::verify("duplicate issued SD-CWT map key"));
-                }
                 if is_redacted_claim_keys_label(key) {
+                    if saw_markers {
+                        return Err(Error::verify("duplicate issued SD-CWT map key"));
+                    }
+                    saw_markers = true;
                     let Value::Array(hashes) = value else {
                         return Err(Error::UnexpectedType(
                             "redacted_claim_keys value must be an array".into(),
@@ -507,11 +535,9 @@ fn validate_issued_value(
                         expect_bytes(hash, "redacted_claim_keys entry")?;
                     }
                 } else {
-                    label_from_value(key).map_err(|_| {
-                        Error::UnexpectedType(
-                            "issued SD-CWT map keys must be integers or text".into(),
-                        )
-                    })?;
+                    if !keys.insert(label_from_value(key)?) {
+                        return Err(Error::verify("duplicate issued SD-CWT map key"));
+                    }
                     validate_issued_value(value, budget, depth + 1)?;
                 }
             }
@@ -598,38 +624,35 @@ fn map_value(entries: &[(Value, Value)], label: i64) -> Option<&Value> {
     })
 }
 
-pub(super) fn claim_maps<'a>(
-    payload: &'a [(Value, Value)],
-    protected_claims: Option<&'a Value>,
-) -> Vec<&'a [(Value, Value)]> {
-    let mut maps = vec![payload];
-    if let Some(Value::Map(entries)) = protected_claims {
-        maps.push(entries);
-    }
-    maps
-}
-
 fn claim_value<'a>(maps: &[&'a [(Value, Value)]], label: i64) -> Option<&'a Value> {
     maps.iter().find_map(|entries| map_value(entries, label))
 }
 
-pub(super) fn validate_matching_claims(maps: &[&[(Value, Value)]]) -> Result<(), Error> {
-    let mut seen = HashMap::<Vec<u8>, (usize, &Value)>::new();
-    for (map_index, entries) in maps.iter().enumerate() {
-        for (key, value) in *entries {
-            if is_redacted_claim_keys_label(key) {
-                continue;
-            }
-            let key_bytes = safe_map_key(key)?;
-            if let Some((previous_map, previous)) = seen.insert(key_bytes, (map_index, value)) {
-                if previous_map == map_index {
-                    return Err(Error::verify(format!("duplicate SD-CWT claim key {key}")));
-                }
-                if !claim_values_match(previous, value)? {
-                    return Err(Error::verify(format!(
-                        "CWT_Claims header and payload disagree for claim {key}"
-                    )));
-                }
+fn visible_map(entries: &[(Value, Value)]) -> Result<HashMap<Label, &Value>, Error> {
+    entries
+        .iter()
+        .filter(|(key, _)| !is_redacted_claim_keys_label(key))
+        .map(|(key, value)| Ok((label_from_value(key)?, value)))
+        .collect()
+}
+
+fn validate_matching_claims(
+    payload: &[(Value, Value)],
+    header: &[(Value, Value)],
+    limits: ProcessingLimits,
+) -> Result<(), Error> {
+    // Restoration has already rejected duplicate keys within each map.
+    let mut budget = TraversalBudget::new(limits);
+    let header = visible_map(header)?;
+    for (key, value) in payload {
+        if is_redacted_claim_keys_label(key) {
+            continue;
+        }
+        if let Some(other) = header.get(&label_from_value(key)?) {
+            if !claim_values_match(value, other, &mut budget)? {
+                return Err(Error::verify(format!(
+                    "CWT_Claims header and payload disagree for claim {key}"
+                )));
             }
         }
     }
@@ -638,77 +661,142 @@ pub(super) fn validate_matching_claims(maps: &[&[(Value, Value)]]) -> Result<(),
 
 /// Compares the visible parts of restored claims. Unmatched hashes conceal
 /// values (or decoys), so their bytes are not evidence of a value mismatch.
-fn claim_values_match(left: &Value, right: &Value) -> Result<bool, Error> {
+fn claim_values_match(
+    left: &Value,
+    right: &Value,
+    budget: &mut TraversalBudget,
+) -> Result<bool, Error> {
+    budget.consume(1)?;
     match (left, right) {
         (Value::Map(left), Value::Map(right)) => {
-            let left_hidden = left
-                .iter()
-                .any(|(key, _)| is_redacted_claim_keys_label(key));
-            let right_hidden = right
-                .iter()
-                .any(|(key, _)| is_redacted_claim_keys_label(key));
-            let mut right_values = right
-                .iter()
-                .filter(|(key, _)| !is_redacted_claim_keys_label(key))
-                .map(|(key, value)| Ok((label_from_value(key)?, value)))
-                .collect::<Result<HashMap<_, _>, Error>>()?;
+            budget.consume(left.len())?;
+            budget.consume(right.len())?;
+            let hidden_count = |entries: &[(Value, Value)]| {
+                entries
+                    .iter()
+                    .find_map(|(key, value)| match value {
+                        Value::Array(hashes) if is_redacted_claim_keys_label(key) => {
+                            Some(hashes.len())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(0)
+            };
+            let mut right_hidden = hidden_count(right);
+            let mut right_values = visible_map(right)?;
             for (key, value) in left {
                 if is_redacted_claim_keys_label(key) {
                     continue;
                 }
                 match right_values.remove(&label_from_value(key)?) {
-                    Some(other) if !claim_values_match(value, other)? => return Ok(false),
-                    None if !right_hidden => return Ok(false),
+                    Some(other) if !claim_values_match(value, other, budget)? => return Ok(false),
+                    None if right_hidden == 0 => return Ok(false),
+                    None => right_hidden -= 1,
                     _ => {}
                 }
             }
-            Ok(left_hidden || right_values.is_empty())
+            Ok(right_values.len() <= hidden_count(left))
         }
-        (Value::Array(left), Value::Array(right)) => {
-            let left_known = left.iter().filter(|v| !is_redacted_element(v)).count();
-            let right_known = right.iter().filter(|v| !is_redacted_element(v)).count();
-            if left_known > right.len() || right_known > left.len() {
-                return Ok(false);
-            }
-            if left_known == left.len() && right_known == right.len() {
-                for (left, right) in left.iter().zip(right) {
-                    if !claim_values_match(left, right)? {
-                        return Ok(false);
-                    }
-                }
-            } else {
-                // An undisclosed element may be a decoy, so middle positions
-                // cannot be aligned yet. Known prefixes and suffixes can.
-                for (left, right) in left
-                    .iter()
-                    .take_while(|v| !is_redacted_element(v))
-                    .zip(right.iter().take_while(|v| !is_redacted_element(v)))
-                    .chain(
-                        left.iter()
-                            .rev()
-                            .take_while(|v| !is_redacted_element(v))
-                            .zip(right.iter().rev().take_while(|v| !is_redacted_element(v))),
-                    )
-                {
-                    if !claim_values_match(left, right)? {
-                        return Ok(false);
-                    }
-                }
-            }
-            Ok(true)
-        }
+        (Value::Array(left), Value::Array(right)) => arrays_match(left, right, budget),
+        (Value::Bytes(_), Value::Bytes(_))
+        | (Value::Text(_), Value::Text(_))
+        | (Value::Integer(_), Value::Integer(_)) => Ok(left == right),
         (Value::Tag(left_tag, left), Value::Tag(right_tag, right)) if left_tag == right_tag => {
-            claim_values_match(left, right)
+            claim_values_match(left, right, budget)
         }
         _ => Ok(cbor2::to_canonical_vec(left)? == cbor2::to_canonical_vec(right)?),
     }
+}
+
+fn arrays_match(
+    mut left: &[Value],
+    mut right: &[Value],
+    budget: &mut TraversalBudget,
+) -> Result<bool, Error> {
+    budget.consume(left.len())?;
+    budget.consume(right.len())?;
+    // Compare the positions fixed by visible prefixes and suffixes first.
+    while let ([a, a_rest @ ..], [b, b_rest @ ..]) = (left, right) {
+        if is_redacted_element(a) || is_redacted_element(b) {
+            break;
+        }
+        if !claim_values_match(a, b, budget)? {
+            return Ok(false);
+        }
+        (left, right) = (a_rest, b_rest);
+    }
+    while let ([a_rest @ .., a], [b_rest @ .., b]) = (left, right) {
+        if is_redacted_element(a) || is_redacted_element(b) {
+            break;
+        }
+        if !claim_values_match(a, b, budget)? {
+            return Ok(false);
+        }
+        (left, right) = (a_rest, b_rest);
+    }
+
+    let left_visible = left.iter().filter(|v| !is_redacted_element(v)).count();
+    let right_visible = right.iter().filter(|v| !is_redacted_element(v)).count();
+    if left_visible > right.len() || right_visible > left.len() {
+        return Ok(false);
+    }
+    if left_visible == 0 || right_visible == 0 {
+        return Ok(true);
+    }
+    if left_visible == right.len() || right_visible == left.len() {
+        // Every slot on one side has a fixed counterpart on the other.
+        let (visible, fixed) = if left_visible == right.len() {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        for (value, slot) in visible
+            .iter()
+            .filter(|v| !is_redacted_element(v))
+            .zip(fixed)
+        {
+            if !is_redacted_element(slot) && !claim_values_match(value, slot, budget)? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+
+    // reachable[j] means the processed prefixes can describe the same array.
+    // A hidden slot may be skipped as a decoy, or paired with exactly one slot.
+    // Keep one row and charge its cells to the shared budget before visiting it.
+    let (rows, cols) = if left.len() >= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let mut reachable = vec![false; cols.len() + 1];
+    reachable[0] = true;
+    for (j, col) in cols.iter().enumerate() {
+        reachable[j + 1] = reachable[j] && is_redacted_element(col);
+    }
+    for row in rows {
+        budget.consume(cols.len())?;
+        let hidden = is_redacted_element(row);
+        let mut diagonal = reachable[0];
+        reachable[0] &= hidden;
+        for (j, col) in cols.iter().enumerate() {
+            let above = reachable[j + 1];
+            let col_hidden = is_redacted_element(col);
+            reachable[j + 1] = (hidden && above)
+                || (col_hidden && reachable[j])
+                || (diagonal && (hidden || col_hidden || claim_values_match(row, col, budget)?));
+            diagonal = above;
+        }
+    }
+    Ok(reachable[cols.len()])
 }
 
 fn is_redacted_element(value: &Value) -> bool {
     matches!(value, Value::Tag(REDACTED_ELEMENT_TAG, _))
 }
 
-pub(super) fn remove_undisclosed_redactions(value: &mut Value) {
+fn remove_undisclosed_redactions(value: &mut Value) {
     match value {
         Value::Map(entries) => entries.retain_mut(|(key, value)| {
             if is_redacted_claim_keys_label(key) {
@@ -867,4 +955,52 @@ fn validate_time_relationships(maps: &[&[(Value, Value)]]) -> Result<(), Error> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod array_tests {
+    use super::*;
+
+    #[test]
+    fn alignment_agrees_with_all_short_concrete_expansions() {
+        let mut cases = Vec::new();
+        for len in 0..=3 {
+            for mut code in 0..3usize.pow(len) {
+                let mut pattern = Vec::new();
+                let mut expansions = vec![Vec::new()];
+                for _ in 0..len {
+                    let symbol = (code % 3) as u8;
+                    code /= 3;
+                    if symbol < 2 {
+                        pattern.push(Value::from(symbol));
+                        for word in &mut expansions {
+                            word.push(symbol);
+                        }
+                    } else {
+                        pattern.push(crate::redacted_element(vec![0; 32]));
+                        let shorter = expansions.clone(); // the slot is a decoy
+                        for word in shorter {
+                            for value in [0, 1] {
+                                let mut disclosed = word.clone();
+                                disclosed.push(value);
+                                expansions.push(disclosed);
+                            }
+                        }
+                    }
+                }
+                cases.push((pattern, expansions));
+            }
+        }
+        for (left, left_words) in &cases {
+            for (right, right_words) in &cases {
+                let expected = left_words.iter().any(|w| right_words.contains(w));
+                let mut budget = TraversalBudget::new(ProcessingLimits::default());
+                assert_eq!(
+                    arrays_match(left, right, &mut budget).unwrap(),
+                    expected,
+                    "{left:?}, {right:?}"
+                );
+            }
+        }
+    }
 }

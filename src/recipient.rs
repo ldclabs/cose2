@@ -474,11 +474,7 @@ impl Serialize for Recipient {
     {
         self.validate_local().map_err(S::Error::custom)?;
         let protected_raw: Cow<'_, [u8]> = match &self.protected_raw {
-            Some(raw) => {
-                crate::header::validate_protected_state(&self.protected, raw)
-                    .map_err(S::Error::custom)?;
-                Cow::Borrowed(raw)
-            }
+            Some(raw) => Cow::Borrowed(raw),
             None => Cow::Owned(encode_protected(&self.protected).map_err(S::Error::custom)?),
         };
         let len = if self.recipients.is_empty() { 3 } else { 4 };
@@ -534,7 +530,6 @@ impl<'de> Deserialize<'de> for Recipient {
                 }
 
                 let protected = decode_protected(&protected_raw.0).map_err(A::Error::custom)?;
-                validate_header_buckets(&protected, &unprotected).map_err(A::Error::custom)?;
                 let recipient = Recipient {
                     protected,
                     unprotected,

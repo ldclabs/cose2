@@ -149,7 +149,7 @@ impl Header {
                 Ok(Some(ContentType::Text(value.clone())))
             }
             Some(Value::Text(_)) => Err(Error::UnexpectedType(
-                "content type text must contain a valid type/subtype without surrounding whitespace"
+                        "content type must contain a valid media type and parameters without surrounding whitespace"
                     .into(),
             )),
             Some(_) => Err(Error::UnexpectedType(
@@ -315,17 +315,69 @@ fn valid_content_type_text(value: &str) -> bool {
     if value.trim() != value {
         return false;
     }
-    let media_type = value
-        .split_once(';')
-        .map_or(value, |(media_type, _)| media_type);
+    let (media_type, mut parameters) = value.split_at(value.find(';').unwrap_or(value.len()));
+    let media_type = media_type.trim_end_matches([' ', '\t']);
     let Some((type_name, subtype)) = media_type.split_once('/') else {
         return false;
     };
-    is_media_type_token(type_name) && is_media_type_token(subtype)
+    if !is_media_type_token(type_name) || !is_media_type_token(subtype) {
+        return false;
+    }
+    let mut names = std::collections::HashSet::new();
+    while !parameters.is_empty() {
+        let Some(parameter) = parameters.strip_prefix(';') else {
+            return false;
+        };
+        let Some((name, value)) = parameter.trim_start_matches([' ', '\t']).split_once('=') else {
+            return false;
+        };
+        if name.is_empty()
+            || !name.bytes().all(is_parameter_token_byte)
+            || !names.insert(name.to_ascii_lowercase())
+        {
+            return false;
+        }
+        let Some(rest) = after_parameter_value(value) else {
+            return false;
+        };
+        parameters = rest.trim_start_matches([' ', '\t']);
+    }
+    true
+}
+
+// Media type parameter values use the token or quoted-string grammar.
+fn after_parameter_value(value: &str) -> Option<&str> {
+    let Some(quoted) = value.strip_prefix('"') else {
+        let len = value
+            .bytes()
+            .take_while(|&b| is_parameter_token_byte(b))
+            .count();
+        return (len > 0).then(|| &value[len..]);
+    };
+    let mut bytes = quoted.bytes().enumerate();
+    while let Some((offset, mut byte)) = bytes.next() {
+        match byte {
+            b'"' => return Some(&quoted[offset + 1..]),
+            b'\\' => byte = bytes.next()?.1,
+            _ => {}
+        }
+        if byte.is_ascii_control() && byte != b'\t' {
+            return None;
+        }
+    }
+    None
+}
+
+fn is_parameter_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
 fn is_media_type_token(value: &str) -> bool {
-    !value.is_empty()
+    value.len() <= 127
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
                 || matches!(

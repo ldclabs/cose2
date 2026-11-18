@@ -34,14 +34,16 @@ policy for you. Issuers provide 16-byte salts; applications still use
 
 ```toml
 [dependencies]
-cose2 = "0.5"
-sd-cwt = "0.3"
+cbor2 = "1.1.5"
+cose2 = "0.5.2"
+sd-cwt = "0.3.1"
 ```
 
 When working from this repository:
 
 ```toml
 [dependencies]
+cbor2 = "1.1.5"
 cose2 = { path = ".." }
 sd-cwt = { path = "../sd-cwt" }
 ```
@@ -164,6 +166,17 @@ cannot be compared until disclosed. Restrictions on redacting registered CWT
 claims apply to the two root Claims Maps, not to application map keys nested
 inside claim values.
 
+Two partially disclosed arrays can represent the same claim when their
+visible elements align in order and each unmatched hash can stand for one
+element or a decoy. Comparing ambiguous positions uses one row of working
+memory. All duplicate-claim comparisons share a `max_items` work budget;
+exhausting it returns `Error::LimitExceeded`.
+
+The root `cnf` value is a safe map. Its confirmation-key parameters stay
+visible throughout issuance and restoration. If a Verifier receives every
+root disclosure, it can also check that one of the claims actually supplies
+the required subject.
+
 ## Protocol boundaries
 
 - `sd_claims` is an unprotected COSE header parameter. A production
@@ -180,6 +193,10 @@ inside claim values.
   decryption are profile/application responsibilities.
 - Salted disclosures are hashed over their bstr-encoded Salted Disclosed Claim
   bytes. `Disclosure::from_encoded` preserves those exact bytes for hashing.
+  Message restoration checks the supplied hasher against the protected
+  `sd_alg`. SHA-256 redaction hashes have a fixed size of 32 bytes.
+- The disclosure count and byte limits cover the plaintext and encrypted
+  disclosure lists together during structural validation.
 - SD-CWT and disclosure decoders reject indefinite-length CBOR, empty present
   disclosure arrays, duplicate salts or encrypted-disclosure nonces, invalid
   reserved-tag placement, non-label map keys, unsafe nested header maps,

@@ -288,8 +288,26 @@ impl<'a> Parser<'a> {
                 return Ok(Cow::Borrowed(raw));
             }
         }
-        let value: Value = cbor2::from_slice(raw)?;
+        let mut value: Value = cbor2::from_slice(raw)?;
+        normalize_key_zeros(&mut value);
         Ok(Cow::Owned(cbor2::to_canonical_vec(&value)?))
+    }
+}
+
+// RFC 8949 §5.6.1 treats both floating-point zeros as the same map key,
+// including when the key is a compound value. Preserve original wire bytes.
+fn normalize_key_zeros(value: &mut Value) {
+    match value {
+        Value::Float(n) if *n == 0.0 => *n = 0.0,
+        Value::Array(items) => items.iter_mut().for_each(normalize_key_zeros),
+        Value::Map(entries) => {
+            for (k, v) in entries {
+                normalize_key_zeros(k);
+                normalize_key_zeros(v);
+            }
+        }
+        Value::Tag(_, value) => normalize_key_zeros(value),
+        _ => {}
     }
 }
 
@@ -559,6 +577,7 @@ pub(crate) fn tagged_body(data: &[u8], expected_tag: u64) -> Result<&[u8], Error
 }
 
 pub(crate) fn remove_known_tags(data: &[u8]) -> Result<&[u8], Error> {
+    cbor2::validate_slice(data)?;
     let item = root(data, CborLimits::default())?;
     let mut current = &item;
     if current.kind == Kind::Tag(55799) {

@@ -42,7 +42,7 @@ pub struct MacMessage {
     pub recipients: Vec<Recipient>,
     tag: Vec<u8>,
     protected_raw: Vec<u8>,
-    state: util::OperationState,
+    state: util::OperationState<util::PreparedPayload>,
 }
 
 impl MacMessage {
@@ -84,9 +84,10 @@ impl MacMessage {
         kid: Option<&[u8]>,
         external_aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, Error> {
-        self.prepare_tag_headers(alg, kid)?;
-        let payload = util::require_embedded_payload(&self.payload, "MacMessage::prepare_tag")?;
-        Self::to_be_maced(&self.protected_raw, external_aad.unwrap_or(&[]), payload)
+        let input = self.prepare_tag_input(alg, kid, None, external_aad)?;
+        self.state =
+            util::OperationState::Awaiting(util::PreparedPayload::new(self.payload.as_deref()));
+        Ok(input)
     }
 
     /// Prepares this detached-payload message for an externally produced tag.
@@ -100,33 +101,43 @@ impl MacMessage {
         detached_payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<Vec<u8>, Error> {
-        self.prepare_tag_headers(alg, kid)?;
-        let tbm = Self::to_be_maced(
-            &self.protected_raw,
-            external_aad.unwrap_or(&[]),
-            detached_payload,
-        )?;
+        let input = self.prepare_tag_input(alg, kid, Some(detached_payload), external_aad)?;
         self.payload = None;
-        Ok(tbm)
+        self.state = util::OperationState::Awaiting(util::PreparedPayload::new(None));
+        Ok(input)
     }
 
-    fn prepare_tag_headers(&mut self, alg: Option<Label>, kid: Option<&[u8]>) -> Result<(), Error> {
+    fn prepare_tag_input(
+        &mut self,
+        alg: Option<Label>,
+        kid: Option<&[u8]>,
+        detached_payload: Option<&[u8]>,
+        external_aad: Option<&[u8]>,
+    ) -> Result<Vec<u8>, Error> {
+        let payload = match detached_payload {
+            Some(bytes) => bytes,
+            None => util::require_embedded_payload(&self.payload, "MacMessage::prepare_tag")?,
+        };
         validate_message_recipients(&self.recipients, "MacMessage")?;
-        self.protected_raw =
-            util::prepare_headers(&mut self.protected, &mut self.unprotected, alg, kid)?;
-        self.state = util::OperationState::Prepared;
+        let raw = util::prepare_headers(&mut self.protected, &mut self.unprotected, alg, kid)?;
+        let input = Self::to_be_maced(&raw, external_aad.unwrap_or_default(), payload)?;
+        self.protected_raw = raw;
         self.tag.clear();
-        Ok(())
+        self.state = util::OperationState::Prepared;
+        Ok(input)
     }
 
     /// Stores externally produced tag bytes on this message.
     pub fn set_tag(&mut self, tag: impl Into<Vec<u8>>) -> Result<(), Error> {
         validate_message_recipients(&self.recipients, "MacMessage")?;
+        if let util::OperationState::Awaiting(inputs) = &self.state {
+            inputs.check(self.payload.as_deref())?;
+        }
         util::sync_protected_raw(
             &self.protected,
             &self.unprotected,
             &mut self.protected_raw,
-            self.state,
+            &self.state,
         )?;
         self.tag = tag.into();
         self.state = util::OperationState::Complete;
@@ -135,11 +146,8 @@ impl MacMessage {
 
     /// Computes the authentication tag with `macer`.
     pub fn compute(&mut self, macer: &dyn Macer, external_aad: Option<&[u8]>) -> Result<(), Error> {
-        self.prepare_tag_headers(macer.alg(), macer.kid())?;
-        let payload = util::require_embedded_payload(&self.payload, "MacMessage::compute")?;
-        let tbm = Self::to_be_maced(&self.protected_raw, external_aad.unwrap_or(&[]), payload)?;
-        // The recipients and headers were validated just above.
-        self.tag = macer.mac_create(&tbm)?;
+        let input = self.prepare_tag_input(macer.alg(), macer.kid(), None, external_aad)?;
+        self.tag = macer.mac_create(&input)?;
         self.state = util::OperationState::Complete;
         Ok(())
     }
@@ -154,15 +162,15 @@ impl MacMessage {
         detached_payload: &[u8],
         external_aad: Option<&[u8]>,
     ) -> Result<(), Error> {
-        self.prepare_tag_headers(macer.alg(), macer.kid())?;
-        let tbm = Self::to_be_maced(
-            &self.protected_raw,
-            external_aad.unwrap_or(&[]),
-            detached_payload,
+        let input = self.prepare_tag_input(
+            macer.alg(),
+            macer.kid(),
+            Some(detached_payload),
+            external_aad,
         )?;
-        self.tag = macer.mac_create(&tbm)?;
-        self.state = util::OperationState::Complete;
+        self.tag = macer.mac_create(&input)?;
         self.payload = None;
+        self.state = util::OperationState::Complete;
         Ok(())
     }
 
@@ -271,6 +279,7 @@ impl MacMessage {
         payload: &[u8],
         external_aad: &[u8],
     ) -> Result<(), Error> {
+        validate_message_recipients(&self.recipients, "MacMessage")?;
         validate_layer(&self.protected, &self.unprotected, &self.protected_raw)?;
         self.protected
             .ensure_crit_understood(macer.understood_critical_headers())?;

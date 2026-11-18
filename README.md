@@ -180,9 +180,9 @@ subset.
   for an empty plaintext.
 - Newly built protected headers and keys serialize with canonical
   (deterministic) CBOR (RFC 8949 §4.2.1).
-- Nonces are taken from the unprotected `IV`, or derived from `Partial IV` by
-  XORing the left-padded partial value with [`Encryptor::base_iv`]. This crate
-  generates no randomness.
+- Encryption uses an `IV` from either header bucket, or derives the nonce by
+  XORing the left-padded `Partial IV` with [`Encryptor::base_iv`]. The caller
+  supplies the IV. The optional ECDSA and RSA signing providers use backend RNGs.
 
 ## Testing
 
@@ -207,13 +207,15 @@ Licensed under the MIT License.
 [cose]: https://datatracker.ietf.org/doc/html/rfc9052
 [cwt]: https://datatracker.ietf.org/doc/html/rfc8392
 [cbor2]: https://crates.io/crates/cbor2
-[ring]: https://crates.io/crates/ring
+[`ring`]: https://crates.io/crates/ring
+[`cbor2::Value`]: https://docs.rs/cbor2/latest/cbor2/enum.Value.html
 [`aws-lc-rs`]: https://crates.io/crates/aws-lc-rs
 [c41]: https://datatracker.ietf.org/doc/html/rfc9052#appendix-C.4
 [`Signer`]: https://docs.rs/cose2/latest/cose2/trait.Signer.html
 [`Verifier`]: https://docs.rs/cose2/latest/cose2/trait.Verifier.html
 [`Macer`]: https://docs.rs/cose2/latest/cose2/trait.Macer.html
 [`Encryptor`]: https://docs.rs/cose2/latest/cose2/trait.Encryptor.html
+[`Encryptor::base_iv`]: https://docs.rs/cose2/latest/cose2/trait.Encryptor.html#method.base_iv
 [`iana`]: https://docs.rs/cose2/latest/cose2/iana/index.html
 [`Header`]: https://docs.rs/cose2/latest/cose2/struct.Header.html
 [`Key`]: https://docs.rs/cose2/latest/cose2/struct.Key.html

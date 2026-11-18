@@ -26,7 +26,7 @@ const NONCE_LEN: usize = 12;
 pub struct AesGcmEncryptor {
     alg: i64,
     kid: Option<Vec<u8>>,
-    cipher: Arc<AesGcmCipher>,
+    cipher: AesGcmCipher,
     // Retained so the symmetric `k` can be re-exported by `to_cose_key`; the
     // cipher does not expose its raw bytes. The shared allocation is zeroized
     // when the final clone is dropped.
@@ -35,22 +35,22 @@ pub struct AesGcmEncryptor {
     key_ops: Option<Vec<Label>>,
 }
 
-// The variants are boxed because AES-256's key schedule is markedly larger
-// than AES-128's, which would otherwise bloat every `AesGcmEncryptor`.
+// Clones share the selected key schedule in a single allocation.
+#[derive(Clone)]
 enum AesGcmCipher {
-    Aes128(Box<Aes128Gcm>),
-    Aes256(Box<Aes256Gcm>),
+    Aes128(Arc<Aes128Gcm>),
+    Aes256(Arc<Aes256Gcm>),
 }
 
 impl AesGcmEncryptor {
     /// Creates a provider from a COSE AES-GCM algorithm and raw key bytes.
     pub fn new(alg: i64, key: &[u8], kid: Option<Vec<u8>>) -> Result<Self, Error> {
         let cipher = match alg {
-            iana::AlgorithmA128GCM => AesGcmCipher::Aes128(Box::new(
+            iana::AlgorithmA128GCM => AesGcmCipher::Aes128(Arc::new(
                 Aes128Gcm::new_from_slice(key)
                     .map_err(|_| Error::custom("invalid A128GCM key length"))?,
             )),
-            iana::AlgorithmA256GCM => AesGcmCipher::Aes256(Box::new(
+            iana::AlgorithmA256GCM => AesGcmCipher::Aes256(Arc::new(
                 Aes256Gcm::new_from_slice(key)
                     .map_err(|_| Error::custom("invalid A256GCM key length"))?,
             )),
@@ -59,7 +59,7 @@ impl AesGcmEncryptor {
         Ok(Self {
             alg,
             kid,
-            cipher: Arc::new(cipher),
+            cipher,
             raw_key: Arc::new(Zeroizing::new(key.to_vec())),
             base_iv: None,
             key_ops: None,
@@ -73,21 +73,19 @@ impl AesGcmEncryptor {
     pub fn from_cose_key(key: &Key) -> Result<Self, Error> {
         key.require_integer_kty(iana::KeyTypeSymmetric)?;
         let alg = key.required_integer_alg("AES-GCM backend")?;
+        let ops = key.ops()?;
+        crate::util::require_key_ops(
+            &ops,
+            &[iana::KeyOperationEncrypt, iana::KeyOperationDecrypt],
+            "encryption or decryption",
+        )?;
         let mut encryptor = Self::new(
             alg,
             key.required_bytes(iana::SymmetricKeyParameterK, "k")?,
             key.kid_owned()?,
         )?;
         encryptor.base_iv = key.base_iv()?.map(ToOwned::to_owned);
-        encryptor.key_ops = key.ops()?;
-        if !crate::util::key_ops_allow(
-            &encryptor.key_ops,
-            &[iana::KeyOperationEncrypt, iana::KeyOperationDecrypt],
-        ) {
-            return Err(Error::custom(
-                "COSE_Key key_ops permits neither encryption nor decryption",
-            ));
-        }
+        encryptor.key_ops = ops;
         Ok(encryptor)
     }
 
@@ -153,7 +151,7 @@ impl Encryptor for AesGcmEncryptor {
             msg: plaintext,
             aad,
         };
-        match self.cipher.as_ref() {
+        match &self.cipher {
             AesGcmCipher::Aes128(c) => aead_seal(c.as_ref(), nonce, payload),
             AesGcmCipher::Aes256(c) => aead_seal(c.as_ref(), nonce, payload),
         }
@@ -165,7 +163,7 @@ impl Encryptor for AesGcmEncryptor {
             msg: ciphertext,
             aad,
         };
-        match self.cipher.as_ref() {
+        match &self.cipher {
             AesGcmCipher::Aes128(c) => aead_open(c.as_ref(), nonce, payload),
             AesGcmCipher::Aes256(c) => aead_open(c.as_ref(), nonce, payload),
         }

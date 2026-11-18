@@ -5,30 +5,85 @@ use crate::{
     Error, Header, Label,
 };
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum OperationState {
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum OperationState<Inputs = ()> {
     #[default]
     New,
     Prepared,
+    Awaiting(Inputs),
     Complete,
 }
 
-impl OperationState {
-    pub(crate) fn initialized(self) -> bool {
-        self != Self::New
+impl<Inputs> OperationState<Inputs> {
+    pub(crate) fn initialized(&self) -> bool {
+        !matches!(self, Self::New)
     }
 
-    pub(crate) fn complete(self) -> bool {
-        self == Self::Complete
+    pub(crate) fn complete(&self) -> bool {
+        matches!(self, Self::Complete)
     }
 
     /// Returns [`Error::InvalidState`] with `message` unless complete.
-    pub(crate) fn require_complete(self, message: &str) -> Result<(), Error> {
+    pub(crate) fn require_complete(&self, message: &str) -> Result<(), Error> {
         if self.complete() {
             Ok(())
         } else {
             Err(Error::InvalidState(message.into()))
         }
+    }
+}
+
+/// Exact input retained only while waiting for an external operation.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PreparedPayload(Option<Box<[u8]>>);
+
+impl std::fmt::Debug for PreparedPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PreparedPayload")
+            .field(&self.0.as_ref().map(|bytes| bytes.len()))
+            .finish()
+    }
+}
+
+impl PreparedPayload {
+    pub(crate) fn new(payload: Option<&[u8]>) -> Self {
+        Self(payload.map(Into::into))
+    }
+
+    pub(crate) fn check(&self, payload: Option<&[u8]>) -> Result<(), Error> {
+        if self.0.as_deref() != payload {
+            return Err(Error::invalid_state("payload changed after preparation"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedEncryption {
+    plaintext: PreparedPayload,
+    iv: Option<Box<[u8]>>,
+    partial_iv: Option<Box<[u8]>>,
+}
+
+impl PreparedEncryption {
+    pub(crate) fn new(payload: Option<&[u8]>, unprotected: &Header) -> Result<Self, Error> {
+        Ok(Self {
+            plaintext: PreparedPayload::new(payload),
+            iv: unprotected.iv()?.map(Into::into),
+            partial_iv: unprotected.partial_iv()?.map(Into::into),
+        })
+    }
+
+    pub(crate) fn check(&self, payload: Option<&[u8]>, unprotected: &Header) -> Result<(), Error> {
+        self.plaintext.check(payload)?;
+        if self.iv.as_deref() != unprotected.iv()?
+            || self.partial_iv.as_deref() != unprotected.partial_iv()?
+        {
+            return Err(Error::invalid_state(
+                "IV or Partial IV changed after preparation",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -48,28 +103,36 @@ pub(crate) fn prepare_headers(
 
 /// Readies a layer to store an externally produced result: rechecks prepared
 /// protected bytes, or encodes them canonically for a newly built layer.
-pub(crate) fn sync_protected_raw(
+pub(crate) fn sync_protected_raw<Inputs>(
     protected: &Header,
     unprotected: &Header,
     protected_raw: &mut Vec<u8>,
-    state: OperationState,
+    state: &OperationState<Inputs>,
 ) -> Result<(), Error> {
+    if let Some(raw) = protected_raw_for_result(protected, unprotected, protected_raw, state)? {
+        *protected_raw = raw;
+    }
+    Ok(())
+}
+
+/// Returns new protected bytes only for a layer that has never been prepared.
+pub(crate) fn protected_raw_for_result<Inputs>(
+    protected: &Header,
+    unprotected: &Header,
+    protected_raw: &[u8],
+    state: &OperationState<Inputs>,
+) -> Result<Option<Vec<u8>>, Error> {
     if state.initialized() {
-        validate_layer(protected, unprotected, protected_raw)
+        validate_layer(protected, unprotected, protected_raw)?;
+        Ok(None)
     } else {
         validate_header_buckets(protected, unprotected)?;
-        *protected_raw = encode_protected(protected)?;
-        Ok(())
+        encode_protected(protected).map(Some)
     }
 }
 
-#[cfg(any(
-    feature = "crypto-ring",
-    feature = "crypto-aws-lc-rs",
-    feature = "crypto-aes-gcm"
-))]
-pub(crate) fn key_ops_allow(ops: &Option<Vec<Label>>, allowed: &[i64]) -> bool {
-    ops.as_ref().is_none_or(|ops| {
+pub(crate) fn key_ops_allow(ops: Option<&[Label]>, allowed: &[i64]) -> bool {
+    ops.is_none_or(|ops| {
         ops.iter()
             .any(|op| matches!(op, Label::Int(value) if allowed.contains(value)))
     })
@@ -85,7 +148,7 @@ pub(crate) fn require_key_ops(
     allowed: &[i64],
     operation: &str,
 ) -> Result<(), Error> {
-    if key_ops_allow(ops, allowed) {
+    if key_ops_allow(ops.as_deref(), allowed) {
         Ok(())
     } else {
         Err(Error::key_operation(format!(
@@ -94,8 +157,6 @@ pub(crate) fn require_key_ops(
     }
 }
 
-/// Maps payload bytes to the CBOR value used in the `*_structure` to be
-/// signed or MACed.
 /// Returns an embedded payload, or an error that points callers at the
 /// detached-payload API.
 pub(crate) fn require_embedded_payload<'a>(
@@ -297,7 +358,7 @@ pub(crate) fn nonce_from_header_values(
 
     let Some(partial_iv) = partial_iv else {
         return Err(Error::Custom(
-            "missing IV or Partial IV in unprotected header".into(),
+            "missing IV or Partial IV in message headers".into(),
         ));
     };
     let base_iv = base_iv.ok_or_else(|| Error::Custom("Partial IV requires a Base IV".into()))?;

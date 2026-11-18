@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cbor2::Cbor;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{iana, tag, CoseMap, Error, Value};
+use crate::{iana, tag, CoseMap, Error, Label, Value};
 
 const MAX_CLOCK_SKEW_SECS: u64 = 10 * 60;
 
@@ -56,12 +56,11 @@ impl NumericDate {
                 compare_f64_to_i128(right, left).map(Ordering::reverse)
             }
             (Self::Float(left), Self::Integer(right)) => compare_f64_to_i128(left, right),
-            (Self::Float(left), Self::Float(right)) => left.partial_cmp(&right),
+            (Self::Float(left), Self::Float(right)) if left.is_finite() && right.is_finite() => {
+                left.partial_cmp(&right)
+            }
+            (Self::Float(_), Self::Float(_)) => None,
         }
-    }
-
-    fn partial_cmp_integer(self, other: i128) -> Option<Ordering> {
-        self.compare(Self::Integer(other))
     }
 }
 
@@ -233,6 +232,11 @@ impl<'de> Deserialize<'de> for Audience {
 }
 
 /// The common, typed subset of CWT claims (RFC 8392 §3).
+///
+/// In JSON the seven registered labels use their claim names. Other integer
+/// labels use canonical decimal object names. Private text labels colliding
+/// with either form return a serialization error. CBOR preserves both label
+/// types directly.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Claims {
     /// Issuer (`iss`, claim 1).
@@ -249,7 +253,8 @@ pub struct Claims {
     pub issued_at: Option<NumericDate>,
     /// CWT ID (`cti`, claim 7).
     pub cwt_id: Option<Vec<u8>>,
-    /// Additional CWT claims.
+    /// Additional CWT claims. A registered claim supplied here must have its
+    /// registered type and must not also be set in the corresponding field.
     pub extra: CoseMap,
 }
 
@@ -267,43 +272,76 @@ impl Cbor for Claims {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(remote = "Claims")]
 struct HumanClaims {
-    #[serde(rename = "iss", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "iss",
+        alias = "1",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     issuer: Option<String>,
-    #[serde(rename = "sub", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "sub",
+        alias = "2",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     subject: Option<String>,
-    #[serde(rename = "aud", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "aud",
+        alias = "3",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     audience: Option<Audience>,
-    #[serde(rename = "exp", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "exp",
+        alias = "4",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     expiration: Option<NumericDate>,
-    #[serde(rename = "nbf", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "nbf",
+        alias = "5",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     not_before: Option<NumericDate>,
-    #[serde(rename = "iat", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "iat",
+        alias = "6",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     issued_at: Option<NumericDate>,
     #[serde(
         rename = "cti",
+        alias = "7",
         with = "serde_bytes",
         skip_serializing_if = "Option::is_none",
         default
     )]
     cwt_id: Option<Vec<u8>>,
-    #[serde(flatten, default)]
+    #[serde(flatten, default, deserialize_with = "deserialize_human_extra")]
     extra: CoseMap,
 }
 
-impl From<HumanClaims> for Claims {
-    fn from(value: HumanClaims) -> Self {
-        Self {
-            issuer: value.issuer,
-            subject: value.subject,
-            audience: value.audience,
-            expiration: value.expiration,
-            not_before: value.not_before,
-            issued_at: value.issued_at,
-            cwt_id: value.cwt_id,
-            extra: value.extra,
-        }
-    }
+// JSON object names are strings. Canonical decimal names stand for integer
+// labels; other extension names keep their spelling.
+fn decimal_label(name: &str) -> Option<i64> {
+    let n: i64 = name.parse().ok()?;
+    (n.to_string() == name).then_some(n)
+}
+
+fn deserialize_human_extra<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<CoseMap, D::Error> {
+    CoseMap::deserialize_with_labels(deserializer, |key| match key {
+        Label::Text(name) => decimal_label(&name).map_or(Label::Text(name), Label::Int),
+        key => key,
+    })
 }
 
 fn insert_claim(map: &mut CoseMap, key: i64, value: Value) -> Result<(), Error> {
@@ -359,13 +397,18 @@ impl Claims {
         Self::default()
     }
 
-    fn to_map(&self) -> Result<CoseMap, Error> {
-        let mut map = self.extra.clone();
+    fn registered_extra(&self) -> CoseMap {
+        (iana::CWTClaimIss..=iana::CWTClaimCti)
+            .filter_map(|key| self.extra.get(key).map(|v| (key.into(), v.clone())))
+            .collect()
+    }
+
+    fn insert_typed_fields(&self, map: &mut CoseMap) -> Result<(), Error> {
         if let Some(value) = &self.issuer {
-            insert_claim(&mut map, iana::CWTClaimIss, Value::Text(value.clone()))?;
+            insert_claim(map, iana::CWTClaimIss, Value::Text(value.clone()))?;
         }
         if let Some(value) = &self.subject {
-            insert_claim(&mut map, iana::CWTClaimSub, Value::Text(value.clone()))?;
+            insert_claim(map, iana::CWTClaimSub, Value::Text(value.clone()))?;
         }
         if let Some(value) = &self.audience {
             let value = match value {
@@ -374,7 +417,7 @@ impl Claims {
                     Value::Array(values.iter().cloned().map(Value::Text).collect())
                 }
             };
-            insert_claim(&mut map, iana::CWTClaimAud, value)?;
+            insert_claim(map, iana::CWTClaimAud, value)?;
         }
         for (key, value) in [
             (iana::CWTClaimExp, self.expiration),
@@ -382,12 +425,22 @@ impl Claims {
             (iana::CWTClaimIat, self.issued_at),
         ] {
             if let Some(value) = value {
-                insert_claim(&mut map, key, numeric_date_value(value)?)?;
+                insert_claim(map, key, numeric_date_value(value)?)?;
             }
         }
         if let Some(value) = &self.cwt_id {
-            insert_claim(&mut map, iana::CWTClaimCti, Value::Bytes(value.clone()))?;
+            insert_claim(map, iana::CWTClaimCti, Value::Bytes(value.clone()))?;
         }
+        Ok(())
+    }
+
+    fn to_map(&self) -> Result<CoseMap, Error> {
+        let extra = self.registered_extra();
+        if !extra.is_empty() {
+            Self::from_map(extra)?;
+        }
+        let mut map = self.extra.clone();
+        self.insert_typed_fields(&mut map)?;
         Ok(map)
     }
 
@@ -469,17 +522,30 @@ impl Claims {
 impl Serialize for Claims {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         if serializer.is_human_readable() {
-            HumanClaims {
-                issuer: self.issuer.clone(),
-                subject: self.subject.clone(),
-                audience: self.audience.clone(),
-                expiration: self.expiration,
-                not_before: self.not_before,
-                issued_at: self.issued_at,
-                cwt_id: self.cwt_id.clone(),
-                extra: self.extra.clone(),
+            let mut has_registered_extra = false;
+            for (label, _) in &self.extra {
+                match label {
+                    Label::Text(name)
+                        if Claims::KEYS.iter().any(|(key, _)| key == name)
+                            || decimal_label(name).is_some() =>
+                    {
+                        return Err(serde::ser::Error::custom(format!(
+                            "private text claim {name:?} conflicts with an integer claim name"
+                        )));
+                    }
+                    Label::Int(1..=7) => has_registered_extra = true,
+                    _ => {}
+                }
             }
-            .serialize(serializer)
+            if has_registered_extra {
+                let normalized = self
+                    .to_map()
+                    .and_then(Self::from_map)
+                    .map_err(serde::ser::Error::custom)?;
+                HumanClaims::serialize(&normalized, serializer)
+            } else {
+                HumanClaims::serialize(self, serializer)
+            }
         } else {
             self.to_map()
                 .map_err(serde::ser::Error::custom)?
@@ -491,7 +557,7 @@ impl Serialize for Claims {
 impl<'de> Deserialize<'de> for Claims {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if deserializer.is_human_readable() {
-            HumanClaims::deserialize(deserializer).map(Claims::from)
+            HumanClaims::deserialize(deserializer)
         } else {
             let map = CoseMap::deserialize(deserializer)?;
             Self::from_map(map).map_err(de::Error::custom)
@@ -524,7 +590,7 @@ pub mod numeric_date {
     }
 }
 
-/// A CWT claims set keyed by [`Label`](crate::Label), preserving all claims.
+/// A CWT claims set keyed by [`Label`], preserving all claims.
 pub type ClaimsMap = CoseMap;
 
 /// Options controlling [`Validator`] behaviour.
@@ -582,21 +648,39 @@ impl Validator {
         Ok(Self { opts })
     }
 
-    fn now(&self) -> i128 {
-        self.opts.fixed_now.map(i128::from).unwrap_or_else(|| {
-            match SystemTime::now().duration_since(UNIX_EPOCH) {
-                Ok(duration) => i128::from(duration.as_secs()),
-                Err(error) => {
-                    let duration = error.duration();
-                    -i128::from(duration.as_secs())
-                        - i128::from(u8::from(duration.subsec_nanos() != 0))
-                }
-            }
-        })
+    fn clock_bounds(&self, clock: impl FnOnce() -> SystemTime) -> (NumericDate, NumericDate) {
+        if let Some(now) = self.opts.fixed_now {
+            let now = i128::from(now);
+            let skew = i128::from(self.opts.clock_skew_secs);
+            return (
+                NumericDate::Integer(now - skew),
+                NumericDate::Integer(now + skew),
+            );
+        }
+        let now = match clock().duration_since(UNIX_EPOCH) {
+            Ok(duration) => duration.as_secs_f64(),
+            Err(error) => -error.duration().as_secs_f64(),
+        };
+        let skew = self.opts.clock_skew_secs as f64;
+        (
+            NumericDate::Float(now - skew),
+            NumericDate::Float(now + skew),
+        )
     }
 
     /// Validates typed claims.
     pub fn validate(&self, claims: &Claims) -> Result<(), Error> {
+        // A caller can supply registered integer labels through the public
+        // extra map. Apply the same policy before and after a wire round trip.
+        let mut extra = claims.registered_extra();
+        let merged;
+        let claims = if extra.is_empty() {
+            claims
+        } else {
+            claims.insert_typed_fields(&mut extra)?;
+            merged = Claims::from_map(extra)?;
+            &merged
+        };
         self.check_times(claims.expiration, claims.not_before, claims.issued_at)?;
         self.check_identity(claims.issuer.as_deref(), claims.audience.as_ref())
     }
@@ -620,32 +704,30 @@ impl Validator {
         nbf: Option<NumericDate>,
         iat: Option<NumericDate>,
     ) -> Result<(), Error> {
-        let now = self.now();
-        let skew = i128::from(self.opts.clock_skew_secs);
+        let (earliest, latest) = self.clock_bounds(SystemTime::now);
 
         match exp.map(NumericDate::validate).transpose()? {
             None if !self.opts.allow_missing_expiration => {
                 return Err(Error::Custom("token doesn't have an expiration set".into()));
             }
-            Some(exp) if exp.partial_cmp_integer(now - skew) != Some(Ordering::Greater) => {
+            Some(exp) if exp.compare(earliest) != Some(Ordering::Greater) => {
                 return Err(Error::Custom("token has expired".into()));
             }
             _ => {}
         }
 
         if let Some(nbf) = nbf.map(NumericDate::validate).transpose()? {
-            if nbf.partial_cmp_integer(now + skew) == Some(Ordering::Greater) {
+            if nbf.compare(latest) == Some(Ordering::Greater) {
                 return Err(Error::Custom("token cannot be used yet".into()));
             }
         }
 
-        if self.opts.expect_issued_in_the_past {
-            if let Some(iat) = iat.map(NumericDate::validate).transpose()? {
-                if iat.partial_cmp_integer(now + skew) == Some(Ordering::Greater) {
-                    return Err(Error::Custom(
-                        "token has an invalid iat claim in the future".into(),
-                    ));
-                }
+        if let Some(iat) = iat.map(NumericDate::validate).transpose()? {
+            if self.opts.expect_issued_in_the_past && iat.compare(latest) == Some(Ordering::Greater)
+            {
+                return Err(Error::Custom(
+                    "token has an invalid iat claim in the future".into(),
+                ));
             }
         }
         Ok(())
@@ -671,5 +753,30 @@ impl Validator {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn system_clock_bounds_retain_fractional_seconds() {
+        let validator = Validator::new(ValidatorOptions {
+            clock_skew_secs: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        let half = Duration::from_millis(500);
+        for (now, start, end) in [
+            (UNIX_EPOCH + half, -0.5, 1.5),
+            (UNIX_EPOCH - half, -1.5, 0.5),
+        ] {
+            assert_eq!(
+                validator.clock_bounds(|| now),
+                (NumericDate::Float(start), NumericDate::Float(end))
+            );
+        }
     }
 }

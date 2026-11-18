@@ -20,6 +20,12 @@ string and array forms. Time fields use `Option<NumericDate>`, retaining
 integer, fractional, and pre-epoch values. Integer construction uses
 `NumericDate::from(value)`; finite floats use `NumericDate::from_f64(value)?`.
 
+In 0.5.2, JSON reserves the seven registered claim names and canonical decimal
+integer names. For example, CBOR can carry both claim 4 and a private text
+label `"exp"`. Serializing this pair as JSON returns an error. Numeric JSON
+object names decode to integer labels, and numeric aliases for registered
+claims use the same type and duplicate checks as their named forms.
+
 ## Algorithms and key use
 
 Raw Ed25519 constructors now advertise the fully specified IANA Ed25519
@@ -60,6 +66,8 @@ behavior.
 values above 65535. Use `ContentType::try_from` when converting wider unsigned
 integers. Header serialization also rejects malformed media-type text and a
 layer containing both `IV` and `Partial IV`.
+Media type parameters accept token and quoted values. Incomplete parameters,
+duplicate names and malformed quoted strings produce an error.
 
 Detached `encrypt_detached_and_encode()` transfers ciphertext ownership into
 its return value, so the sender message's `ciphertext()` is empty afterward.

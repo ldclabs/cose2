@@ -1,8 +1,8 @@
 //! Disclosure matching, bounded restoration and removal of undisclosed claims.
 
 use crate::validation::{
-    claim_maps, definite_cbor_limits, protected_cwt_claims, remove_undisclosed_redactions,
-    validate_matching_claims, validate_root_disclosure_key,
+    definite_cbor_limits, protected_cwt_claims, validate_protected_encoding,
+    validate_root_disclosure_key, validate_safe_value,
 };
 use crate::{
     default_hasher_for_sd_alg, disclosures_from_unprotected, expect_owned_bytes,
@@ -118,26 +118,14 @@ where
     let mut budget = TraversalBudget::new(limits);
     let mut pending = DisclosureMap::new(disclosures, hasher, &mut budget)?;
     pending.validate_claims = validate_claims;
-    let mut protected_claims = protected_claims
+    let protected_claims = protected_claims
         .map(|claims| restore_value(claims, &mut pending, mode, &mut stats, &mut budget, 0))
         .transpose()?;
-    let mut value = restore_value(value, &mut pending, mode, &mut stats, &mut budget, 0)?;
+    let value = restore_value(value, &mut pending, mode, &mut stats, &mut budget, 0)?;
     if !pending.is_empty() {
         return Err(Error::verify(
             "sd_claims contains a disclosure without a matching redacted claim",
         ));
-    }
-    if validate_claims {
-        let Value::Map(entries) = &value else {
-            unreachable!("the structural validator requires a claims map");
-        };
-        // Preserve undisclosed markers until comparison: removing them first
-        // loses the distinction between absent and still-hidden fields.
-        validate_matching_claims(&claim_maps(entries, protected_claims.as_ref()))?;
-        remove_undisclosed_redactions(&mut value);
-        if let Some(claims) = &mut protected_claims {
-            remove_undisclosed_redactions(claims);
-        }
     }
     Ok(RestoreReport {
         value,
@@ -205,6 +193,15 @@ where
     I: IntoIterator<Item = Disclosure>,
 {
     message.validate_headers()?;
+    validate_protected_encoding(message, limits)?;
+    let declared = sd_alg(&message.protected)?.unwrap_or(crate::ALG_SHA_256);
+    let expected = hasher.algorithm();
+    if declared != expected {
+        return Err(Error::AlgorithmMismatch {
+            declared: declared.to_string(),
+            expected: expected.to_string(),
+        });
+    }
     let payload = message
         .payload
         .as_deref()
@@ -232,6 +229,7 @@ where
 
 struct DisclosureMap {
     entries: HashMap<Vec<u8>, Disclosure>,
+    algorithm: i64,
     // Only the structural validator applies registered-claim policy and
     // retains unmatched markers until duplicate claims have been compared.
     validate_claims: bool,
@@ -280,12 +278,14 @@ impl DisclosureMap {
         }
         Ok(Self {
             entries,
+            algorithm: hasher.algorithm(),
             validate_claims: false,
         })
     }
 
-    fn remove(&mut self, hash: &[u8]) -> Option<Disclosure> {
-        self.entries.remove(hash)
+    fn remove(&mut self, hash: &[u8]) -> Result<Option<Disclosure>, Error> {
+        crate::disclosure::validate_hash_length(self.algorithm, hash)?;
+        Ok(self.entries.remove(hash))
     }
 
     fn is_empty(&self) -> bool {
@@ -379,13 +379,22 @@ fn restore_map(
         if !output_keys.insert(label) {
             return Err(Error::verify(format!("duplicate claim key {key}")));
         }
-        let value = restore_value(value, pending, mode, stats, budget, depth + 1)?;
+        let value = if pending.validate_claims
+            && depth == 0
+            && key == Value::from(cose2::iana::CWTClaimCnf)
+        {
+            // The confirmation key is a draft-08 safe_map at both claims roots.
+            validate_safe_value(&value, budget, depth + 1)?;
+            value
+        } else {
+            restore_value(value, pending, mode, stats, budget, depth + 1)?
+        };
         output.push((key, value));
     }
 
     let mut undisclosed_hashes = Vec::new();
     for hash in redacted_hashes {
-        match pending.remove(&hash) {
+        match pending.remove(&hash)? {
             Some(disclosure) => match disclosure.kind {
                 DisclosureKind::Claim { key, value, .. } => {
                     if pending.validate_claims && depth == 0 {
@@ -394,6 +403,7 @@ fn restore_map(
                     if !output_keys.insert(key.clone()) {
                         return Err(Error::verify(format!("duplicate claim key {key}")));
                     }
+                    budget.container(output_keys.len())?;
                     let value = restore_value(value, pending, mode, stats, budget, depth + 1)?;
                     output.push((Value::from(key), value));
                     stats.disclosed += 1;
@@ -447,7 +457,7 @@ fn restore_array(
                 budget.enter(depth + 1)?;
                 budget.enter(depth + 2)?;
                 let hash = expect_owned_bytes(*inner, "redacted array element hash must be bytes")?;
-                match pending.remove(&hash) {
+                match pending.remove(&hash)? {
                     Some(disclosure) => match disclosure.kind {
                         DisclosureKind::Element { value, .. } => {
                             output.push(restore_value(

@@ -2,8 +2,8 @@
 
 use crate::validation::{definite_cbor_limits, validate_disclosure_value, validate_text_label};
 use crate::{
-    expect_owned_bytes, label_from_value, value_item_count, ProcessingLimits, ALG_SHA_256,
-    HEADER_SD_CLAIMS,
+    expect_owned_bytes, label_from_value, value_item_count, ProcessingLimits, TraversalBudget,
+    ALG_SHA_256, HEADER_SD_CLAIMS,
 };
 use cbor2::Value;
 use cose2::{Error, Header, Label};
@@ -31,6 +31,13 @@ impl RedactionHasher for Sha256RedactionHasher {
     fn digest(&self, data: &[u8]) -> Vec<u8> {
         Sha256::digest(data).to_vec()
     }
+}
+
+pub(super) fn validate_hash_length(algorithm: i64, digest: &[u8]) -> Result<(), Error> {
+    if algorithm == ALG_SHA_256 && digest.len() != 32 {
+        return Err(Error::custom("SHA-256 redaction hashes must be 32 bytes"));
+    }
+    Ok(())
 }
 
 /// Returns the built-in SHA-256 hasher for `sd_alg = -16` or an omitted `sd_alg`.
@@ -165,6 +172,12 @@ impl Disclosure {
         validate_disclosure_kind(&kind)?;
         validate_disclosure_value(&kind, limits)?;
         let encoded = encode_kind(&kind)?;
+        if encoded.len() > limits.max_disclosure_bytes {
+            return Err(Error::limit(
+                "SD-CWT disclosure bytes",
+                limits.max_disclosure_bytes,
+            ));
+        }
         Ok(Self { kind, encoded })
     }
 
@@ -295,6 +308,7 @@ pub fn disclosures_from_unprotected_with_limits(
     if items.len() > limits.max_disclosures {
         return Err(Error::limit("SD-CWT disclosure", limits.max_disclosures));
     }
+    TraversalBudget::new(limits).container(items.len())?;
     let envelope_items = items
         .len()
         .checked_add(1)

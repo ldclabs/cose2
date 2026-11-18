@@ -199,15 +199,19 @@ impl AeadEncryptedDisclosure {
                 "AEAD encrypted disclosure must be an array".into(),
             ));
         };
+        Self::from_fields(items)
+    }
+
+    fn from_fields(items: &[Value]) -> Result<Self, Error> {
         if !(3..=4).contains(&items.len()) {
             return Err(Error::custom(
                 "AEAD encrypted disclosure must have 3 or 4 elements",
             ));
         }
 
-        let nonce = expect_bytes(&items[0], "AEAD nonce")?.to_vec();
-        let ciphertext = expect_bytes(&items[1], "AEAD ciphertext")?.to_vec();
-        let tag = expect_bytes(&items[2], "AEAD tag")?.to_vec();
+        let nonce = expect_bytes(&items[0], "AEAD nonce")?;
+        let ciphertext = expect_bytes(&items[1], "AEAD ciphertext")?;
+        let tag = expect_bytes(&items[2], "AEAD tag")?;
         if nonce.is_empty() {
             return Err(Error::custom("AEAD disclosure nonce must not be empty"));
         }
@@ -242,9 +246,9 @@ impl AeadEncryptedDisclosure {
         };
 
         Ok(Self {
-            nonce,
-            ciphertext,
-            tag,
+            nonce: nonce.to_vec(),
+            ciphertext: ciphertext.to_vec(),
+            tag: tag.to_vec(),
             key_context,
         })
     }
@@ -281,27 +285,35 @@ pub fn aead_encrypted_disclosures_from_unprotected_with_limits(
             limits.max_disclosures,
         ));
     }
-    if items.len() > limits.max_container_entries {
-        return Err(Error::limit(
-            "SD-CWT encrypted disclosure container entry",
-            limits.max_container_entries,
-        ));
+    let mut budget = TraversalBudget::new(limits);
+    budget.enter(0)?;
+    budget.container(items.len())?;
+    let mut disclosures = Vec::with_capacity(items.len());
+    let mut remaining = limits.max_disclosure_bytes;
+    for item in items {
+        let Value::Array(fields) = item else {
+            return Err(Error::UnexpectedType(
+                "AEAD encrypted disclosure must be an array".into(),
+            ));
+        };
+        budget.enter(1)?;
+        budget.container(fields.len())?;
+        for field in fields {
+            budget.enter(2)?;
+            let len = match field {
+                Value::Text(s) => s.len(),
+                Value::Bytes(b) => b.len(),
+                _ => 0,
+            };
+            remaining = remaining.checked_sub(len).ok_or_else(|| {
+                Error::limit(
+                    "SD-CWT encrypted disclosure bytes",
+                    limits.max_disclosure_bytes,
+                )
+            })?;
+        }
+        disclosures.push(AeadEncryptedDisclosure::from_fields(fields)?);
     }
-    let item_count = items.iter().try_fold(1usize, |count, value| {
-        count
-            .checked_add(value_item_count(value)?)
-            .ok_or_else(|| Error::custom("encrypted disclosure item count overflow"))
-    })?;
-    if item_count > limits.max_items {
-        return Err(Error::limit(
-            "SD-CWT encrypted disclosure item",
-            limits.max_items,
-        ));
-    }
-    let disclosures = items
-        .iter()
-        .map(AeadEncryptedDisclosure::from_value)
-        .collect::<Result<Vec<_>, _>>()?;
     let mut nonces = HashSet::with_capacity(disclosures.len());
     if disclosures
         .iter()
@@ -309,27 +321,6 @@ pub fn aead_encrypted_disclosures_from_unprotected_with_limits(
     {
         return Err(Error::verify(
             "duplicate nonce in SD-CWT encrypted disclosures",
-        ));
-    }
-    let total_bytes = disclosures.iter().try_fold(0usize, |total, disclosure| {
-        total
-            .checked_add(disclosure.nonce.len())
-            .and_then(|total| total.checked_add(disclosure.ciphertext.len()))
-            .and_then(|total| total.checked_add(disclosure.tag.len()))
-            .and_then(|total| {
-                let context_len = match &disclosure.key_context {
-                    Some(AeadKeyContext::Text(value)) => value.len(),
-                    Some(AeadKeyContext::Thumbprint(value)) => value.len(),
-                    Some(AeadKeyContext::Uint(_)) | None => 0,
-                };
-                total.checked_add(context_len)
-            })
-            .ok_or_else(|| Error::custom("encrypted disclosure size overflow"))
-    })?;
-    if total_bytes > limits.max_disclosure_bytes {
-        return Err(Error::limit(
-            "SD-CWT encrypted disclosure bytes",
-            limits.max_disclosure_bytes,
         ));
     }
     Ok(disclosures)
@@ -361,7 +352,8 @@ pub fn set_aead_encrypted_disclosures(
 pub struct ProcessingLimits {
     /// Maximum nesting assembled across the payload and disclosures.
     pub max_depth: usize,
-    /// Maximum number of values visited during one operation.
+    /// Maximum number of values visited in a processing pass. Comparison of
+    /// duplicate claims shares one such budget, including array alignment cells.
     pub max_items: usize,
     /// Maximum number of disclosures accepted in one operation.
     pub max_disclosures: usize,

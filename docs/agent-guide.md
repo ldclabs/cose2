@@ -136,6 +136,11 @@ device queue, or separate service, use the two-step message APIs instead:
   `set_ciphertext`. For async decryption, use `prepare_decryption` with
   `ciphertext` or the detached ciphertext.
 
+Keep each outstanding request with its own message. Attaching an external
+result checks the prepared payload and protected headers. Multi-signature
+messages also check signer order, and encryption checks the IV or Partial IV.
+If an input changes, prepare again and use the result of the new request.
+
 Sign1 example:
 
 ```rust

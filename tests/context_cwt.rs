@@ -203,13 +203,46 @@ fn claims_omit_absent_fields_and_json() {
     let bytes = claims.to_vec().unwrap();
     assert_eq!(bytes[0], 0xa1);
 
-    // JSON keeps the original (renamed) field names — the cbor2 derive leaves
-    // serde names intact for other formats.
-    // (We don't depend on serde_json here; check the empty-claims default.)
+    assert_eq!(serde_json::to_string(&claims).unwrap(), r#"{"iss":"iss"}"#);
     let empty = Claims::new();
     assert_eq!(empty, Claims::default());
     assert_eq!(empty.to_vec().unwrap(), vec![0xa0]);
     assert_eq!(empty.to_untagged_vec().unwrap(), vec![0xa0]);
+}
+
+#[test]
+fn json_claim_names_preserve_integer_labels_and_reject_ambiguous_text() {
+    let mut claims = Claims::new();
+    claims.expiration = Some(100.into());
+    claims.cwt_id = Some(vec![1, 2]);
+    claims.extra.insert(99, true);
+    claims.extra.insert(-99, "custom");
+    claims.extra.insert("099", false);
+    let json = serde_json::to_string(&claims).unwrap();
+    assert_eq!(serde_json::from_str::<Claims>(&json).unwrap(), claims);
+
+    // Numeric aliases also use the declared type of the registered claim.
+    let from_numbers: Claims =
+        serde_json::from_str(r#"{"4":100,"7":[1,2],"99":true,"-99":"custom","099":false}"#)
+            .unwrap();
+    assert_eq!(from_numbers, claims);
+    assert!(serde_json::from_str::<Claims>(r#"{"4":100,"exp":101}"#).is_err());
+    assert!(serde_json::from_str::<Claims>(r#"{"99":true,"99":false}"#).is_err());
+
+    for name in ["exp", "iss", "99", "-99", "4"] {
+        claims.extra.insert(name, "private");
+        assert!(serde_json::to_string(&claims).is_err(), "{name}");
+        assert_eq!(
+            Claims::from_slice(&claims.to_vec().unwrap()).unwrap(),
+            claims
+        );
+        claims.extra.remove(name);
+    }
+    claims.expiration = None;
+    claims.extra.insert(4, 100);
+    assert_eq!(serde_json::to_string(&claims).unwrap(), json);
+    claims.expiration = Some(200.into());
+    assert!(serde_json::to_string(&claims).is_err());
 }
 
 #[test]
@@ -483,6 +516,35 @@ fn validator_uses_system_clock_when_now_unset() {
 }
 
 #[test]
+fn registered_claims_in_extra_follow_the_same_validation_as_wire_claims() {
+    let validator = Validator::new(ValidatorOptions {
+        fixed_now: Some(10),
+        allow_missing_expiration: true,
+        expected_issuer: Some("issuer".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut claims = Claims::new();
+    claims.extra.insert(iana::CWTClaimIss, "issuer");
+    for (exp, valid) in [(11, true), (10, false)] {
+        claims.extra.insert(iana::CWTClaimExp, exp);
+        let decoded = Claims::from_slice(&claims.to_vec().unwrap()).unwrap();
+        assert_eq!(validator.validate(&claims), validator.validate(&decoded));
+        assert_eq!(validator.validate(&claims).is_ok(), valid);
+    }
+    claims.expiration = Some(20.into());
+    assert!(claims.to_vec().is_err());
+    assert!(validator.validate(&claims).is_err());
+    claims.expiration = None;
+    claims.extra.insert(iana::CWTClaimExp, "later");
+    assert!(claims.to_vec().is_err());
+    assert!(validator.validate(&claims).is_err());
+    claims.extra.remove(iana::CWTClaimExp);
+    claims.issued_at = Some(NumericDate::Float(f64::INFINITY));
+    assert!(validator.validate(&claims).is_err());
+}
+
+#[test]
 fn numeric_dates_compare_across_integer_and_float_forms() {
     use std::cmp::Ordering;
 
@@ -505,6 +567,10 @@ fn numeric_dates_compare_across_integer_and_float_forms() {
     );
     assert_eq!(
         compare(NumericDate::Float(f64::NAN), NumericDate::Integer(0)),
+        None
+    );
+    assert_eq!(
+        compare(NumericDate::Float(0.0), NumericDate::Float(f64::INFINITY)),
         None
     );
 }

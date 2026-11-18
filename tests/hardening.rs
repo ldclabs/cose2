@@ -57,6 +57,16 @@ fn duplicate_map_keys_are_detected_across_encodings_of_one_key() {
     assert!(CoseMap::from_slice(&[0xa2, 0x41, 0x00, 0x01, 0x58, 0x01, 0x00, 0x02]).is_err());
     // A text key that is not valid UTF-8 is still rejected.
     assert!(CoseMap::from_slice(&[0xa1, 0x61, 0xff, 0x01]).is_err());
+    // A nested map cannot have both floating-point zeros as keys, even
+    // when the zeros occur inside array keys.
+    for map in ["a2f9800000f9000001", "a281f980000081f9000001"] {
+        let mut outer = vec![0xa1, 0x18, 100];
+        outer.extend(hex::decode(map).unwrap());
+        assert!(CoseMap::from_slice(&outer).is_err());
+        let mut built = CoseMap::new();
+        built.insert(100, cbor2::from_slice::<Value>(&outer[3..]).unwrap());
+        assert!(built.to_vec().is_err());
+    }
     // Distinct keys sharing an encoding prefix remain distinct: {1: 1, 24: 2}.
     assert_eq!(
         CoseMap::from_slice(&[0xa2, 0x01, 0x01, 0x18, 0x18, 0x02])

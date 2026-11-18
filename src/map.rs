@@ -169,6 +169,39 @@ impl CoseMap {
         Ok(out)
     }
 
+    /// Reads an ordinary Serde map, checking for duplicates after label conversion.
+    pub(crate) fn deserialize_with_labels<'de, D>(
+        deserializer: D,
+        convert: fn(Label) -> Label,
+    ) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct MapVisitor(fn(Label) -> Label);
+
+        impl<'de> Visitor<'de> for MapVisitor {
+            type Value = CoseMap;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a COSE map keyed by integers or text strings")
+            }
+
+            fn visit_map<A>(self, mut access: A) -> Result<CoseMap, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut map = BTreeMap::new();
+                while let Some((key, value)) = access.next_entry::<Label, Value>()? {
+                    if map.insert((self.0)(key), value).is_some() {
+                        return Err(serde::de::Error::custom("duplicate COSE map label"));
+                    }
+                }
+                Ok(CoseMap(map))
+            }
+        }
+        deserializer.deserialize_map(MapVisitor(convert))
+    }
+
     /// Deserializes a map whose encoding a strict pass already checked for
     /// duplicate keys at every depth, skipping the second strict pass.
     pub(crate) fn deserialize_checked<'de, D>(deserializer: D) -> Result<Self, D::Error>
@@ -258,31 +291,8 @@ impl<'de> Deserialize<'de> for CoseMap {
     where
         D: Deserializer<'de>,
     {
-        struct MapVisitor;
-
-        impl<'de> Visitor<'de> for MapVisitor {
-            type Value = CoseMap;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a COSE map keyed by integers or text strings")
-            }
-
-            fn visit_map<A>(self, mut access: A) -> Result<CoseMap, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let mut map = BTreeMap::new();
-                while let Some((key, value)) = access.next_entry::<Label, Value>()? {
-                    if map.insert(key, value).is_some() {
-                        return Err(serde::de::Error::custom("duplicate COSE map label"));
-                    }
-                }
-                Ok(CoseMap(map))
-            }
-        }
-
         if deserializer.is_human_readable() {
-            deserializer.deserialize_map(MapVisitor)
+            Self::deserialize_with_labels(deserializer, std::convert::identity)
         } else {
             let raw = cbor2::RawValue::deserialize(deserializer)?;
             crate::strict::validate_map(raw.as_bytes()).map_err(serde::de::Error::custom)?;
